@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gl-hnsw"
+version = "0.1.0"
+description = "HNSW retrieval with a DeepAgents-driven logic overlay."
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "deepagents>=0.0.17",
+  "fastapi>=0.116.0",
+  "hnswlib>=0.8.0",
+  "langchain-openai>=0.3.0",
+  "numpy>=2.2.0",
+  "orjson>=3.10.0",
+  "pydantic>=2.10.0",
+  "pydantic-settings>=2.6.0",
+  "pyyaml>=6.0.2",
+  "uvicorn>=0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28.0",
+  "pytest>=8.3.0",
+]
+
+[project.scripts]
+gl-hnsw-build-embeddings = "hnsw_logic.cli:build_embeddings_main"
+gl-hnsw-build-hnsw = "hnsw_logic.cli:build_hnsw_main"
+gl-hnsw-profile-docs = "hnsw_logic.cli:profile_docs_main"
+gl-hnsw-discover-edges = "hnsw_logic.cli:discover_edges_main"
+gl-hnsw-revalidate-edges = "hnsw_logic.cli:revalidate_edges_main"
+gl-hnsw-serve = "hnsw_logic.cli:serve_main"
+gl-hnsw-evaluate = "hnsw_logic.cli:evaluate_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

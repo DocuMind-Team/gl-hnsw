@@ -1,0 +1,5 @@
+m: 16
+ef_construction: 100
+ef_search: 40
+vector_dim: 64
+metric: cosine

@@ -1,0 +1,40 @@
+initial_top_k: 50
+seed_top_b: 5
+max_expansions_per_seed: 2
+jump_policy:
+  tau_conf: 0.6
+  tau_edge: 0.2
+  tau_target: 0.15
+fusion:
+  alpha: 1.0
+  beta: 0.7
+edge_quality:
+  max_edges_per_anchor_live: 1
+  max_judge_candidates_live: 4
+  second_edge_margin: 0.015
+  relation_thresholds:
+    supporting_evidence:
+      enabled: true
+      min_confidence: 0.82
+      min_support: 0.3
+      min_evidence_quality: 0.35
+    implementation_detail:
+      enabled: true
+      min_confidence: 0.84
+      min_support: 0.34
+      min_evidence_quality: 0.4
+    same_concept:
+      enabled: false
+      min_confidence: 0.9
+      min_support: 0.5
+      min_evidence_quality: 0.4
+    comparison:
+      enabled: false
+      min_confidence: 0.92
+      min_support: 0.55
+      min_evidence_quality: 0.45
+    prerequisite:
+      enabled: true
+      min_confidence: 0.88
+      min_support: 0.38
+      min_evidence_quality: 0.4

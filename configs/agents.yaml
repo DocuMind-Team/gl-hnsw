@@ -1,0 +1,25 @@
+runtime_mode: deepagents
+sandbox_enabled: false
+live_reasoning:
+  enable_scout_thinking: true
+  enable_judge_thinking: true
+  enable_curator_thinking: true
+subagents:
+  doc_profiler:
+    enabled: true
+    skills:
+      - doc_briefing
+      - entity_canonicalization
+  corpus_scout:
+    enabled: true
+    skills:
+      - corpus_navigation
+  relation_judge:
+    enabled: true
+    skills:
+      - evidence_linking
+      - relation_typing
+  memory_curator:
+    enabled: true
+    skills:
+      - memory_update

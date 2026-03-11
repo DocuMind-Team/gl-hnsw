@@ -1,0 +1,18 @@
+provider:
+  kind: stub
+  base_url: https://api.xiaomimimo.com/v1
+  api_key_env: GL_HNSW_API_KEY
+  chat_model: stub-chat
+  embedding_model: stub-embedding
+  embedding_dim: 64
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  indices_dir: data/indices
+  graph_dir: data/graph
+  memories_dir: data/memories
+  workspace_dir: data/workspace
+  jobs_db: data/jobs.sqlite3
+runtime:
+  log_level: INFO
+  deterministic_seed: 7
