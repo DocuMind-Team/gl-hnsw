@@ -1,0 +1,14 @@
+[
+  {"query_id":"q1","text":"What does HNSW use layered links for?"},
+  {"query_id":"q2","text":"Which parameters control HNSW build quality and search latency?"},
+  {"query_id":"q3","text":"How does the system decide whether to follow a logical edge?"},
+  {"query_id":"q4","text":"How are HNSW scores merged with logic expansion scores?"},
+  {"query_id":"q5","text":"What do DeepAgents subagents do in this project?"},
+  {"query_id":"q6","text":"How is memory persisted for the agent system?"},
+  {"query_id":"q7","text":"What does the document profiler produce?"},
+  {"query_id":"q8","text":"How are background jobs managed?"},
+  {"query_id":"q9","text":"Why should logic edges be revalidated?"},
+  {"query_id":"q10","text":"Which metrics are reported in evaluation?"},
+  {"query_id":"q11","text":"How does the corpus scout find candidates?"},
+  {"query_id":"q12","text":"What is the role of the logic overlay graph?"}
+]
