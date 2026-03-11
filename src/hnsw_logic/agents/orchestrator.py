@@ -13,9 +13,40 @@ from hnsw_logic.embedding.provider import CandidateProposal
 
 ROLE_WORDS = {"role", "roles", "subagent", "subagents", "profiler", "scout", "judge", "curator"}
 LISTING_WORDS = {"include", "includes", "including", "role", "roles", "subagent", "subagents"}
-DETAIL_CUES = {"detail", "formula", "score", "policy", "fusion", "registry", "storage", "backend", "worker", "report", "metrics", "tracked", "path"}
-SUPPORT_CUES = {"support", "supports", "allow", "allows", "govern", "governs", "control", "controls", "later", "after", "used", "enters"}
+DETAIL_CUES = {
+    "detail", "formula", "score", "scores", "policy", "fusion", "registry", "storage", "backend",
+    "worker", "workers", "report", "metrics", "tracked", "path", "weighted", "combine", "combines",
+    "routing", "route", "persistent", "expansion", "gate", "gates",
+}
+SUPPORT_CUES = {"allow", "allows", "govern", "governs", "control", "controls", "later", "after", "provide", "provides", "enable", "enables", "enter", "enters", "gate", "gates"}
 ORDER_CUES = {"before", "after", "first", "then", "prior", "precedes", "depends"}
+SPECIFIC_ROLE_TERMS = {"profiler", "scout", "judge", "curator"}
+SERVICE_SURFACE_TERMS = {"service", "fastapi", "api", "endpoint", "endpoints", "health", "inspection", "public"}
+FOUNDATIONAL_TERMS = {"similarity", "metric", "metrics", "benchmark", "heuristic", "heuristics"}
+HIGH_SPECIFICITY_TITLE_TERMS = {"fusion", "policy", "registry", "backend", "profiler", "scout", "judge", "curator", "revalidation"}
+MEDIUM_SPECIFICITY_TITLE_TERMS = {"subagents", "memory", "workers", "jobs"}
+LOW_SPECIFICITY_TITLE_TERMS = {"retrieval", "graph", "overview", "service", "metrics", "reporting", "dataset", "similarity", "layers", "parameters", "path"}
+CONTENT_STOPWORDS = {
+    "this", "that", "with", "from", "into", "through", "used", "using", "only", "when", "then", "than",
+    "their", "there", "about", "project", "system", "document", "documents", "candidate", "candidates",
+    "results", "result", "where", "while", "without", "after", "before", "under", "specific", "initial",
+}
+DETAIL_FAMILIES = (
+    ("hybrid", {"hybrid", "retrieval", "ranker", "fusion", "score", "scores", "formula", "weighted", "alpha", "beta", "geometric", "logical", "seed", "target"}),
+    ("logic", {"logic", "logical", "overlay", "graph", "jump", "policy", "edge", "confidence", "relevance", "expansion", "candidate", "recall", "one-hop"}),
+    ("insert", {"insert", "insertion", "hierarchy", "hierarchical", "walk", "walking", "walks", "neighbor", "selection", "heuristic", "heuristics", "points", "traversal"}),
+    ("agent", {"deepagents", "subagents", "profiler", "scout", "judge", "curator", "planning", "filesystem", "shell", "memory", "backend", "storage", "persistent", "route", "routing", "semantic", "procedural", "anchor"}),
+    ("ops", {"job", "jobs", "worker", "workers", "registry", "sqlite", "build", "revalidation", "queue", "payload", "state", "timestamps", "messages"}),
+)
+GRAPH_STAGE_TOKENS = {"logic", "overlay", "graph", "sidecar", "relations", "recall"}
+POLICY_STAGE_TOKENS = {"jump", "policy", "confidence", "relevance", "target", "seed", "one-hop", "expansion"}
+FUSION_STAGE_TOKENS = {"fusion", "ranker", "alpha", "beta", "score", "scores", "weighted", "path", "formula"}
+ROLE_STAGE_TOKENS = {"subagents", "role", "roles", "profiler", "scout", "judge", "curator"}
+MEMORY_STAGE_TOKENS = {"memory", "memories", "backend", "storage", "persistent", "semantic", "procedural", "anchor"}
+OVERVIEW_STAGE_TOKENS = {"hybrid", "retrieval", "deepagents", "overview", "jobs", "workers", "background"}
+REGISTRY_STAGE_TOKENS = {"sqlite", "registry", "queue", "payload", "messages", "timestamps"}
+SERVICE_STAGE_TOKENS = {"service", "fastapi", "api", "endpoint", "endpoints", "health", "inspection", "public", "search"}
+REVALIDATION_STAGE_TOKENS = {"revalidation", "revalidate", "stale", "corpus"}
 DISCOVERY_TERMS = {
     "logic", "hybrid", "jump", "candidate", "fusion", "subagent", "subagents", "memory",
     "profiler", "scout", "judge", "curator", "worker", "workers", "job", "jobs", "registry",
@@ -76,6 +107,283 @@ class LogicOrchestrator:
     def _brief_text(self, brief: DocBrief) -> str:
         return " ".join([brief.title, brief.summary, *brief.claims]).lower()
 
+    def _content_terms(self, brief: DocBrief) -> set[str]:
+        tokens = {
+            *tokenize(brief.title),
+            *tokenize(brief.summary),
+            *tokenize(" ".join(brief.claims)),
+            *tokenize(" ".join(brief.keywords)),
+            *tokenize(" ".join(brief.entities)),
+            *tokenize(" ".join(brief.relation_hints)),
+        }
+        return {token for token in tokens if len(token) > 3 and token not in CONTENT_STOPWORDS}
+
+    def _family_bridge_score(self, anchor_terms: set[str], candidate_terms: set[str]) -> float:
+        best = 0.0
+        for _, family in DETAIL_FAMILIES:
+            anchor_hits = len(anchor_terms & family)
+            candidate_hits = len(candidate_terms & family)
+            if anchor_hits == 0 or candidate_hits == 0:
+                continue
+            best = max(best, min(anchor_hits, candidate_hits) / 4.0)
+        return min(best, 1.0)
+
+    def _dominant_family(self, content_terms: set[str]) -> str:
+        best_name = ""
+        best_hits = 0
+        for name, family in DETAIL_FAMILIES:
+            hits = len(content_terms & family)
+            if hits > best_hits:
+                best_name = name
+                best_hits = hits
+        return best_name if best_hits > 0 else ""
+
+    def _reference_score(self, source: DocBrief, target: DocBrief) -> float:
+        source_text = self._brief_text(source)
+        target_title = target.title.lower()
+        title_tokens = {token for token in tokenize(target.title) if len(token) > 3}
+        score = 0.0
+        if target_title and target_title in source_text:
+            score += 0.55
+        source_tokens = set(tokenize(source.summary + " " + " ".join(source.claims) + " " + " ".join(source.relation_hints)))
+        score += 0.08 * len(title_tokens & source_tokens)
+        return min(score, 1.0)
+
+    def _title_specificity_score(self, brief: DocBrief) -> float:
+        tokens = set(tokenize(brief.title))
+        score = 0.0
+        score += 0.55 * len(tokens & HIGH_SPECIFICITY_TITLE_TERMS)
+        score += 0.25 * len(tokens & MEDIUM_SPECIFICITY_TITLE_TERMS)
+        score -= 0.3 * len(tokens & LOW_SPECIFICITY_TITLE_TERMS)
+        return max(-0.6, min(score, 1.2))
+
+    def _detail_density(self, brief: DocBrief) -> float:
+        content_terms = self._content_terms(brief)
+        cue_hits = len(content_terms & DETAIL_CUES)
+        return min(cue_hits / 6.0, 1.0)
+
+    def _implementation_direction_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
+        candidate_spec = self._title_specificity_score(candidate)
+        anchor_spec = self._title_specificity_score(anchor)
+        detail_gap = self._detail_density(candidate) - self._detail_density(anchor)
+        reference_gap = metrics["forward_reference_score"] - 0.85 * metrics["reverse_reference_score"]
+        score = (
+            0.55 * (candidate_spec - anchor_spec)
+            + 0.2 * detail_gap
+            + 0.2 * reference_gap
+            + 0.15 * (metrics["family_bridge_score"] - 0.5)
+        )
+        return max(-1.0, min(score, 1.0))
+
+    def _has_listing_context(self, brief: DocBrief) -> float:
+        return 1.0 if any(word in self._brief_text(brief) for word in LISTING_WORDS) else 0.0
+
+    def _doc_stage(self, brief: DocBrief) -> str:
+        title_tokens = set(tokenize(brief.title))
+        content_terms = self._content_terms(brief)
+        topic = str(brief.metadata.get("topic", "")).lower()
+
+        if title_tokens & {"overlay", "graph"}:
+            return "logic_graph"
+        if title_tokens & {"policy", "jump"}:
+            return "logic_policy"
+        if title_tokens & {"fusion", "ranker"}:
+            return "logic_fusion"
+        if title_tokens & {"hybrid", "retrieval"}:
+            return "retrieval_overview"
+        if title_tokens & {"deepagents", "overview"}:
+            return "agent_overview"
+        if title_tokens & ROLE_STAGE_TOKENS:
+            return "agent_roles"
+        if title_tokens & {"memory", "backend"} and (content_terms & MEMORY_STAGE_TOKENS or topic in {"deepagents", "agents"}):
+            return "agent_memory"
+        if title_tokens & {"jobs", "workers"}:
+            return "ops_overview"
+        if title_tokens & {"fastapi", "service"}:
+            return "ops_service"
+        if title_tokens & {"registry", "sqlite"}:
+            return "ops_registry"
+        if title_tokens & {"revalidation", "revalidate"}:
+            return "ops_revalidation"
+
+        if topic == "retrieval" and (title_tokens & {"hybrid", "retrieval"} or content_terms & {"hybrid", "ranker"}):
+            return "retrieval_overview"
+        if topic == "logic":
+            if title_tokens & {"overlay", "graph"} or len(content_terms & GRAPH_STAGE_TOKENS) >= 2:
+                return "logic_graph"
+            if title_tokens & {"policy", "jump"} or len(content_terms & POLICY_STAGE_TOKENS) >= 2:
+                return "logic_policy"
+            if title_tokens & {"fusion", "ranker"} or len(content_terms & FUSION_STAGE_TOKENS) >= 2:
+                return "logic_fusion"
+        if topic in {"deepagents", "agents"}:
+            if title_tokens & {"deepagents", "overview"}:
+                return "agent_overview"
+            if title_tokens & ROLE_STAGE_TOKENS or len(content_terms & ROLE_STAGE_TOKENS) >= 2:
+                return "agent_roles"
+            if title_tokens & {"memory", "backend"} or len(content_terms & MEMORY_STAGE_TOKENS) >= 2:
+                return "agent_memory"
+        if topic == "ops":
+            if title_tokens & {"jobs", "workers"}:
+                return "ops_overview"
+            if title_tokens & {"fastapi", "service"} or len(content_terms & SERVICE_STAGE_TOKENS) >= 2:
+                return "ops_service"
+            if title_tokens & {"registry", "sqlite"} or len(content_terms & REGISTRY_STAGE_TOKENS) >= 2:
+                return "ops_registry"
+            if title_tokens & {"revalidation", "revalidate"} or len(content_terms & REVALIDATION_STAGE_TOKENS) >= 2:
+                return "ops_revalidation"
+            if len(content_terms & OVERVIEW_STAGE_TOKENS) >= 2:
+                return "ops_overview"
+        return ""
+
+    def _relation_stage_bonus(self, anchor: DocBrief, candidate: DocBrief, relation_type: str, metrics: dict[str, float]) -> float:
+        anchor_stage = self._doc_stage(anchor)
+        candidate_stage = self._doc_stage(candidate)
+        pair = (anchor_stage, candidate_stage)
+        bonus = 0.0
+        if relation_type == "implementation_detail":
+            positive = {
+                ("retrieval_overview", "logic_fusion"): 0.3,
+                ("logic_graph", "logic_policy"): 0.34,
+                ("agent_overview", "agent_roles"): 0.28,
+                ("agent_overview", "agent_memory"): 0.28,
+                ("ops_overview", "ops_registry"): 0.32,
+                ("ops_service", "ops_registry"): 0.28,
+            }
+            negative = {
+                ("logic_fusion", "retrieval_overview"): -0.3,
+                ("logic_policy", "logic_graph"): -0.34,
+                ("agent_roles", "agent_overview"): -0.28,
+                ("agent_memory", "agent_overview"): -0.28,
+                ("ops_registry", "ops_overview"): -0.34,
+                ("ops_registry", "ops_service"): -0.28,
+                ("ops_service", "ops_overview"): -0.32,
+            }
+            bonus = positive.get(pair, negative.get(pair, 0.0))
+            if bonus == 0.0:
+                if candidate_stage.endswith("_overview") and anchor_stage and candidate_stage != anchor_stage:
+                    bonus -= 0.28
+                if metrics["specific_role_score"] >= 0.5 and anchor_stage not in {"agent_overview", "agent_roles"}:
+                    bonus -= 0.22
+        elif relation_type == "supporting_evidence":
+            positive = {
+                ("logic_graph", "retrieval_overview"): 0.28,
+                ("logic_policy", "logic_fusion"): 0.3,
+            }
+            negative = {
+                ("retrieval_overview", "logic_graph"): -0.28,
+                ("logic_fusion", "logic_policy"): -0.32,
+                ("ops_revalidation", "agent_roles"): -0.28,
+            }
+            bonus = positive.get(pair, negative.get(pair, 0.0))
+            if "judge" in set(tokenize(anchor.title)) and candidate_stage == "ops_revalidation":
+                bonus = max(bonus, 0.28)
+        elif relation_type == "prerequisite":
+            bonus = {
+                ("agent_roles", "agent_roles"): 0.28,
+            }.get(pair, 0.0)
+            if anchor_stage == "agent_roles" and metrics["specific_role_score"] >= 0.5 and self._has_listing_context(anchor) >= 1.0:
+                bonus = max(bonus, 0.3)
+            if "scout" in set(tokenize(anchor.title)) and "judge" in set(tokenize(candidate.title)):
+                bonus = max(bonus, 0.24)
+        return bonus
+
+    def _relation_fit_scores(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> dict[str, float]:
+        direction_score = self._implementation_direction_score(anchor, candidate, metrics)
+        listing_context = self._has_listing_context(anchor)
+        reference_balance = max(metrics["forward_reference_score"] - 0.75 * metrics["reverse_reference_score"], 0.0)
+        cue_terms = self._content_terms(anchor) | self._content_terms(candidate)
+        detail_cue_score = min(len(cue_terms & DETAIL_CUES) / 5.0, 1.0)
+        support_cue_score = min(len(cue_terms & SUPPORT_CUES) / 4.0, 1.0)
+
+        implementation_detail = (
+            0.32 * metrics["dense_score"]
+            + 0.16 * metrics["family_bridge_score"]
+            + 0.12 * metrics["shared_dominant_family"]
+            + 0.16 * max(direction_score, 0.0)
+            + 0.1 * metrics["content_overlap_score"]
+            + 0.06 * metrics["mention_score"]
+            + 0.06 * metrics["topic_alignment"]
+            + 0.08 * reference_balance
+            + 0.06 * detail_cue_score
+            + self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics)
+            - 0.18 * metrics["service_surface_score"]
+            - 0.16 * max(-direction_score, 0.0)
+            - 0.06 * (listing_context * metrics["specific_role_score"])
+        )
+        supporting_evidence = (
+            0.18 * metrics["dense_score"]
+            + 0.22 * metrics["mention_score"]
+            + 0.16 * metrics["content_overlap_score"]
+            + 0.12 * metrics["family_bridge_score"]
+            + 0.08 * reference_balance
+            + 0.08 * metrics["topic_alignment"]
+            + 0.1 * support_cue_score
+            + self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics)
+            - 0.24 * metrics["service_surface_score"]
+        )
+        prerequisite = (
+            0.34 * metrics["specific_role_score"]
+            + 0.24 * metrics["role_listing_score"]
+            + 0.12 * metrics["mention_score"]
+            + 0.08 * metrics["content_overlap_score"]
+            + 0.1 * listing_context
+            + 0.08 * metrics["topic_alignment"]
+            + self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics)
+            - 0.08 * metrics["service_surface_score"]
+        )
+        return {
+            "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
+            "supporting_evidence": max(0.0, min(supporting_evidence, 1.2)),
+            "prerequisite": max(0.0, min(prerequisite, 1.2)),
+        }
+
+    def _pair_rerank(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> tuple[float, str, dict[str, float]]:
+        fit_scores = self._relation_fit_scores(anchor, candidate, metrics)
+        relation_type, score = max(fit_scores.items(), key=lambda item: (item[1], item[0]))
+        return score, relation_type, fit_scores
+
+    def _proposal_bucket_quotas(self, anchor: DocBrief, limit: int) -> dict[str, int]:
+        stage = self._doc_stage(anchor)
+        if stage == "agent_roles":
+            return {"prerequisite": min(limit, 4), "implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 1)}
+        if stage in {"logic_graph", "retrieval_overview", "ops_overview", "ops_service", "agent_overview"}:
+            return {"implementation_detail": min(limit, 3), "supporting_evidence": min(limit, 2), "prerequisite": min(limit, 1)}
+        return {"implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 2), "prerequisite": min(limit, 1)}
+
+    def _select_diverse_proposals(
+        self,
+        anchor: DocBrief,
+        scored: list[tuple[float, str, CandidateProposal]],
+        limit: int,
+    ) -> list[CandidateProposal]:
+        quotas = self._proposal_bucket_quotas(anchor, limit)
+        buckets: dict[str, list[tuple[float, CandidateProposal]]] = {key: [] for key in quotas}
+        for score, relation_type, proposal in scored:
+            buckets.setdefault(relation_type, []).append((score, proposal))
+
+        selected: list[CandidateProposal] = []
+        selected_ids: set[str] = set()
+        for relation_type, quota in quotas.items():
+            for score, proposal in buckets.get(relation_type, []):
+                if len(selected) >= limit:
+                    break
+                if quota <= 0 or proposal.doc_id in selected_ids:
+                    continue
+                selected.append(proposal)
+                selected_ids.add(proposal.doc_id)
+                quota -= 1
+            if len(selected) >= limit:
+                break
+
+        for score, relation_type, proposal in sorted(scored, key=lambda item: (-item[0], item[1], item[2].doc_id)):
+            if len(selected) >= limit:
+                break
+            if proposal.doc_id in selected_ids:
+                continue
+            selected.append(proposal)
+            selected_ids.add(proposal.doc_id)
+        return selected[:limit]
+
     def _mention_score(self, anchor: DocBrief, candidate: DocBrief) -> float:
         anchor_text = self._brief_text(anchor)
         candidate_text = self._brief_text(candidate)
@@ -112,17 +420,29 @@ class LogicOrchestrator:
     def _candidate_metrics(self, anchor: DocBrief, candidate: DocBrief) -> dict[str, float]:
         anchor_terms = self._brief_terms(anchor)
         candidate_terms = self._brief_terms(candidate)
+        anchor_content_terms = self._content_terms(anchor)
+        candidate_content_terms = self._content_terms(candidate)
         keyword_overlap = len(set(anchor.keywords) & set(candidate.keywords))
         entity_overlap = len(set(anchor.entities) & set(candidate.entities))
         hint_overlap = len(set(anchor.relation_hints) & set(candidate.relation_hints))
         title_overlap = len(set(tokenize(anchor.title)) & set(tokenize(candidate.title)))
         overlap_score = min((keyword_overlap + entity_overlap + hint_overlap + title_overlap) / 5.0, 1.0)
+        content_overlap = len(anchor_content_terms & candidate_content_terms)
+        content_overlap_score = min(content_overlap / 6.0, 1.0)
         mention_score = self._mention_score(anchor, candidate)
         role_listing_score = self._role_listing_score(anchor, candidate)
+        forward_reference_score = self._reference_score(anchor, candidate)
+        reverse_reference_score = self._reference_score(candidate, anchor)
         anchor_vec = self._embed_brief(anchor)
         candidate_vec = self._embed_brief(candidate)
         dense_score = max(cosine(anchor_vec, candidate_vec), 0.0) if anchor_vec is not None and candidate_vec is not None else 0.0
         length_ratio = min(len(candidate.summary), len(anchor.summary)) / max(len(candidate.summary), len(anchor.summary), 1)
+        family_bridge_score = self._family_bridge_score(anchor_content_terms, candidate_content_terms)
+        anchor_family = self._dominant_family(anchor_content_terms)
+        candidate_family = self._dominant_family(candidate_content_terms)
+        topic_alignment = 1.0 if anchor.metadata.get("topic") and anchor.metadata.get("topic") == candidate.metadata.get("topic") else 0.0
+        service_surface_score = min(len(candidate_content_terms & SERVICE_SURFACE_TERMS) / 3.0, 1.0)
+        specific_role_score = 1.0 if set(tokenize(candidate.title)) & SPECIFIC_ROLE_TERMS else 0.0
         topic_drift = 1.0 if mention_score < 0.2 and title_overlap == 0 and keyword_overlap + entity_overlap + hint_overlap == 0 and dense_score < 0.45 else 0.0
         local_support = (
             0.42 * dense_score
@@ -134,6 +454,7 @@ class LogicOrchestrator:
         return {
             "dense_score": dense_score,
             "overlap_score": overlap_score,
+            "content_overlap_score": content_overlap_score,
             "keyword_overlap": float(keyword_overlap),
             "entity_overlap": float(entity_overlap),
             "hint_overlap": float(hint_overlap),
@@ -141,6 +462,13 @@ class LogicOrchestrator:
             "length_ratio": float(length_ratio),
             "mention_score": mention_score,
             "role_listing_score": role_listing_score,
+            "forward_reference_score": forward_reference_score,
+            "reverse_reference_score": reverse_reference_score,
+            "family_bridge_score": family_bridge_score,
+            "shared_dominant_family": 1.0 if anchor_family and anchor_family == candidate_family else 0.0,
+            "topic_alignment": topic_alignment,
+            "service_surface_score": service_surface_score,
+            "specific_role_score": specific_role_score,
             "topic_drift": topic_drift,
             "local_support": local_support,
             "anchor_terms": float(len(anchor_terms)),
@@ -189,18 +517,42 @@ class LogicOrchestrator:
             return any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs"})
         return False
 
-    def _passes_structural_gate(self, metrics: dict[str, float], result) -> bool:
+    def _passes_structural_gate(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result) -> bool:
         relation_type = result.relation_type
         if relation_type == "implementation_detail":
+            direction_score = self._implementation_direction_score(anchor, candidate, metrics)
+            semantic_detail_bridge = (
+                metrics["dense_score"] >= 0.68
+                and metrics["service_surface_score"] < 0.55
+                and metrics["family_bridge_score"] >= 0.75
+                and metrics["shared_dominant_family"] >= 1.0
+                and direction_score >= 0.08
+                and (
+                    metrics["content_overlap_score"] >= 0.18
+                    or metrics["topic_alignment"] >= 1.0
+                    or metrics["mention_score"] >= 0.18
+                )
+            )
             return (
                 metrics["mention_score"] >= 0.3
                 or metrics["role_listing_score"] >= 0.55
                 or (metrics["overlap_score"] >= 0.6 and metrics["dense_score"] >= 0.55)
+                or semantic_detail_bridge
             )
         if relation_type == "supporting_evidence":
-            return metrics["mention_score"] >= 0.28 or (metrics["dense_score"] >= 0.68 and metrics["overlap_score"] >= 0.4)
+            return (
+                metrics["service_surface_score"] < 0.35
+                and metrics["dense_score"] >= 0.58
+                and (
+                    metrics["mention_score"] >= 0.18
+                    or metrics["content_overlap_score"] >= 0.18
+                    or metrics["family_bridge_score"] >= 0.42
+                )
+            )
         if relation_type == "prerequisite":
-            return metrics["role_listing_score"] >= 0.5 or (metrics["mention_score"] >= 0.28 and metrics["dense_score"] >= 0.52)
+            return metrics["specific_role_score"] >= 0.5 and (
+                metrics["role_listing_score"] >= 0.5 or (metrics["mention_score"] >= 0.28 and metrics["dense_score"] >= 0.52)
+            )
         if relation_type in {"same_concept", "comparison"}:
             return False
         return True
@@ -231,6 +583,17 @@ class LogicOrchestrator:
         )
 
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
+        topic = str(anchor.metadata.get("topic", "")).lower()
+        anchor_terms = self._content_terms(anchor)
+        title_tokens = set(tokenize(anchor.title))
+        if topic in {"hnsw", "evaluation"}:
+            return False
+        if "similarity" in title_tokens:
+            return False
+        if topic == "retrieval" and len(anchor_terms & FOUNDATIONAL_TERMS) >= 2 and not (anchor_terms & {"hybrid", "overlay", "logic"}):
+            return False
+        if topic in {"retrieval", "logic", "deepagents", "ops"}:
+            return True
         text_tokens = set(tokenize(self._brief_text(anchor)))
         return bool(text_tokens & DISCOVERY_TERMS) or len(anchor.relation_hints) >= 4
 
@@ -238,7 +601,14 @@ class LogicOrchestrator:
         anchor_text = self._brief_text(anchor)
         candidate_text = self._brief_text(candidate)
         direct_title_link = candidate.title.lower() in anchor_text or anchor.title.lower() in candidate_text
-        if metrics["role_listing_score"] >= 0.62 and metrics["mention_score"] >= 0.32:
+        _, _, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+        if (
+            self._doc_stage(anchor) == "agent_roles"
+            and self._has_listing_context(anchor) >= 1.0
+            and metrics["specific_role_score"] >= 0.5
+            and fit_scores["prerequisite"] >= 0.72
+            and metrics["role_listing_score"] >= 0.5
+        ):
             return self._make_fallback_result(
                 anchor,
                 candidate,
@@ -247,16 +617,40 @@ class LogicOrchestrator:
                 reason="Anchor enumerates specialized roles and candidate is one listed role.",
                 support_score=min(0.95, metrics["local_support"] + 0.18),
             )
-        if direct_title_link and metrics["mention_score"] >= 0.4 and any(cue in candidate_text or cue in anchor_text for cue in DETAIL_CUES):
+        if (
+            metrics["service_surface_score"] < 0.55
+            and fit_scores["implementation_detail"] >= 0.6
+            and (
+                (direct_title_link and metrics["mention_score"] >= 0.28 and any(cue in candidate_text or cue in anchor_text for cue in DETAIL_CUES))
+                or (
+                    metrics["dense_score"] >= 0.68
+                    and metrics["family_bridge_score"] >= 0.75
+                    and metrics["shared_dominant_family"] >= 1.0
+                    and self._implementation_direction_score(anchor, candidate, metrics) >= 0.08
+                    and (
+                        metrics["content_overlap_score"] >= 0.18
+                        or metrics["topic_alignment"] >= 1.0
+                        or metrics["mention_score"] >= 0.18
+                    )
+                )
+            )
+        ):
             return self._make_fallback_result(
                 anchor,
                 candidate,
                 "implementation_detail",
                 confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
-                reason="Candidate title or function is explicitly referenced and then elaborated with concrete details.",
+                reason="Anchor and candidate share a high-confidence mechanism or component-level semantic match.",
                 support_score=min(0.92, metrics["local_support"] + 0.12),
             )
-        if direct_title_link and metrics["mention_score"] >= 0.38 and any(cue in candidate_text or cue in anchor_text for cue in SUPPORT_CUES):
+        if (
+            metrics["service_surface_score"] < 0.35
+            and fit_scores["supporting_evidence"] >= 0.45
+            and direct_title_link
+            and metrics["mention_score"] >= 0.28
+            and metrics["content_overlap_score"] >= 0.14
+            and any(cue in candidate_text or cue in anchor_text for cue in SUPPORT_CUES)
+        ):
             return self._make_fallback_result(
                 anchor,
                 candidate,
@@ -269,11 +663,22 @@ class LogicOrchestrator:
 
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
         metrics = self._candidate_metrics(anchor, candidate)
+        rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
         final_result = result
         fallback = self._local_relation_override(anchor, candidate, metrics, result)
         if fallback is not None:
-            force_override = fallback.relation_type == "prerequisite" and metrics["role_listing_score"] >= 0.62
-            if force_override or not result.accepted or result.relation_type in {"same_concept", "comparison"} or float(result.confidence) < 0.84:
+            force_override = fallback.relation_type == "prerequisite" and metrics["specific_role_score"] >= 0.5 and metrics["role_listing_score"] >= 0.62
+            detail_override = (
+                fallback.relation_type == "implementation_detail"
+                and metrics["dense_score"] >= 0.68
+                and metrics["service_surface_score"] < 0.55
+                and (
+                    not result.accepted
+                    or result.relation_type in {"same_concept", "comparison", "prerequisite", "supporting_evidence"}
+                    or float(result.confidence) < 0.88
+                )
+            )
+            if force_override or detail_override or not result.accepted or result.relation_type in {"same_concept", "comparison"} or float(result.confidence) < 0.84:
                 final_result = fallback
 
         if not final_result.accepted:
@@ -294,8 +699,23 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._relation_cues(anchor, candidate, final_result):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if not self._passes_structural_gate(metrics, final_result):
+        if final_result.relation_type == "implementation_detail" and fit_scores["implementation_detail"] + 0.04 < max(fit_scores["supporting_evidence"], fit_scores["prerequisite"]):
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "supporting_evidence" and fit_scores["supporting_evidence"] < 0.25:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "prerequisite" and fit_scores["prerequisite"] < 0.38:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if not self._passes_structural_gate(anchor, candidate, metrics, final_result):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "implementation_detail":
+            direction_score = self._implementation_direction_score(anchor, candidate, metrics)
+            if direction_score < 0.08:
+                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+            if self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) < -0.08:
+                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "supporting_evidence":
+            if self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) < -0.08:
+                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
@@ -306,6 +726,9 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
 
         score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
+        score *= 1.0 + 0.16 * fit_scores.get(final_result.relation_type, rerank_score)
+        if final_result.relation_type == "implementation_detail":
+            score *= 1.0 + max(self._implementation_direction_score(anchor, candidate, metrics), 0.0)
         edge = LogicEdge(
             src_doc_id=anchor.doc_id,
             dst_doc_id=candidate.doc_id,
@@ -345,13 +768,19 @@ class LogicOrchestrator:
             metrics = self._candidate_metrics(anchor, candidate)
             if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
                 continue
-            score = metrics["local_support"] + 0.35 * metrics["mention_score"] + 0.15 * metrics["role_listing_score"]
+            rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            score = (
+                metrics["local_support"]
+                + 0.42 * rerank_score
+                + 0.08 * fit_scores["implementation_detail"]
+                + 0.06 * fit_scores["supporting_evidence"]
+            )
             proposals.append(
                 (
                     score,
                     CandidateProposal(
                         doc_id=candidate.doc_id,
-                        reason="local dense+lexical match",
+                        reason=f"local rerank favors {relation_type}",
                         query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
                         score_hint=min(score, 0.99),
                     ),
@@ -376,19 +805,34 @@ class LogicOrchestrator:
             metrics = self._candidate_metrics(anchor, candidate)
             if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
                 continue
-            score = proposal.score_hint + metrics["local_support"] + 0.2 * metrics["mention_score"]
+            rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            score = (
+                0.55 * proposal.score_hint
+                + metrics["local_support"]
+                + 0.34 * rerank_score
+                + 0.06 * fit_scores["implementation_detail"]
+                + 0.04 * fit_scores["supporting_evidence"]
+            )
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
-                merged[proposal.doc_id] = (score, proposal)
+                merged[proposal.doc_id] = (score, CandidateProposal(doc_id=proposal.doc_id, reason=proposal.reason, query=proposal.query, score_hint=min(score, 0.99)))
 
         for score, proposal in self._local_candidate_proposals(anchor, corpus):
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
 
-        ranked = sorted(merged.values(), key=lambda item: (-item[0], item[1].doc_id))
         limit = self._live_candidate_limit(anchor) if self._is_live_provider() else 6
-        return [proposal for _, proposal in ranked[:limit]]
+        scored: list[tuple[float, str, CandidateProposal]] = []
+        for score, proposal in merged.values():
+            candidate = brief_map.get(proposal.doc_id)
+            if candidate is None:
+                continue
+            metrics = self._candidate_metrics(anchor, candidate)
+            rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            scored.append((score + 0.18 * rerank_score, relation_type, proposal))
+        scored.sort(key=lambda item: (-item[0], item[1], item[2].doc_id))
+        return self._select_diverse_proposals(anchor, scored, limit)
 
     def judge(self, anchor: DocBrief, candidate: DocBrief) -> LogicEdge | None:
         result = self.relation_judge.run(anchor, candidate)

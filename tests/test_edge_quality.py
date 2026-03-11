@@ -209,6 +209,369 @@ def test_local_gate_rejects_topic_drift_or_low_support():
     assert assessment.reject_reason in {"topic_drift", "low_support"}
 
 
+def test_semantic_detail_bridge_accepts_high_dense_mechanism_pair():
+    class SemanticProvider(FakeProvider):
+        def embed_texts(self, texts):
+            rows = []
+            for text in texts:
+                if "Hybrid Retrieval" in text or "Candidate Fusion" in text:
+                    rows.append(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+                else:
+                    rows.append(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+            return np.vstack(rows)
+
+    provider = type("OpenAICompatibleProvider", (SemanticProvider,), {})()
+    anchor = _brief(
+        "doc-07",
+        "Hybrid Retrieval",
+        "Hybrid retrieval merges geometric seed sets with logical expansions and combines HNSW and logic scores in a weighted formula.",
+        ["hybrid", "retrieval", "geometric", "hnsw", "logic", "scores", "weighted", "formula"],
+        ["hybrid retrieval"],
+        ["weighted formula", "logic score"],
+    )
+    candidate = _brief(
+        "doc-10",
+        "Candidate Fusion",
+        "Candidate fusion computes alpha times the HNSW score plus beta times the logic score from the best expansion path.",
+        ["candidate", "fusion", "hnsw", "logic", "score", "expansion", "path", "formula"],
+        ["candidate fusion"],
+        ["scoring", "expansion path"],
+    )
+    verdicts = {
+        "doc-10": JudgeResult(
+            accepted=False,
+            relation_type="comparison",
+            confidence=0.42,
+            evidence_spans=[],
+            rationale="Shared ranking context only.",
+            support_score=0.2,
+            contradiction_flags=[],
+            decision_reason="Model abstained on the pair.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
+    assert assessment.edge is not None
+
+
+def test_directionality_rejects_reverse_implementation_pair():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-10",
+        "Candidate Fusion",
+        "Candidate fusion computes alpha times the HNSW score plus beta times the logic score from the best expansion path.",
+        ["candidate", "fusion", "hnsw", "logic", "score", "expansion", "path", "formula"],
+        ["candidate fusion"],
+        ["scoring", "expansion path"],
+    )
+    candidate = _brief(
+        "doc-08",
+        "Logic Overlay Graph",
+        "The logic overlay graph stores offline-discovered relations and is used after initial HNSW recall.",
+        ["logic", "overlay", "graph", "recall", "relations"],
+        ["logic graph"],
+        ["sidecar graph", "recall"],
+    )
+    verdicts = {
+        "doc-08": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.94,
+            evidence_spans=[
+                "Candidate fusion combines logic score with HNSW score.",
+                "The logic overlay graph supplies document relations used after recall.",
+            ],
+            rationale="The two documents share the same logic-retrieval mechanism family.",
+            support_score=0.84,
+            contradiction_flags=[],
+            decision_reason="Mechanism family overlap appears strong.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason in {"wrong_direction", "weak_link"}
+
+
+def test_supporting_evidence_rejects_service_surface_pairs():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-20",
+        "Jobs and Workers",
+        "Offline build and discovery tasks run as background jobs using a lightweight worker pool and SQLite registry.",
+        ["jobs", "workers", "background", "build", "discovery", "sqlite", "registry"],
+        ["jobs"],
+        ["background jobs", "sqlite registry"],
+    )
+    candidate = _brief(
+        "doc-21",
+        "FastAPI Service",
+        "The public service exposes build endpoints, health checks, and job inspection while scheduling expensive tasks through the job registry.",
+        ["fastapi", "service", "endpoints", "health", "inspection", "job", "registry"],
+        ["service"],
+        ["build endpoints", "job registry"],
+    )
+    verdicts = {
+        "doc-21": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.91,
+            evidence_spans=[
+                "Expensive tasks are scheduled through the job registry.",
+                "The service exposes build endpoints and job inspection.",
+            ],
+            rationale="The service uses the same job registry for task scheduling.",
+            support_score=0.8,
+            contradiction_flags=[],
+            decision_reason="Shared registry suggests supporting evidence.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason == "wrong_relation_type"
+
+
+def test_should_attempt_discovery_prefers_structural_topics():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=SimpleNamespace(provider=provider),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    hnsw_brief = _brief(
+        "doc-04",
+        "HNSW Insert Path",
+        "Insertion in HNSW walks the hierarchy and keeps the base algorithm unchanged.",
+        ["hnsw", "insert", "hierarchy"],
+    )
+    hnsw_brief.metadata["topic"] = "hnsw"
+    logic_brief = _brief(
+        "doc-08",
+        "Logic Overlay Graph",
+        "The overlay graph stores logical edges used after HNSW recall.",
+        ["logic", "overlay", "graph", "recall"],
+    )
+    logic_brief.metadata["topic"] = "logic"
+    similarity_brief = _brief(
+        "doc-06",
+        "Cosine Similarity",
+        "Cosine similarity is a standard metric for vector retrieval and relevance scoring.",
+        ["cosine", "similarity", "metric", "retrieval"],
+    )
+    similarity_brief.metadata["topic"] = "retrieval"
+
+    assert orchestrator.should_attempt_discovery(hnsw_brief) is False
+    assert orchestrator.should_attempt_discovery(similarity_brief) is False
+    assert orchestrator.should_attempt_discovery(logic_brief) is True
+
+
+def test_stage_reranker_prefers_graph_to_policy_over_fusion():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=SimpleNamespace(provider=provider),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "doc-08",
+        "Logic Overlay Graph",
+        "The logic overlay graph stores offline relations and is used after initial HNSW recall.",
+        ["logic", "overlay", "graph", "relations", "recall"],
+        relation_hints=["sidecar graph", "after recall"],
+    )
+    anchor.metadata["topic"] = "logic"
+    policy = _brief(
+        "doc-09",
+        "Jump Policy",
+        "The jump policy defines confidence and relevance gates for one-hop expansion after top-B geometric recall.",
+        ["jump", "policy", "confidence", "relevance", "expansion", "recall"],
+        relation_hints=["one-hop expansion", "top B recall"],
+    )
+    policy.metadata["topic"] = "logic"
+    fusion = _brief(
+        "doc-10",
+        "Candidate Fusion",
+        "Candidate fusion combines HNSW score and logic score in the final weighted ranker.",
+        ["candidate", "fusion", "score", "logic", "ranker", "weighted"],
+        relation_hints=["final ranker", "weighted score"],
+    )
+    fusion.metadata["topic"] = "logic"
+
+    policy_metrics = orchestrator._candidate_metrics(anchor, policy)
+    fusion_metrics = orchestrator._candidate_metrics(anchor, fusion)
+
+    assert orchestrator._relation_fit_scores(anchor, policy, policy_metrics)["implementation_detail"] > orchestrator._relation_fit_scores(anchor, fusion, fusion_metrics)["implementation_detail"]
+
+
+def test_role_reranker_recovers_specific_role_from_comparison_verdict():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-12",
+        "Subagents",
+        "Subagents include document profiler, corpus scout, relation judge, and memory curator roles.",
+        ["subagents", "document", "profiler", "corpus", "scout", "relation", "judge", "memory", "curator"],
+        ["subagents"],
+        ["include", "roles"],
+    )
+    anchor.metadata["topic"] = "deepagents"
+    candidate = _brief(
+        "doc-18",
+        "Memory Curator",
+        "The memory curator maintains persistent memory for accepted edges.",
+        ["memory", "curator", "persistent", "accepted", "edges"],
+        ["memory"],
+        ["maintains"],
+    )
+    candidate.metadata["topic"] = "agents"
+    verdicts = {
+        "doc-18": JudgeResult(
+            accepted=True,
+            relation_type="comparison",
+            confidence=0.95,
+            evidence_spans=[
+                "Subagents include memory curator among the roles.",
+                "The memory curator maintains persistent memory for accepted edges.",
+            ],
+            rationale="Both are parts of the same system.",
+            support_score=0.83,
+            contradiction_flags=[],
+            decision_reason="Shared system context only.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "prerequisite"
+    assert assessment.edge is not None
+
+
+def test_support_stage_direction_rejects_reverse_policy_edge():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-10",
+        "Candidate Fusion",
+        "Candidate fusion combines HNSW score and logic score in the final weighted ranker.",
+        ["candidate", "fusion", "score", "logic", "ranker", "weighted"],
+        relation_hints=["final ranker", "weighted score"],
+    )
+    anchor.metadata["topic"] = "logic"
+    candidate = _brief(
+        "doc-09",
+        "Jump Policy",
+        "The jump policy defines confidence and relevance gates for one-hop expansion after top-B geometric recall.",
+        ["jump", "policy", "confidence", "relevance", "expansion", "recall"],
+        relation_hints=["one-hop expansion", "top B recall"],
+    )
+    candidate.metadata["topic"] = "logic"
+    verdicts = {
+        "doc-09": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.9,
+            evidence_spans=[
+                "One-hop expansion is allowed only under specific conditions.",
+                "The seed must be in the top B geometric results.",
+            ],
+            rationale="Jump Policy constrains the expansion paths later used by Candidate Fusion.",
+            support_score=0.82,
+            contradiction_flags=[],
+            decision_reason="The policy influences the fusion stage through the path definition.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason in {"topic_drift", "wrong_direction"}
+
+
+def test_implementation_stage_direction_rejects_service_to_overview_edge():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-21",
+        "FastAPI Service",
+        "The public FastAPI service exposes endpoints for build, search, revalidation, health checks, and job inspection.",
+        ["fastapi", "service", "endpoints", "search", "revalidation", "health", "job"],
+        relation_hints=["build endpoints", "job inspection"],
+    )
+    anchor.metadata["topic"] = "ops"
+    candidate = _brief(
+        "doc-20",
+        "Jobs and Workers",
+        "Offline build, profiling, discovery, and revalidation tasks run as background jobs with a lightweight worker pool.",
+        ["jobs", "workers", "background", "build", "profiling", "discovery", "revalidation"],
+        relation_hints=["background jobs", "worker pool"],
+    )
+    candidate.metadata["topic"] = "ops"
+    verdicts = {
+        "doc-20": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.9,
+            evidence_spans=[
+                "The service exposes build and revalidation endpoints.",
+                "Offline build, profiling, discovery, and revalidation tasks run as background jobs.",
+            ],
+            rationale="The service depends on the worker system for expensive tasks.",
+            support_score=0.8,
+            contradiction_flags=[],
+            decision_reason="The worker system appears to be a downstream implementation detail.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason in {"wrong_relation_type", "wrong_direction"}
+
+
 def test_parse_json_tolerates_fenced_json():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     payload = provider._parse_json("```json\n{\"accepted\": true, \"confidence\": 0.9}\n```")
