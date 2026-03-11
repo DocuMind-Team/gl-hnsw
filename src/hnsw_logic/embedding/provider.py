@@ -131,6 +131,15 @@ class ProviderBase:
                 "expected_relation_type": "none",
                 "why": "There is no direct semantic dependency between profiling and job persistence.",
             },
+            {
+                "label": "negative",
+                "anchor_title": "Background Jobs",
+                "anchor_text": "Workers run expensive offline tasks through a lightweight registry.",
+                "candidate_title": "Public API Service",
+                "candidate_text": "The service exposes endpoints that can submit jobs to the registry.",
+                "expected_relation_type": "none",
+                "why": "A service using the same registry is not by itself durable supporting evidence for the worker design.",
+            },
         ]
         return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
 
@@ -330,6 +339,15 @@ class OpenAICompatibleProvider(StubProvider):
         ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
         return [brief for _, brief in ranked[:limit]]
 
+    def _judge_instruction(self) -> str:
+        return (
+            "You are a relation judge. Return JSON only. Prefer precision over recall. "
+            "Use relation types: supporting_evidence, implementation_detail, same_concept, comparison, prerequisite. "
+            "implementation_detail means the candidate defines a mechanism, formula, backend, or component directly used by the anchor. "
+            "supporting_evidence means the candidate explains, constrains, or gates a claim in the anchor; do not use it for mere co-usage, API exposure, or two components that share the same registry or service surface. "
+            "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor."
+        )
+
     def _embed_local_bge_m3(self, texts: list[str]) -> np.ndarray:
         import torch
 
@@ -492,7 +510,7 @@ class OpenAICompatibleProvider(StubProvider):
     def judge_relation(self, anchor: DocBrief, candidate: DocBrief) -> JudgeResult:
         try:
             payload = self._invoke_json(
-                "You are a relation judge. Return JSON only. Prefer precision over recall. Use relation types: supporting_evidence, implementation_detail, same_concept, comparison, prerequisite.",
+                self._judge_instruction(),
                 "\n".join(
                     part
                     for part in [
@@ -541,7 +559,7 @@ class OpenAICompatibleProvider(StubProvider):
         for batch in self._chunk(candidates, 6):
             try:
                 payload = self._invoke_json(
-                    "You are a relation judge. Return JSON only. Prefer precision over recall. Use relation types: supporting_evidence, implementation_detail, same_concept, comparison, prerequisite.",
+                    self._judge_instruction(),
                     "\n".join(
                         part
                         for part in [
