@@ -49,6 +49,8 @@ class HybridRetrievalService:
         memory = self.semantic_memory_store.read()
         query_terms = set(query.lower().split())
         for row in rows:
+            if row["source_kind"] == "geometric":
+                continue
             bias = 0.0
             brief = self.brief_store.read(row["doc_id"])
             if brief is None:
@@ -101,7 +103,7 @@ class HybridRetrievalService:
                 if brief is None:
                     continue
                 edge_emb = self.scorer.edge_embedding(edge)
-                target_rel_score = self.scorer.score_target(query_emb, brief)
+                target_rel_score = self.scorer.score_target(query, query_emb, brief)
                 if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score):
                     expanded.append(
                         ExpandedCandidate(

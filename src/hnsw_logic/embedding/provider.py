@@ -11,7 +11,7 @@ import numpy as np
 
 from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
-from hnsw_logic.core.utils import deterministic_vector, read_jsonl, to_jsonable, tokenize, top_terms
+from hnsw_logic.core.utils import deterministic_vector, to_jsonable, tokenize, top_terms
 
 
 @dataclass(slots=True)
@@ -43,20 +43,14 @@ class ProviderBase:
             "judge": True,
             "curator": True,
         }
-        self.gold_edges: list[dict] = []
-        self.gold_edge_set: set[tuple[str, str, str]] = set()
-        self.gold_targets_by_source: dict[str, set[str]] = {}
-        self.gold_relation_by_pair: dict[tuple[str, str], str] = {}
         self.relation_priors = {
-            "supporting_evidence": 1.0,
+            "supporting_evidence": 1.02,
             "implementation_detail": 1.0,
-            "same_concept": 0.7,
-            "comparison": 0.6,
-            "prerequisite": 1.0,
+            "same_concept": 0.82,
+            "comparison": 0.68,
+            "prerequisite": 0.98,
         }
-        self.judge_few_shot_text = ""
-        self._doc_map: dict[str, dict] = {}
-        self._load_gold_calibration()
+        self.judge_few_shot_text = self._build_generic_judge_examples()
 
     @property
     def embedding_dim(self) -> int:
@@ -90,81 +84,55 @@ class ProviderBase:
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
         raise NotImplementedError
 
-    def _load_gold_calibration(self) -> None:
-        if self.root_dir is None:
-            return
-        raw_path = self.root_dir / "data" / "raw" / "demo.jsonl"
-        gold_path = self.root_dir / "data" / "demo" / "gold_edges.jsonl"
-        if not raw_path.exists() or not gold_path.exists():
-            return
-        self._doc_map = {row["doc_id"]: row for row in read_jsonl(raw_path)}
-        self.gold_edges = read_jsonl(gold_path)
-        self.gold_edge_set = {
-            (row["src_doc_id"], row["dst_doc_id"], row["relation_type"])
-            for row in self.gold_edges
-        }
-        self.gold_targets_by_source = {}
-        self.gold_relation_by_pair = {}
-        counts: dict[str, int] = {}
-        for row in self.gold_edges:
-            counts[row["relation_type"]] = counts.get(row["relation_type"], 0) + 1
-            self.gold_targets_by_source.setdefault(row["src_doc_id"], set()).add(row["dst_doc_id"])
-            self.gold_relation_by_pair[(row["src_doc_id"], row["dst_doc_id"])] = row["relation_type"]
-        if counts:
-            max_count = max(counts.values())
-            for relation_type, count in counts.items():
-                self.relation_priors[relation_type] = 0.85 + 0.3 * (count / max_count)
-        self.judge_few_shot_text = self._build_judge_few_shot_text()
-
-    def _build_judge_few_shot_text(self) -> str:
-        if not self.gold_edges or not self._doc_map:
-            return ""
-        examples: list[str] = []
-        seen_relations: set[str] = set()
-        for row in self.gold_edges:
-            relation_type = row["relation_type"]
-            if relation_type in seen_relations or relation_type not in {"supporting_evidence", "implementation_detail", "prerequisite"}:
-                continue
-            seen_relations.add(relation_type)
-            src = self._doc_map.get(row["src_doc_id"], {})
-            dst = self._doc_map.get(row["dst_doc_id"], {})
-            examples.append(
-                json.dumps(
-                    {
-                        "label": "positive",
-                        "anchor_title": src.get("title", row["src_doc_id"]),
-                        "anchor_text": src.get("text", "")[:220],
-                        "candidate_title": dst.get("title", row["dst_doc_id"]),
-                        "candidate_text": dst.get("text", "")[:220],
-                        "expected_relation_type": relation_type,
-                        "why": row.get("edge_card_text", ""),
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        negative_pairs = [
-            ("doc-08", "doc-05", "topic drift: logic overlay vs evaluation metrics"),
-            ("doc-15", "doc-23", "weak evidence: profiling does not imply revalidation"),
-            ("doc-11", "doc-20", "same product family but no direct logical edge"),
+    def _build_generic_judge_examples(self) -> str:
+        examples = [
+            {
+                "label": "positive",
+                "anchor_title": "Hybrid Retrieval",
+                "anchor_text": "The retriever combines geometric recall with logical expansions and then ranks the merged candidates.",
+                "candidate_title": "Candidate Fusion",
+                "candidate_text": "The fusion stage computes a weighted score over the geometric score and the logic score.",
+                "expected_relation_type": "implementation_detail",
+                "why": "The candidate defines the scoring mechanism used by the anchor.",
+            },
+            {
+                "label": "positive",
+                "anchor_title": "Subagents",
+                "anchor_text": "The system includes a profiler role, a scout role, a judge role, and a curator role.",
+                "candidate_title": "Relation Judge",
+                "candidate_text": "The judge role verifies whether an anchor and a candidate should form a durable edge.",
+                "expected_relation_type": "prerequisite",
+                "why": "The candidate is one of the explicitly listed roles in the anchor.",
+            },
+            {
+                "label": "positive",
+                "anchor_title": "Jump Policy",
+                "anchor_text": "The policy decides whether a logical candidate may enter the final ranker.",
+                "candidate_title": "Candidate Fusion",
+                "candidate_text": "Only approved logical candidates contribute logic score to the final ranking stage.",
+                "expected_relation_type": "supporting_evidence",
+                "why": "The candidate explains the downstream effect of the policy's approval.",
+            },
+            {
+                "label": "negative",
+                "anchor_title": "Logic Overlay Graph",
+                "anchor_text": "The overlay stores durable document-to-document relations used after initial recall.",
+                "candidate_title": "ANN Metrics",
+                "candidate_text": "Metrics such as recall and MRR summarize retrieval quality.",
+                "expected_relation_type": "none",
+                "why": "The topics belong to the same project but do not form a durable document edge.",
+            },
+            {
+                "label": "negative",
+                "anchor_title": "Document Profiler",
+                "anchor_text": "The profiler produces a structured brief for an input document.",
+                "candidate_title": "SQLite Job Registry",
+                "candidate_text": "A registry stores job ids, states, and timestamps for background workers.",
+                "expected_relation_type": "none",
+                "why": "There is no direct semantic dependency between profiling and job persistence.",
+            },
         ]
-        for src_id, dst_id, why in negative_pairs:
-            src = self._doc_map.get(src_id, {})
-            dst = self._doc_map.get(dst_id, {})
-            examples.append(
-                json.dumps(
-                    {
-                        "label": "negative",
-                        "anchor_title": src.get("title", src_id),
-                        "anchor_text": src.get("text", "")[:220],
-                        "candidate_title": dst.get("title", dst_id),
-                        "candidate_text": dst.get("text", "")[:220],
-                        "expected_relation_type": "none",
-                        "why": why,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        return "\n".join(examples)
+        return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
 
 
 class StubProvider(ProviderBase):

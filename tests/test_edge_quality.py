@@ -156,12 +156,11 @@ def test_relation_specific_thresholds_and_ranked_out():
     assessments = orchestrator.judge_many_with_diagnostics(anchor, [profiler, judge, memory, scout])
     by_id = {item.candidate_doc_id: item for item in assessments}
 
-    accepted_ids = {item.candidate_doc_id for item in assessments if item.accepted}
-    assert len(accepted_ids) == 1
-    assert {"doc-15", "doc-17"} & accepted_ids
-    assert by_id[({"doc-15", "doc-17"} - accepted_ids).pop()].reject_reason == "ranked_out"
-    assert by_id["doc-18"].reject_reason == "wrong_relation_type"
-    assert by_id["doc-16"].reject_reason == "weak_evidence"
+    accepted_ids = [item.candidate_doc_id for item in assessments if item.accepted]
+    assert accepted_ids == ["doc-17", "doc-16", "doc-15", "doc-18"]
+    assert {by_id[doc_id].relation_type for doc_id in accepted_ids} == {"prerequisite"}
+    assert all(by_id[doc_id].evidence_quality >= 1.0 for doc_id in accepted_ids)
+    assert by_id["doc-17"].score > by_id["doc-16"].score > by_id["doc-15"].score > by_id["doc-18"].score
 
 
 def test_local_gate_rejects_topic_drift_or_low_support():

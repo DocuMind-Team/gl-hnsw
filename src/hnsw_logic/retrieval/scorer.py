@@ -6,7 +6,7 @@ import numpy as np
 
 from hnsw_logic.config.schema import RetrievalConfig
 from hnsw_logic.core.models import DocBrief, LogicEdge
-from hnsw_logic.core.utils import cosine
+from hnsw_logic.core.utils import cosine, tokenize
 from hnsw_logic.embedding.provider import ProviderBase
 
 
@@ -31,12 +31,41 @@ class RetrievalScorer:
     def encode_query(self, query: str) -> np.ndarray:
         return self.provider.embed_texts([query])[0]
 
-    def score_target(self, query_emb: np.ndarray, brief: DocBrief) -> float:
+    def query_alignment(self, query: str, brief: DocBrief) -> float:
+        query_tokens = {token for token in tokenize(query) if len(token) > 2}
+        if not query_tokens:
+            return 0.0
+        brief_tokens = {
+            *tokenize(brief.title),
+            *tokenize(brief.summary),
+            *brief.keywords,
+            *brief.entities,
+            *brief.relation_hints,
+        }
+        brief_tokens = {token for token in brief_tokens if len(token) > 2}
+        overlap = query_tokens & brief_tokens
+        if not overlap:
+            return 0.0
+        return min(len(overlap) / max(1, min(len(query_tokens), 4)), 1.0)
+
+    def score_target(self, query: str, query_emb: np.ndarray, brief: DocBrief) -> float:
         target_emb = self._brief_embedding_cache.get(brief.doc_id)
         if target_emb is None:
             target_emb = self.provider.embed_texts([f"{brief.title}\n{brief.summary}"])[0]
             self._brief_embedding_cache[brief.doc_id] = target_emb
-        return cosine(query_emb, target_emb)
+        dense_score = cosine(query_emb, target_emb)
+        lexical_alignment = self.query_alignment(query, brief)
+        return 0.82 * dense_score + 0.18 * lexical_alignment
+
+    def relation_query_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
+        alignment = self.query_alignment(query, brief)
+        if edge.relation_type == "prerequisite":
+            return 0.2 + 0.8 * alignment
+        if edge.relation_type == "supporting_evidence":
+            return 0.1 + 0.6 * alignment
+        if edge.relation_type == "implementation_detail":
+            return 0.55 + 0.45 * alignment
+        return 0.4 + 0.6 * alignment
 
     def edge_embedding(self, edge: LogicEdge) -> np.ndarray:
         edge_emb = self._edge_embedding_cache.get(edge.edge_card_text)
@@ -66,17 +95,19 @@ class RetrievalScorer:
                 "summary": briefs[doc_id].summary,
             }
         for candidate in expanded:
-            logic_score = candidate.seed_score * candidate.edge.confidence * candidate.edge_match * candidate.target_rel_score
+            target_brief = briefs[candidate.doc_id]
+            relation_multiplier = self.relation_query_multiplier(query, target_brief, candidate.edge)
+            logic_score = candidate.seed_score * candidate.edge.confidence * candidate.edge_match * candidate.target_rel_score * relation_multiplier
             row = merged.setdefault(
                 candidate.doc_id,
                 {
                     "doc_id": candidate.doc_id,
-                    "title": briefs[candidate.doc_id].title,
+                    "title": target_brief.title,
                     "geometric_score": 0.0,
                     "logical_score": 0.0,
                     "source_kind": "logic",
                     "via_edge": f"{candidate.source_doc_id}->{candidate.doc_id}",
-                    "summary": briefs[candidate.doc_id].summary,
+                    "summary": target_brief.summary,
                 },
             )
             if logic_score > row["logical_score"]:

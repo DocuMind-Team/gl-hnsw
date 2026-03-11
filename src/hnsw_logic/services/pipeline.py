@@ -49,6 +49,7 @@ class BuildPipeline:
     def discover_edges(self):
         docs = self.corpus_store.read_processed()
         briefs = self.discovery_service.ensure_briefs(docs)
+        brief_map = {brief.doc_id: brief for brief in briefs}
         self.graph_store.path.unlink(missing_ok=True)
         self.graph_store.reload()
         if self.settings.app.provider.kind == "stub":
@@ -62,9 +63,10 @@ class BuildPipeline:
                 self.graph_memory_store.write(stats)
                 return {"edges": len(gold_edges), "new_edges": len(gold_edges), "mode": "demo-gold"}
         if self.settings.app.provider.kind == "openai_compatible":
-            calibration_targets = getattr(self.provider, "gold_targets_by_source", {})
-            if calibration_targets:
-                docs = [doc for doc in docs if doc.doc_id in calibration_targets]
+            docs = [
+                doc for doc in docs
+                if self.discovery_service.orchestrator.should_attempt_discovery(brief_map[doc.doc_id])
+            ]
         accepted = []
         for doc in docs:
             accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))

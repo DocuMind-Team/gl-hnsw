@@ -8,6 +8,19 @@ from hnsw_logic.config.schema import RelationQualityConfig, RetrievalConfig
 from hnsw_logic.core.constants import DEFAULT_TIMESTAMP, RELATION_TYPES
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.core.utils import cosine, tokenize
+from hnsw_logic.embedding.provider import CandidateProposal
+
+
+ROLE_WORDS = {"role", "roles", "subagent", "subagents", "profiler", "scout", "judge", "curator"}
+LISTING_WORDS = {"include", "includes", "including", "role", "roles", "subagent", "subagents"}
+DETAIL_CUES = {"detail", "formula", "score", "policy", "fusion", "registry", "storage", "backend", "worker", "report", "metrics", "tracked", "path"}
+SUPPORT_CUES = {"support", "supports", "allow", "allows", "govern", "governs", "control", "controls", "later", "after", "used", "enters"}
+ORDER_CUES = {"before", "after", "first", "then", "prior", "precedes", "depends"}
+DISCOVERY_TERMS = {
+    "logic", "hybrid", "jump", "candidate", "fusion", "subagent", "subagents", "memory",
+    "profiler", "scout", "judge", "curator", "worker", "workers", "job", "jobs", "registry",
+    "report", "benchmark", "metrics", "revalidate", "revalidation",
+}
 
 
 @dataclass(slots=True)
@@ -60,6 +73,42 @@ class LogicOrchestrator:
     def _brief_terms(self, brief: DocBrief) -> set[str]:
         return set(brief.keywords + brief.entities + brief.relation_hints + tokenize(brief.title))
 
+    def _brief_text(self, brief: DocBrief) -> str:
+        return " ".join([brief.title, brief.summary, *brief.claims]).lower()
+
+    def _mention_score(self, anchor: DocBrief, candidate: DocBrief) -> float:
+        anchor_text = self._brief_text(anchor)
+        candidate_text = self._brief_text(candidate)
+        candidate_title = candidate.title.lower()
+        anchor_title = anchor.title.lower()
+        candidate_title_tokens = {token for token in tokenize(candidate.title) if len(token) > 3}
+        anchor_title_tokens = {token for token in tokenize(anchor.title) if len(token) > 3}
+        anchor_text_tokens = set(tokenize(anchor.summary + " " + " ".join(anchor.claims)))
+        candidate_text_tokens = set(tokenize(candidate.summary + " " + " ".join(candidate.claims)))
+        score = 0.0
+        if candidate_title and candidate_title in anchor_text:
+            score += 0.55
+        if anchor_title and anchor_title in candidate_text:
+            score += 0.35
+        score += 0.08 * len(candidate_title_tokens & anchor_text_tokens)
+        score += 0.06 * len(anchor_title_tokens & candidate_text_tokens)
+        return min(score, 1.0)
+
+    def _role_listing_score(self, anchor: DocBrief, candidate: DocBrief) -> float:
+        anchor_text = self._brief_text(anchor)
+        candidate_text = self._brief_text(candidate)
+        candidate_title_tokens = {token for token in tokenize(candidate.title) if len(token) > 3}
+        score = 0.0
+        if any(word in anchor_text for word in LISTING_WORDS):
+            score += 0.3
+        if any(word in candidate_text for word in ROLE_WORDS):
+            score += 0.2
+        if candidate.title.lower() in anchor_text:
+            score += 0.35
+        if candidate_title_tokens & set(tokenize(anchor_text)):
+            score += 0.15
+        return min(score, 1.0)
+
     def _candidate_metrics(self, anchor: DocBrief, candidate: DocBrief) -> dict[str, float]:
         anchor_terms = self._brief_terms(anchor)
         candidate_terms = self._brief_terms(candidate)
@@ -68,12 +117,20 @@ class LogicOrchestrator:
         hint_overlap = len(set(anchor.relation_hints) & set(candidate.relation_hints))
         title_overlap = len(set(tokenize(anchor.title)) & set(tokenize(candidate.title)))
         overlap_score = min((keyword_overlap + entity_overlap + hint_overlap + title_overlap) / 5.0, 1.0)
+        mention_score = self._mention_score(anchor, candidate)
+        role_listing_score = self._role_listing_score(anchor, candidate)
         anchor_vec = self._embed_brief(anchor)
         candidate_vec = self._embed_brief(candidate)
         dense_score = max(cosine(anchor_vec, candidate_vec), 0.0) if anchor_vec is not None and candidate_vec is not None else 0.0
         length_ratio = min(len(candidate.summary), len(anchor.summary)) / max(len(candidate.summary), len(anchor.summary), 1)
-        topic_drift = 1.0 if title_overlap == 0 and keyword_overlap + entity_overlap + hint_overlap == 0 and dense_score < 0.45 else 0.0
-        local_support = 0.55 * dense_score + 0.3 * overlap_score + 0.15 * min(length_ratio * 1.5, 1.0)
+        topic_drift = 1.0 if mention_score < 0.2 and title_overlap == 0 and keyword_overlap + entity_overlap + hint_overlap == 0 and dense_score < 0.45 else 0.0
+        local_support = (
+            0.42 * dense_score
+            + 0.2 * overlap_score
+            + 0.22 * mention_score
+            + 0.08 * role_listing_score
+            + 0.08 * min(length_ratio * 1.5, 1.0)
+        )
         return {
             "dense_score": dense_score,
             "overlap_score": overlap_score,
@@ -82,6 +139,8 @@ class LogicOrchestrator:
             "hint_overlap": float(hint_overlap),
             "title_overlap": float(title_overlap),
             "length_ratio": float(length_ratio),
+            "mention_score": mention_score,
+            "role_listing_score": role_listing_score,
             "topic_drift": topic_drift,
             "local_support": local_support,
             "anchor_terms": float(len(anchor_terms)),
@@ -100,9 +159,10 @@ class LogicOrchestrator:
         candidate_terms = self._brief_terms(candidate)
         anchor_cov = len(evidence_terms & anchor_terms) / max(1, min(len(anchor_terms), 6))
         candidate_cov = len(evidence_terms & candidate_terms) / max(1, min(len(candidate_terms), 6))
+        mention_bonus = 0.12 if candidate.title.lower() in evidence_text.lower() or anchor.title.lower() in evidence_text.lower() else 0.0
         span_score = min(len(evidence_chunks) / 2.0, 1.0)
         contradiction_penalty = 0.15 if getattr(result, "contradiction_flags", None) else 0.0
-        return max(0.0, 0.4 * min(anchor_cov + candidate_cov, 1.0) + 0.45 * span_score + 0.15 - contradiction_penalty)
+        return max(0.0, 0.36 * min(anchor_cov + candidate_cov, 1.0) + 0.38 * span_score + 0.14 + mention_bonus - contradiction_penalty)
 
     def _relation_cues(self, anchor: DocBrief, candidate: DocBrief, result) -> bool:
         relation_type = result.relation_type
@@ -118,19 +178,32 @@ class LogicOrchestrator:
             ]
         ).lower()
         if relation_type == "supporting_evidence":
-            cues = {"support", "supports", "evidence", "provides", "controls", "governs", "later", "revalidated", "augment"}
-            return any(cue in text for cue in cues)
+            return any(cue in text for cue in SUPPORT_CUES)
         if relation_type == "implementation_detail":
-            cues = {"uses", "through", "tracked", "registry", "detail", "includes", "relies", "merge", "score", "route"}
-            return any(cue in text for cue in cues) or candidate.title.lower() in anchor.summary.lower()
+            return any(cue in text for cue in DETAIL_CUES) or candidate.title.lower() in self._brief_text(anchor)
         if relation_type == "prerequisite":
-            cues = {"before", "after", "first", "then", "prior", "precedes", "depends", "include", "subagent", "role"}
-            return any(cue in text for cue in cues)
+            return any(cue in text for cue in ORDER_CUES | LISTING_WORDS)
         if relation_type == "same_concept":
             return any(cue in text for cue in {"same", "alias", "equivalent", "become", "becomes"})
         if relation_type == "comparison":
             return any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs"})
         return False
+
+    def _passes_structural_gate(self, metrics: dict[str, float], result) -> bool:
+        relation_type = result.relation_type
+        if relation_type == "implementation_detail":
+            return (
+                metrics["mention_score"] >= 0.3
+                or metrics["role_listing_score"] >= 0.55
+                or (metrics["overlap_score"] >= 0.6 and metrics["dense_score"] >= 0.55)
+            )
+        if relation_type == "supporting_evidence":
+            return metrics["mention_score"] >= 0.28 or (metrics["dense_score"] >= 0.68 and metrics["overlap_score"] >= 0.4)
+        if relation_type == "prerequisite":
+            return metrics["role_listing_score"] >= 0.5 or (metrics["mention_score"] >= 0.28 and metrics["dense_score"] >= 0.52)
+        if relation_type in {"same_concept", "comparison"}:
+            return False
+        return True
 
     def _relation_threshold(self, relation_type: str) -> RelationQualityConfig:
         return self._edge_quality().relation_thresholds.get(relation_type, RelationQualityConfig())
@@ -145,84 +218,102 @@ class LogicOrchestrator:
             return 1.0
         return float(getattr(provider, "relation_priors", {}).get(relation_type, 1.0))
 
-    def _gold_targets(self, anchor_doc_id: str) -> set[str]:
-        provider = self._provider()
-        if provider is None:
-            return set()
-        return set(getattr(provider, "gold_targets_by_source", {}).get(anchor_doc_id, set()))
-
-    def _expected_relation(self, anchor_doc_id: str, candidate_doc_id: str) -> str | None:
-        provider = self._provider()
-        if provider is None:
-            return None
-        return getattr(provider, "gold_relation_by_pair", {}).get((anchor_doc_id, candidate_doc_id))
-
-    def _calibrated_result(self, anchor: DocBrief, candidate: DocBrief, result, expected_relation: str, local_support: float):
-        evidence_spans = result.evidence_spans or [anchor.summary[:160], candidate.summary[:160]]
-        rationale = result.rationale or f"Calibrated target pair aligned to expected {expected_relation} relation."
-        confidence = max(float(result.confidence), 0.84)
-        if result.accepted:
-            confidence = max(confidence, 0.9)
-        support_score = max(float(getattr(result, "support_score", 0.0)), min(local_support + 0.2, 0.95))
+    def _make_fallback_result(self, anchor: DocBrief, candidate: DocBrief, relation_type: str, confidence: float, reason: str, support_score: float):
         return SimpleNamespace(
             accepted=True,
-            relation_type=expected_relation,
+            relation_type=relation_type,
             confidence=confidence,
-            evidence_spans=evidence_spans,
-            rationale=rationale,
+            evidence_spans=[anchor.summary[:160], candidate.summary[:160]],
+            rationale=reason,
             support_score=support_score,
             contradiction_flags=[],
-            decision_reason=f"Calibrated exact pair fallback for expected relation {expected_relation}.",
+            decision_reason="Accepted by local fallback after strong lexical and structural match.",
         )
 
+    def should_attempt_discovery(self, anchor: DocBrief) -> bool:
+        text_tokens = set(tokenize(self._brief_text(anchor)))
+        return bool(text_tokens & DISCOVERY_TERMS) or len(anchor.relation_hints) >= 4
+
+    def _local_relation_override(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result):
+        anchor_text = self._brief_text(anchor)
+        candidate_text = self._brief_text(candidate)
+        direct_title_link = candidate.title.lower() in anchor_text or anchor.title.lower() in candidate_text
+        if metrics["role_listing_score"] >= 0.62 and metrics["mention_score"] >= 0.32:
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "prerequisite",
+                confidence=max(0.87, float(getattr(result, "confidence", 0.0))),
+                reason="Anchor enumerates specialized roles and candidate is one listed role.",
+                support_score=min(0.95, metrics["local_support"] + 0.18),
+            )
+        if direct_title_link and metrics["mention_score"] >= 0.4 and any(cue in candidate_text or cue in anchor_text for cue in DETAIL_CUES):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "implementation_detail",
+                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
+                reason="Candidate title or function is explicitly referenced and then elaborated with concrete details.",
+                support_score=min(0.92, metrics["local_support"] + 0.12),
+            )
+        if direct_title_link and metrics["mention_score"] >= 0.38 and any(cue in candidate_text or cue in anchor_text for cue in SUPPORT_CUES):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "supporting_evidence",
+                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                reason="Candidate explains or constrains a behavior that the anchor depends on.",
+                support_score=min(0.9, metrics["local_support"] + 0.1),
+            )
+        return None
+
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
-        calibration_targets = self._gold_targets(anchor.doc_id)
-        if self._is_live_provider() and calibration_targets and candidate.doc_id not in calibration_targets:
-            return CandidateAssessment(candidate.doc_id, False, "calibration_miss", 0.0, 0.0, 0.0, result.relation_type, result.confidence)
-
         metrics = self._candidate_metrics(anchor, candidate)
-        local_support = metrics["local_support"]
-        expected_relation = self._expected_relation(anchor.doc_id, candidate.doc_id)
-        calibrated_result = result
-        if self._is_live_provider() and expected_relation:
-            calibrated_result = self._calibrated_result(anchor, candidate, result, expected_relation, local_support)
+        final_result = result
+        fallback = self._local_relation_override(anchor, candidate, metrics, result)
+        if fallback is not None:
+            force_override = fallback.relation_type == "prerequisite" and metrics["role_listing_score"] >= 0.62
+            if force_override or not result.accepted or result.relation_type in {"same_concept", "comparison"} or float(result.confidence) < 0.84:
+                final_result = fallback
 
-        if not calibrated_result.accepted:
-            return CandidateAssessment(candidate.doc_id, False, "model_rejected", 0.0, 0.0, 0.0, calibrated_result.relation_type, calibrated_result.confidence)
-        if calibrated_result.relation_type not in RELATION_TYPES:
-            return CandidateAssessment(candidate.doc_id, False, "unsupported_relation", 0.0, 0.0, 0.0, calibrated_result.relation_type, calibrated_result.confidence)
+        if not final_result.accepted:
+            return CandidateAssessment(candidate.doc_id, False, "model_rejected", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type not in RELATION_TYPES:
+            return CandidateAssessment(candidate.doc_id, False, "unsupported_relation", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
+        if self._is_live_provider() and final_result.relation_type in {"same_concept", "comparison"}:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
-        model_support = max(0.0, min(float(getattr(calibrated_result, "support_score", 0.0)), 1.0))
-        blended_support = 0.7 * local_support + 0.3 * model_support
-        evidence_quality = self._evidence_quality(anchor, candidate, calibrated_result)
-        threshold = self._relation_threshold(calibrated_result.relation_type)
+        model_support = max(0.0, min(float(getattr(final_result, "support_score", 0.0)), 1.0))
+        blended_support = 0.7 * metrics["local_support"] + 0.3 * model_support
+        evidence_quality = self._evidence_quality(anchor, candidate, final_result)
+        threshold = self._relation_threshold(final_result.relation_type)
 
         if metrics["topic_drift"] >= 1.0:
-            return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
-        if not threshold.enabled and not self._relation_cues(anchor, candidate, calibrated_result):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
-        if not self._relation_cues(anchor, candidate, calibrated_result):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
-        if calibrated_result.confidence < threshold.min_confidence:
-            return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
+            return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if not threshold.enabled and not self._relation_cues(anchor, candidate, final_result):
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if not self._relation_cues(anchor, candidate, final_result):
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if not self._passes_structural_gate(metrics, final_result):
+            return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.confidence < threshold.min_confidence:
+            return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
-            return CandidateAssessment(candidate.doc_id, False, "low_support", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
+            return CandidateAssessment(candidate.doc_id, False, "low_support", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if evidence_quality < threshold.min_evidence_quality:
-            return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
-        if getattr(calibrated_result, "contradiction_flags", None):
-            return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, calibrated_result.relation_type, calibrated_result.confidence)
+            return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if getattr(final_result, "contradiction_flags", None):
+            return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
 
-        score = calibrated_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(calibrated_result.relation_type)
-        if self._is_live_provider() and expected_relation == calibrated_result.relation_type:
-            score *= 1.3
+        score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
         edge = LogicEdge(
             src_doc_id=anchor.doc_id,
             dst_doc_id=candidate.doc_id,
-            relation_type=calibrated_result.relation_type,
-            confidence=calibrated_result.confidence,
-            evidence_spans=calibrated_result.evidence_spans,
+            relation_type=final_result.relation_type,
+            confidence=final_result.confidence,
+            evidence_spans=final_result.evidence_spans,
             discovery_path=["scout", "judge", "gate"],
-            edge_card_text=f"[REL={calibrated_result.relation_type}] {anchor.title} -> {candidate.title}: {calibrated_result.rationale}",
+            edge_card_text=f"[REL={final_result.relation_type}] {anchor.title} -> {candidate.title}: {final_result.rationale}",
             created_at=DEFAULT_TIMESTAMP,
             last_validated_at=DEFAULT_TIMESTAMP,
         )
@@ -233,8 +324,8 @@ class LogicOrchestrator:
             score=score,
             local_support=blended_support,
             evidence_quality=evidence_quality,
-            relation_type=calibrated_result.relation_type,
-            confidence=calibrated_result.confidence,
+            relation_type=final_result.relation_type,
+            confidence=final_result.confidence,
             edge=edge,
         )
 
@@ -246,51 +337,58 @@ class LogicOrchestrator:
             return self.doc_profiler.run_many(docs)
         return [self.profile(doc) for doc in docs]
 
+    def _local_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
+        proposals: list[tuple[float, CandidateProposal]] = []
+        for candidate in corpus:
+            if candidate.doc_id == anchor.doc_id:
+                continue
+            metrics = self._candidate_metrics(anchor, candidate)
+            if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
+                continue
+            score = metrics["local_support"] + 0.35 * metrics["mention_score"] + 0.15 * metrics["role_listing_score"]
+            proposals.append(
+                (
+                    score,
+                    CandidateProposal(
+                        doc_id=candidate.doc_id,
+                        reason="local dense+lexical match",
+                        query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
+                        score_hint=min(score, 0.99),
+                    ),
+                )
+            )
+        proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
+        return proposals[:8]
+
+    def _live_candidate_limit(self, anchor: DocBrief) -> int:
+        anchor_text = self._brief_text(anchor)
+        if any(word in anchor_text for word in LISTING_WORDS):
+            return max(self._edge_quality().max_judge_candidates_live, 8)
+        return max(self._edge_quality().max_judge_candidates_live, 6)
+
     def scout(self, anchor: DocBrief, corpus: list[DocBrief]):
-        proposals = self.corpus_scout.run(anchor, corpus)
         brief_map = {brief.doc_id: brief for brief in corpus}
-        rescored = []
-        for proposal in proposals:
+        merged: dict[str, tuple[float, CandidateProposal]] = {}
+        for proposal in self.corpus_scout.run(anchor, corpus):
             candidate = brief_map.get(proposal.doc_id)
             if candidate is None:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
             if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
                 continue
-            rescored.append((proposal.score_hint + metrics["local_support"], proposal))
-        rescored.sort(key=lambda item: (-item[0], item[1].doc_id))
-        limit = self._edge_quality().max_judge_candidates_live if self._is_live_provider() else 6
-        if self._is_live_provider():
-            calibration_targets = self._gold_targets(anchor.doc_id)
-            if calibration_targets:
-                calibrated_rows = []
-                for target_id in calibration_targets:
-                    candidate = brief_map.get(target_id)
-                    if candidate is None or candidate.doc_id == anchor.doc_id:
-                        continue
-                    metrics = self._candidate_metrics(anchor, candidate)
-                    calibrated_rows.append(
-                        (
-                            1.0 + metrics["local_support"],
-                            type(proposals[0])(
-                                doc_id=candidate.doc_id,
-                                reason="gold-calibrated target shortlist",
-                                query=" ".join((anchor.relation_hints + candidate.relation_hints + [candidate.title])[:4]),
-                                score_hint=0.99,
-                            )
-                            if proposals
-                            else SimpleNamespace(
-                                doc_id=candidate.doc_id,
-                                reason="gold-calibrated target shortlist",
-                                query=" ".join((anchor.relation_hints + candidate.relation_hints + [candidate.title])[:4]),
-                                score_hint=0.99,
-                            ),
-                        )
-                    )
-                calibrated_rows.sort(key=lambda item: (-item[0], item[1].doc_id))
-                if calibrated_rows:
-                    return [proposal for _, proposal in calibrated_rows[: max(limit, len(calibration_targets))]]
-        return [proposal for _, proposal in rescored[:limit]]
+            score = proposal.score_hint + metrics["local_support"] + 0.2 * metrics["mention_score"]
+            previous = merged.get(proposal.doc_id)
+            if previous is None or score > previous[0]:
+                merged[proposal.doc_id] = (score, proposal)
+
+        for score, proposal in self._local_candidate_proposals(anchor, corpus):
+            previous = merged.get(proposal.doc_id)
+            if previous is None or score > previous[0]:
+                merged[proposal.doc_id] = (score, proposal)
+
+        ranked = sorted(merged.values(), key=lambda item: (-item[0], item[1].doc_id))
+        limit = self._live_candidate_limit(anchor) if self._is_live_provider() else 6
+        return [proposal for _, proposal in ranked[:limit]]
 
     def judge(self, anchor: DocBrief, candidate: DocBrief) -> LogicEdge | None:
         result = self.relation_judge.run(anchor, candidate)
@@ -308,33 +406,12 @@ class LogicOrchestrator:
         accepted.sort(key=lambda item: (-item.score, item.candidate_doc_id))
 
         cap = self._edge_quality().max_edges_per_anchor_live if self._is_live_provider() else 4
-        if self._is_live_provider():
-            exact_calibrated = [
-                item for item in accepted if self._expected_relation(anchor.doc_id, item.candidate_doc_id) == item.relation_type
-            ]
-            if exact_calibrated:
-                if all(item.relation_type == "prerequisite" for item in exact_calibrated):
-                    cap = max(cap, min(4, len(exact_calibrated)))
-                else:
-                    cap = max(cap, min(2, len(exact_calibrated)))
-        kept_ids: set[str] = set()
-        if accepted:
-            kept_ids.add(accepted[0].candidate_doc_id)
-            if cap > 1 and not self._is_live_provider():
-                leader = accepted[0]
-                for item in accepted[1:]:
-                    if len(kept_ids) >= cap:
-                        break
-                    if item.relation_type == leader.relation_type:
-                        continue
-                    if leader.score - item.score <= self._edge_quality().second_edge_margin:
-                        kept_ids.add(item.candidate_doc_id)
-            elif cap > 1 and self._is_live_provider():
-                for item in accepted[1:]:
-                    if len(kept_ids) >= cap:
-                        break
-                    kept_ids.add(item.candidate_doc_id)
+        if self._is_live_provider() and any(word in self._brief_text(anchor) for word in LISTING_WORDS):
+            prerequisite_group = [item for item in accepted if item.relation_type == "prerequisite" and item.local_support >= 0.42]
+            if len(prerequisite_group) >= 2:
+                cap = max(cap, min(4, len(prerequisite_group)))
 
+        kept_ids = {item.candidate_doc_id for item in accepted[:cap]}
         final: list[CandidateAssessment] = []
         for item in assessments:
             if item.accepted and item.candidate_doc_id not in kept_ids:
