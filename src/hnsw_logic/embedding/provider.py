@@ -10,6 +10,7 @@ from typing import Iterable
 import numpy as np
 
 from hnsw_logic.config.schema import ProviderConfig
+from hnsw_logic.core.facets import enrich_brief
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.core.utils import deterministic_vector, to_jsonable, tokenize, top_terms
 
@@ -153,7 +154,8 @@ class StubProvider(ProviderBase):
         entities = sorted({token for token in tokens if token in {"hnsw", "deepagents", "fastapi", "sqlite", "memory", "subagents", "skills"}})
         claims = [sentence.strip() for sentence in doc.text.split(". ")[:2] if sentence.strip()]
         relation_hints = top_terms(doc.text, limit=3)
-        return DocBrief(
+        return enrich_brief(
+            DocBrief(
             doc_id=doc.doc_id,
             title=doc.title,
             summary=" ".join(claims)[:320],
@@ -162,6 +164,7 @@ class StubProvider(ProviderBase):
             claims=claims[:3],
             relation_hints=relation_hints,
             metadata=doc.metadata,
+            )
         )
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
@@ -390,15 +393,17 @@ class OpenAICompatibleProvider(StubProvider):
                 ),
                 thinking=False,
             )
-            return DocBrief(
-                doc_id=doc.doc_id,
-                title=doc.title,
-                summary=str(payload.get("summary", ""))[:320],
-                entities=[str(item) for item in payload.get("entities", [])][:8],
-                keywords=[str(item) for item in payload.get("keywords", [])][:8],
-                claims=[str(item) for item in payload.get("claims", [])][:4],
-                relation_hints=[str(item) for item in payload.get("relation_hints", [])][:4],
-                metadata=doc.metadata,
+            return enrich_brief(
+                DocBrief(
+                    doc_id=doc.doc_id,
+                    title=doc.title,
+                    summary=str(payload.get("summary", ""))[:320],
+                    entities=[str(item) for item in payload.get("entities", [])][:8],
+                    keywords=[str(item) for item in payload.get("keywords", [])][:8],
+                    claims=[str(item) for item in payload.get("claims", [])][:4],
+                    relation_hints=[str(item) for item in payload.get("relation_hints", [])][:4],
+                    metadata=doc.metadata,
+                )
             )
         except Exception:
             return super().profile_doc(doc)
@@ -438,15 +443,17 @@ class OpenAICompatibleProvider(StubProvider):
                     source = next((doc for doc in batch if doc.doc_id == doc_id), None)
                     if source is None:
                         continue
-                    results[doc_id] = DocBrief(
-                        doc_id=source.doc_id,
-                        title=source.title,
-                        summary=str(item.get("summary", ""))[:320],
-                        entities=[str(value) for value in item.get("entities", [])][:8],
-                        keywords=[str(value) for value in item.get("keywords", [])][:8],
-                        claims=[str(value) for value in item.get("claims", [])][:4],
-                        relation_hints=[str(value) for value in item.get("relation_hints", [])][:4],
-                        metadata=source.metadata,
+                    results[doc_id] = enrich_brief(
+                        DocBrief(
+                            doc_id=source.doc_id,
+                            title=source.title,
+                            summary=str(item.get("summary", ""))[:320],
+                            entities=[str(value) for value in item.get("entities", [])][:8],
+                            keywords=[str(value) for value in item.get("keywords", [])][:8],
+                            claims=[str(value) for value in item.get("claims", [])][:4],
+                            relation_hints=[str(value) for value in item.get("relation_hints", [])][:4],
+                            metadata=source.metadata,
+                        )
                     )
             except Exception:
                 pass

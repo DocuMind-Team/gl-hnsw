@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from hnsw_logic.config.schema import RetrievalConfig
+from hnsw_logic.core.facets import build_search_views
 from hnsw_logic.core.models import DocBrief, LogicEdge
 from hnsw_logic.core.utils import cosine, tokenize
 from hnsw_logic.embedding.provider import ProviderBase
@@ -25,37 +26,105 @@ class RetrievalScorer:
         self.provider = provider
         self.alpha = retrieval_config.fusion.alpha
         self.beta = retrieval_config.fusion.beta
-        self._brief_embedding_cache: dict[str, np.ndarray] = {}
+        self._brief_embedding_cache: dict[tuple[str, str], np.ndarray] = {}
         self._edge_embedding_cache: dict[str, np.ndarray] = {}
+        self._view_cache: dict[str, dict[str, str]] = {}
+
+    def _brief_views(self, brief: DocBrief) -> dict[str, str]:
+        cached = self._view_cache.get(brief.doc_id)
+        if cached is not None:
+            return cached
+        views = build_search_views(brief)
+        self._view_cache[brief.doc_id] = views
+        return views
+
+    def _view_embedding(self, brief: DocBrief, view_name: str) -> np.ndarray:
+        key = (brief.doc_id, view_name)
+        cached = self._brief_embedding_cache.get(key)
+        if cached is not None:
+            return cached
+        views = self._brief_views(brief)
+        text = views.get(view_name, "") or views.get("full", "")
+        cached = self.provider.embed_texts([text])[0]
+        self._brief_embedding_cache[key] = cached
+        return cached
+
+    def _query_tokens(self, query: str) -> set[str]:
+        return {token for token in tokenize(query) if len(token) > 2}
 
     def encode_query(self, query: str) -> np.ndarray:
         return self.provider.embed_texts([query])[0]
 
     def query_alignment(self, query: str, brief: DocBrief) -> float:
-        query_tokens = {token for token in tokenize(query) if len(token) > 2}
+        query_tokens = self._query_tokens(query)
         if not query_tokens:
             return 0.0
-        brief_tokens = {
-            *tokenize(brief.title),
-            *tokenize(brief.summary),
-            *brief.keywords,
-            *brief.entities,
-            *brief.relation_hints,
-        }
-        brief_tokens = {token for token in brief_tokens if len(token) > 2}
-        overlap = query_tokens & brief_tokens
+        views = self._brief_views(brief)
+        title_tokens = {token for token in tokenize(brief.title) if len(token) > 2}
+        relation_tokens = {token for token in tokenize(views["relation"]) if len(token) > 2}
+        claim_tokens = {token for token in tokenize(views["claims"]) if len(token) > 2}
+        summary_tokens = {token for token in tokenize(brief.summary) if len(token) > 2}
+        structure_tokens = {token for token in tokenize(views["structure"]) if len(token) > 2}
+        overlap = query_tokens & (title_tokens | relation_tokens | claim_tokens | summary_tokens | structure_tokens)
         if not overlap:
             return 0.0
-        return min(len(overlap) / max(1, min(len(query_tokens), 4)), 1.0)
+        title_overlap = len(query_tokens & title_tokens)
+        relation_overlap = len(query_tokens & relation_tokens)
+        claim_overlap = len(query_tokens & claim_tokens)
+        summary_overlap = len(query_tokens & summary_tokens)
+        structure_overlap = len(query_tokens & structure_tokens)
+        score = (
+            0.34 * min(title_overlap / max(1, min(len(query_tokens), 3)), 1.0)
+            + 0.24 * min(relation_overlap / max(1, min(len(query_tokens), 4)), 1.0)
+            + 0.18 * min(claim_overlap / max(1, min(len(query_tokens), 4)), 1.0)
+            + 0.16 * min(summary_overlap / max(1, min(len(query_tokens), 4)), 1.0)
+            + 0.08 * min(structure_overlap / max(1, min(len(query_tokens), 3)), 1.0)
+        )
+        return min(score, 1.0)
+
+    def structure_alignment(self, query: str, brief: DocBrief) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        structure_tokens = {token for token in tokenize(self._brief_views(brief)["structure"]) if len(token) > 2}
+        if not structure_tokens:
+            return 0.0
+        overlap = query_tokens & structure_tokens
+        if not overlap:
+            return 0.0
+        return min(len(overlap) / max(1, min(len(query_tokens), 3)), 1.0)
+
+    def seed_score(self, query: str, query_emb: np.ndarray, brief: DocBrief) -> float:
+        title_emb = self._view_embedding(brief, "title")
+        relation_emb = self._view_embedding(brief, "relation")
+        claims_emb = self._view_embedding(brief, "claims")
+        full_emb = self._view_embedding(brief, "full")
+        dense_score = max(
+            0.78 * cosine(query_emb, title_emb),
+            0.92 * cosine(query_emb, relation_emb),
+            0.88 * cosine(query_emb, claims_emb),
+            cosine(query_emb, full_emb),
+        )
+        lexical_alignment = self.query_alignment(query, brief)
+        structure_alignment = self.structure_alignment(query, brief)
+        return 0.58 * dense_score + 0.28 * lexical_alignment + 0.14 * structure_alignment
 
     def score_target(self, query: str, query_emb: np.ndarray, brief: DocBrief) -> float:
-        target_emb = self._brief_embedding_cache.get(brief.doc_id)
-        if target_emb is None:
-            target_emb = self.provider.embed_texts([f"{brief.title}\n{brief.summary}"])[0]
-            self._brief_embedding_cache[brief.doc_id] = target_emb
-        dense_score = cosine(query_emb, target_emb)
+        title_emb = self._view_embedding(brief, "title")
+        summary_emb = self._view_embedding(brief, "summary")
+        claims_emb = self._view_embedding(brief, "claims")
+        relation_emb = self._view_embedding(brief, "relation")
+        full_emb = self._view_embedding(brief, "full")
+        dense_score = max(
+            0.84 * cosine(query_emb, title_emb),
+            0.94 * cosine(query_emb, summary_emb),
+            cosine(query_emb, claims_emb),
+            0.96 * cosine(query_emb, relation_emb),
+            cosine(query_emb, full_emb),
+        )
         lexical_alignment = self.query_alignment(query, brief)
-        return 0.82 * dense_score + 0.18 * lexical_alignment
+        structure_alignment = self.structure_alignment(query, brief)
+        return 0.68 * dense_score + 0.22 * lexical_alignment + 0.1 * structure_alignment
 
     def relation_query_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
         alignment = self.query_alignment(query, brief)

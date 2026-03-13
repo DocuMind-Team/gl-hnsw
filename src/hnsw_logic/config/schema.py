@@ -100,6 +100,9 @@ class RetrievalConfig(BaseModel):
     initial_top_k: int = 50
     seed_top_b: int = 5
     max_expansions_per_seed: int = 2
+    supplemental_seed_top_k: int = 6
+    supplemental_seed_min_score: float = 0.3
+    supplemental_seed_weight: float = 0.92
     jump_policy: JumpPolicyConfig = Field(default_factory=JumpPolicyConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
     edge_quality: EdgeQualityConfig = Field(default_factory=EdgeQualityConfig)

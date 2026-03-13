@@ -25,6 +25,10 @@ class HybridRetrievalService:
         self.scorer = scorer
         self.jump_policy = jump_policy
         self.semantic_memory_store = semantic_memory_store
+        self.initial_top_k = jump_policy.config.initial_top_k
+        self.supplemental_seed_top_k = jump_policy.config.supplemental_seed_top_k
+        self.supplemental_seed_min_score = jump_policy.config.supplemental_seed_min_score
+        self.supplemental_seed_weight = jump_policy.config.supplemental_seed_weight
 
     def _hits_from_ranked(self, query: str, ranked: list[dict], top_k: int) -> SearchResponse:
         hits = [
@@ -49,7 +53,7 @@ class HybridRetrievalService:
         memory = self.semantic_memory_store.read()
         query_terms = set(query.lower().split())
         for row in rows:
-            if row["source_kind"] == "geometric":
+            if row["source_kind"] in {"geometric", "supplemental"}:
                 continue
             bias = 0.0
             brief = self.brief_store.read(row["doc_id"])
@@ -66,9 +70,42 @@ class HybridRetrievalService:
             row["rank"] = rank
         return rows
 
+    def _supplemental_seed_rows(
+        self,
+        query: str,
+        query_emb,
+        briefs: dict[str, object],
+        existing_ids: set[str],
+    ) -> list[tuple[str, float]]:
+        scored: list[tuple[float, str]] = []
+        for doc_id, brief in briefs.items():
+            if doc_id in existing_ids:
+                continue
+            score = self.scorer.seed_score(query, query_emb, brief)
+            if score < self.supplemental_seed_min_score:
+                continue
+            if self.scorer.query_alignment(query, brief) <= 0.0 and self.scorer.structure_alignment(query, brief) <= 0.0 and score < 0.7:
+                continue
+            scored.append((score, doc_id))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [(doc_id, min(score * self.supplemental_seed_weight, 0.99)) for score, doc_id in scored[: self.supplemental_seed_top_k]]
+
+    def _seed_rows(self, query: str, query_emb, briefs: dict[str, object]) -> list[tuple[str, float, str]]:
+        seed_neighbors = self.searcher.search(query_emb, top_k=self.initial_top_k)
+        merged: dict[str, tuple[float, str]] = {
+            neighbor.doc_id: (neighbor.score, "geometric") for neighbor in seed_neighbors
+        }
+        for doc_id, score in self._supplemental_seed_rows(query, query_emb, briefs, set(merged)):
+            current = merged.get(doc_id)
+            if current is None or score > current[0]:
+                merged[doc_id] = (score, "supplemental")
+        rows = [(doc_id, score, source_kind) for doc_id, (score, source_kind) in merged.items()]
+        rows.sort(key=lambda item: (-item[1], item[0]))
+        return rows
+
     def search_baseline(self, query: str, top_k: int = 10) -> SearchResponse:
         query_emb = self.scorer.encode_query(query)
-        seed_neighbors = self.searcher.search(query_emb, top_k=50)
+        seed_neighbors = self.searcher.search(query_emb, top_k=self.initial_top_k)
         briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
         ranked = []
         for neighbor in seed_neighbors[:top_k]:
@@ -92,13 +129,13 @@ class HybridRetrievalService:
 
     def search(self, query: str, top_k: int = 10, use_memory_bias: bool = True) -> SearchResponse:
         query_emb = self.scorer.encode_query(query)
-        seed_neighbors = self.searcher.search(query_emb, top_k=50)
         briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
-        seeds = {neighbor.doc_id: (neighbor.score, "geometric") for neighbor in seed_neighbors}
+        seed_rows = self._seed_rows(query, query_emb, briefs)
+        seeds = {doc_id: (score, source_kind) for doc_id, score, source_kind in seed_rows}
         expanded: list[ExpandedCandidate] = []
 
-        for neighbor in seed_neighbors[: self.jump_policy.max_seeds]:
-            for edge in self.graph_store.get_out_edges(neighbor.doc_id)[: self.jump_policy.max_expansions_per_seed]:
+        for doc_id, seed_score, source_kind in seed_rows[: self.jump_policy.max_seeds]:
+            for edge in self.graph_store.get_out_edges(doc_id)[: self.jump_policy.max_expansions_per_seed]:
                 brief = briefs.get(edge.dst_doc_id)
                 if brief is None:
                     continue
@@ -108,9 +145,9 @@ class HybridRetrievalService:
                     expanded.append(
                         ExpandedCandidate(
                             doc_id=edge.dst_doc_id,
-                            source_doc_id=neighbor.doc_id,
+                            source_doc_id=doc_id,
                             edge=edge,
-                            seed_score=neighbor.score,
+                            seed_score=seed_score,
                             edge_match=float(query_emb.dot(edge_emb)),
                             target_rel_score=target_rel_score,
                         )

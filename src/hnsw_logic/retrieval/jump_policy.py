@@ -8,6 +8,7 @@ from hnsw_logic.core.models import LogicEdge
 
 class JumpPolicy:
     def __init__(self, config: RetrievalConfig):
+        self.config = config
         self.tau_conf = config.jump_policy.tau_conf
         self.tau_edge = config.jump_policy.tau_edge
         self.tau_target = config.jump_policy.tau_target
