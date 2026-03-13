@@ -33,6 +33,29 @@ class JudgeResult:
     support_score: float = 0.0
     contradiction_flags: list[str] | None = None
     decision_reason: str = ""
+    semantic_relation_label: str = ""
+    canonical_relation: str = ""
+    utility_score: float = 0.0
+    uncertainty: float = 0.0
+
+
+@dataclass(slots=True)
+class JudgeSignals:
+    dense_score: float
+    sparse_score: float
+    overlap_score: float
+    content_overlap_score: float
+    mention_score: float
+    role_listing_score: float
+    forward_reference_score: float
+    reverse_reference_score: float
+    direction_score: float
+    local_support: float
+    utility_score: float
+    best_relation: str
+    stage_pair: str
+    risk_flags: list[str]
+    relation_fit_scores: dict[str, float]
 
 
 class ProviderBase:
@@ -81,6 +104,12 @@ class ProviderBase:
 
     def judge_relations(self, anchor: DocBrief, candidates: list[DocBrief]) -> dict[str, JudgeResult]:
         return {candidate.doc_id: self.judge_relation(anchor, candidate) for candidate in candidates}
+
+    def judge_relation_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals) -> JudgeResult:
+        return self.judge_relation(anchor, candidate)
+
+    def judge_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals]]) -> dict[str, JudgeResult]:
+        return {candidate.doc_id: self.judge_relation_with_signals(anchor, candidate, signals) for candidate, signals in candidates}
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
         raise NotImplementedError
@@ -219,6 +248,10 @@ class StubProvider(ProviderBase):
             support_score=min(1.0, 0.25 * len(shared)),
             contradiction_flags=[],
             decision_reason="accepted by deterministic overlap heuristic" if confidence >= 0.6 else "confidence below heuristic threshold",
+            semantic_relation_label=relation,
+            canonical_relation=relation,
+            utility_score=min(1.0, confidence * 0.9),
+            uncertainty=max(0.0, 1.0 - confidence),
         )
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
@@ -346,9 +379,34 @@ class OpenAICompatibleProvider(StubProvider):
         return (
             "You are a relation judge. Return JSON only. Prefer precision over recall. "
             "Use relation types: supporting_evidence, implementation_detail, same_concept, comparison, prerequisite. "
+            "You may also use canonical_relation='none' when the pair is related but not useful as a durable retrieval edge. "
             "implementation_detail means the candidate defines a mechanism, formula, backend, or component directly used by the anchor. "
             "supporting_evidence means the candidate explains, constrains, or gates a claim in the anchor; do not use it for mere co-usage, API exposure, or two components that share the same registry or service surface. "
-            "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor."
+            "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor. "
+            "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
+        )
+
+    def _verdict_from_payload(self, payload: dict) -> JudgeResult:
+        canonical_relation = str(payload.get("canonical_relation", payload.get("relation_type", "comparison")))
+        accepted = bool(payload.get("accepted", False))
+        if canonical_relation == "none":
+            accepted = False
+            relation_type = "comparison"
+        else:
+            relation_type = canonical_relation
+        return JudgeResult(
+            accepted=accepted,
+            relation_type=relation_type,
+            confidence=float(payload.get("confidence", 0.0)),
+            evidence_spans=[str(item) for item in payload.get("evidence_spans", [])][:4],
+            rationale=str(payload.get("rationale", ""))[:200],
+            support_score=float(payload.get("support_score", payload.get("confidence", 0.0))),
+            contradiction_flags=[str(item) for item in payload.get("contradiction_flags", [])][:4],
+            decision_reason=str(payload.get("decision_reason", ""))[:200],
+            semantic_relation_label=str(payload.get("semantic_relation_label", relation_type))[:80],
+            canonical_relation=canonical_relation,
+            utility_score=float(payload.get("utility_score", 0.0)),
+            uncertainty=float(payload.get("uncertainty", max(0.0, 1.0 - float(payload.get("confidence", 0.0))))),
         )
 
     def _embed_local_bge_m3(self, texts: list[str]) -> np.ndarray:
@@ -515,6 +573,29 @@ class OpenAICompatibleProvider(StubProvider):
             return super().propose_candidates(anchor, corpus)
 
     def judge_relation(self, anchor: DocBrief, candidate: DocBrief) -> JudgeResult:
+        return self.judge_relation_with_signals(
+            anchor,
+            candidate,
+            JudgeSignals(
+                dense_score=0.0,
+                sparse_score=0.0,
+                overlap_score=0.0,
+                content_overlap_score=0.0,
+                mention_score=0.0,
+                role_listing_score=0.0,
+                forward_reference_score=0.0,
+                reverse_reference_score=0.0,
+                direction_score=0.0,
+                local_support=0.0,
+                utility_score=0.0,
+                best_relation="comparison",
+                stage_pair="",
+                risk_flags=[],
+                relation_fit_scores={},
+            ),
+        )
+
+    def judge_relation_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals) -> JudgeResult:
         try:
             payload = self._invoke_json(
                 self._judge_instruction(),
@@ -526,10 +607,14 @@ class OpenAICompatibleProvider(StubProvider):
                                 "task": "Judge whether the candidate should become a durable logic edge from the anchor.",
                                 "anchor": to_jsonable(anchor),
                                 "candidate": to_jsonable(candidate),
+                                "signals": to_jsonable(signals),
                                 "output_schema": {
                                     "accepted": "boolean",
-                                    "relation_type": "string",
+                                    "canonical_relation": "string",
+                                    "semantic_relation_label": "string",
                                     "confidence": "float",
+                                    "utility_score": "float",
+                                    "uncertainty": "float",
                                     "evidence_spans": ["string"],
                                     "rationale": "string",
                                     "support_score": "float",
@@ -546,20 +631,39 @@ class OpenAICompatibleProvider(StubProvider):
                 ),
                 thinking=self.live_reasoning["judge"],
             )
-            return JudgeResult(
-                accepted=bool(payload.get("accepted", False)),
-                relation_type=str(payload.get("relation_type", "comparison")),
-                confidence=float(payload.get("confidence", 0.0)),
-                evidence_spans=[str(item) for item in payload.get("evidence_spans", [])][:4],
-                rationale=str(payload.get("rationale", ""))[:200],
-                support_score=float(payload.get("support_score", payload.get("confidence", 0.0))),
-                contradiction_flags=[str(item) for item in payload.get("contradiction_flags", [])][:4],
-                decision_reason=str(payload.get("decision_reason", ""))[:200],
-            )
+            return self._verdict_from_payload(payload)
         except Exception:
             return super().judge_relation(anchor, candidate)
 
     def judge_relations(self, anchor: DocBrief, candidates: list[DocBrief]) -> dict[str, JudgeResult]:
+        default_signals = [
+            (
+                candidate,
+                JudgeSignals(
+                    dense_score=0.0,
+                    sparse_score=0.0,
+                    overlap_score=0.0,
+                    content_overlap_score=0.0,
+                    mention_score=0.0,
+                    role_listing_score=0.0,
+                    forward_reference_score=0.0,
+                    reverse_reference_score=0.0,
+                    direction_score=0.0,
+                    local_support=0.0,
+                    utility_score=0.0,
+                    best_relation="comparison",
+                    stage_pair="",
+                    risk_flags=[],
+                    relation_fit_scores={},
+                ),
+            )
+            for candidate in candidates
+        ]
+        return self.judge_relations_with_signals(anchor, default_signals)
+
+    def judge_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals]]) -> dict[str, JudgeResult]:
+        if not candidates:
+            return {}
         if not candidates:
             return {}
         verdicts: dict[str, JudgeResult] = {}
@@ -574,13 +678,22 @@ class OpenAICompatibleProvider(StubProvider):
                                 {
                                     "task": "Judge each candidate against the anchor and return a JSON array.",
                                     "anchor": to_jsonable(anchor),
-                                    "candidates": [to_jsonable(candidate) for candidate in batch],
+                                    "candidates": [
+                                        {
+                                            "candidate": to_jsonable(candidate),
+                                            "signals": to_jsonable(signals),
+                                        }
+                                        for candidate, signals in batch
+                                    ],
                                     "output_schema": [
                                         {
                                             "candidate_doc_id": "string",
                                             "accepted": "boolean",
-                                            "relation_type": "string",
+                                            "canonical_relation": "string",
+                                            "semantic_relation_label": "string",
                                             "confidence": "float",
+                                            "utility_score": "float",
+                                            "uncertainty": "float",
                                             "evidence_spans": ["string"],
                                             "rationale": "string",
                                             "support_score": "float",
@@ -603,20 +716,11 @@ class OpenAICompatibleProvider(StubProvider):
                     candidate_doc_id = str(item.get("candidate_doc_id", ""))
                     if not candidate_doc_id:
                         continue
-                    verdicts[candidate_doc_id] = JudgeResult(
-                        accepted=bool(item.get("accepted", False)),
-                        relation_type=str(item.get("relation_type", "comparison")),
-                        confidence=float(item.get("confidence", 0.0)),
-                        evidence_spans=[str(value) for value in item.get("evidence_spans", [])][:4],
-                        rationale=str(item.get("rationale", ""))[:200],
-                        support_score=float(item.get("support_score", item.get("confidence", 0.0))),
-                        contradiction_flags=[str(value) for value in item.get("contradiction_flags", [])][:4],
-                        decision_reason=str(item.get("decision_reason", ""))[:200],
-                    )
+                    verdicts[candidate_doc_id] = self._verdict_from_payload(item)
             except Exception:
                 pass
-            for candidate in batch:
-                verdicts.setdefault(candidate.doc_id, super().judge_relation(anchor, candidate))
+            for candidate, signals in batch:
+                verdicts.setdefault(candidate.doc_id, super().judge_relation_with_signals(anchor, candidate, signals))
         return verdicts
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:

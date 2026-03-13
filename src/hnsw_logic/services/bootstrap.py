@@ -97,6 +97,7 @@ def build_app(root_dir=None) -> AppContainer:
         scorer=scorer,
         jump_policy=JumpPolicy(settings.retrieval),
         semantic_memory_store=semantic_memory_store,
+        corpus_store=corpus_store,
     )
     pipeline = BuildPipeline(
         corpus_store=corpus_store,

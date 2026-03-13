@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from hnsw_logic.config.schema import ProviderConfig, RetrievalConfig
-from hnsw_logic.core.models import DocBrief
+from hnsw_logic.core.models import DocBrief, DocRecord
 from hnsw_logic.embedding.provider import StubProvider
 from hnsw_logic.graph.store import GraphStore
 from hnsw_logic.hnsw.searcher import Neighbor
@@ -29,6 +29,14 @@ class FakeBriefStore:
 
     def read(self, doc_id: str) -> DocBrief | None:
         return self._briefs.get(doc_id)
+
+
+class FakeCorpusStore:
+    def __init__(self, docs: list[DocRecord]):
+        self._docs = docs
+
+    def read_processed(self) -> list[DocRecord]:
+        return list(self._docs)
 
 
 def _brief(
@@ -81,6 +89,12 @@ def test_search_adds_supplemental_seed_for_structured_memory_doc(tmp_path: Path)
         scorer=RetrievalScorer(provider, retrieval_config),
         jump_policy=JumpPolicy(retrieval_config),
         semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-11", title="DeepAgents Overview", text="DeepAgents powers subagents and shell execution."),
+                DocRecord(doc_id="doc-14", title="Long Term Memory", text="Persistent storage routes memories through a composite backend on disk."),
+            ]
+        ),
     )
 
     response = service.search("How is memory persisted for the agent system?", top_k=3, use_memory_bias=False)
@@ -119,6 +133,12 @@ def test_search_uses_claim_view_for_profiler_query(tmp_path: Path):
         scorer=RetrievalScorer(provider, retrieval_config),
         jump_policy=JumpPolicy(retrieval_config),
         semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-04", title="Evaluation Metrics", text="The benchmark reports recall, MRR, and NDCG."),
+                DocRecord(doc_id="doc-15", title="Document Profiler", text="The profiler produces a DocBrief with title, summary, entities, keywords, claims, and relation hints."),
+            ]
+        ),
     )
 
     response = service.search("What does the document profiler produce?", top_k=3, use_memory_bias=False)
@@ -127,3 +147,46 @@ def test_search_uses_claim_view_for_profiler_query(tmp_path: Path):
     assert "doc-15" in by_id
     assert by_id["doc-15"].source_kind == "supplemental"
     assert by_id["doc-15"].final_score > 0.35
+
+
+def test_search_can_boost_dense_result_with_sparse_raw_text(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief(
+            "doc-a",
+            "General System Notes",
+            "A broad overview of system behavior.",
+            metadata={"topic": "general"},
+        ),
+        _brief(
+            "doc-b",
+            "Latency Tuning",
+            "A short note about optimizations.",
+            metadata={"topic": "general"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-a", score=0.66, rank=1),
+                Neighbor(doc_id="doc-b", score=0.61, rank=2),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="General System Notes", text="A broad overview of system behavior."),
+                DocRecord(doc_id="doc-b", title="Latency Tuning", text="Vector search latency tuning uses ef_search caching and query expansion guards."),
+            ]
+        ),
+    )
+
+    response = service.search("How do we tune vector search latency?", top_k=2, use_memory_bias=False)
+
+    assert response.hits[0].doc_id == "doc-b"
+    assert response.hits[0].source_kind == "supplemental"

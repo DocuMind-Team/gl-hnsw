@@ -8,7 +8,7 @@ from hnsw_logic.config.schema import RelationQualityConfig, RetrievalConfig
 from hnsw_logic.core.constants import DEFAULT_TIMESTAMP, RELATION_TYPES
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.core.utils import cosine, tokenize
-from hnsw_logic.embedding.provider import CandidateProposal
+from hnsw_logic.embedding.provider import CandidateProposal, JudgeSignals
 
 
 ROLE_WORDS = {"role", "roles", "subagent", "subagents", "profiler", "scout", "judge", "curator"}
@@ -336,6 +336,53 @@ class LogicOrchestrator:
             "supporting_evidence": max(0.0, min(supporting_evidence, 1.2)),
             "prerequisite": max(0.0, min(prerequisite, 1.2)),
         }
+
+    def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
+        score = (
+            0.28 * metrics["dense_score"]
+            + 0.22 * metrics["local_support"]
+            + 0.14 * metrics["mention_score"]
+            + 0.14 * fit_scores.get(relation_type, 0.0)
+            + 0.08 * metrics["forward_reference_score"]
+            + 0.06 * metrics["content_overlap_score"]
+            + 0.08 * metrics["topic_alignment"]
+            + max(self._relation_stage_bonus(anchor, candidate, relation_type, metrics), 0.0) * 0.1
+        )
+        score -= 0.16 * metrics["service_surface_score"]
+        if metrics["topic_drift"] >= 1.0:
+            score -= 0.24
+        if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
+            score -= 0.22
+        return max(0.0, min(score, 1.0))
+
+    def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
+        stage_pair = f"{self._doc_stage(anchor)}->{self._doc_stage(candidate)}".strip("->")
+        risk_flags: list[str] = []
+        if metrics["topic_drift"] >= 1.0:
+            risk_flags.append("topic_drift")
+        if metrics["service_surface_score"] >= 0.5:
+            risk_flags.append("service_surface")
+        if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
+            risk_flags.append("foundational_support")
+        if relation_type == "implementation_detail" and self._implementation_direction_score(anchor, candidate, metrics) < 0.08:
+            risk_flags.append("weak_direction")
+        return JudgeSignals(
+            dense_score=metrics["dense_score"],
+            sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
+            overlap_score=metrics["overlap_score"],
+            content_overlap_score=metrics["content_overlap_score"],
+            mention_score=metrics["mention_score"],
+            role_listing_score=metrics["role_listing_score"],
+            forward_reference_score=metrics["forward_reference_score"],
+            reverse_reference_score=metrics["reverse_reference_score"],
+            direction_score=self._implementation_direction_score(anchor, candidate, metrics),
+            local_support=metrics["local_support"],
+            utility_score=self._utility_score(anchor, candidate, metrics, fit_scores, relation_type),
+            best_relation=relation_type,
+            stage_pair=stage_pair,
+            risk_flags=risk_flags,
+            relation_fit_scores={key: round(value, 4) for key, value in fit_scores.items()},
+        )
 
     def _pair_rerank(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> tuple[float, str, dict[str, float]]:
         fit_scores = self._relation_fit_scores(anchor, candidate, metrics)
@@ -782,6 +829,7 @@ class LogicOrchestrator:
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
         metrics = self._candidate_metrics(anchor, candidate)
         rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+        signal_bundle = self._signal_bundle(anchor, candidate, metrics, fit_scores, rerank_relation)
         final_result = result
         fallback = self._local_relation_override(anchor, candidate, metrics, result)
         if fallback is not None:
@@ -824,6 +872,8 @@ class LogicOrchestrator:
 
         model_support = max(0.0, min(float(getattr(final_result, "support_score", 0.0)), 1.0))
         blended_support = 0.7 * metrics["local_support"] + 0.3 * model_support
+        model_utility = max(0.0, min(float(getattr(final_result, "utility_score", 0.0)), 1.0))
+        blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * model_utility)
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
         threshold = self._relation_threshold(final_result.relation_type)
 
@@ -856,6 +906,8 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
             return CandidateAssessment(candidate.doc_id, False, "low_support", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if self._is_live_provider() and blended_utility < 0.24:
+            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if evidence_quality < threshold.min_evidence_quality:
             return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if getattr(final_result, "contradiction_flags", None):
@@ -863,6 +915,7 @@ class LogicOrchestrator:
 
         score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
         score *= 1.0 + 0.16 * fit_scores.get(final_result.relation_type, rerank_score)
+        score *= 0.85 + 0.4 * blended_utility
         if final_result.relation_type == "implementation_detail":
             score *= 1.0 + max(self._implementation_direction_score(anchor, candidate, metrics), 0.0)
         edge = LogicEdge(
@@ -981,7 +1034,14 @@ class LogicOrchestrator:
         return assessment.edge if assessment.accepted else None
 
     def judge_many_with_diagnostics(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[CandidateAssessment]:
-        if hasattr(self.relation_judge, "run_many"):
+        if hasattr(self.relation_judge, "run_many_with_signals"):
+            candidate_pairs = []
+            for candidate in candidates:
+                metrics = self._candidate_metrics(anchor, candidate)
+                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+                candidate_pairs.append((candidate, self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)))
+            verdicts = self.relation_judge.run_many_with_signals(anchor, candidate_pairs)
+        elif hasattr(self.relation_judge, "run_many"):
             verdicts = self.relation_judge.run_many(anchor, candidates)
         else:
             verdicts = {candidate.doc_id: self.relation_judge.run(anchor, candidate) for candidate in candidates}
