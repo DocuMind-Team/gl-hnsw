@@ -342,6 +342,111 @@ class LogicOrchestrator:
         relation_type, score = max(fit_scores.items(), key=lambda item: (item[1], item[0]))
         return score, relation_type, fit_scores
 
+    def _is_foundational_candidate(self, candidate: DocBrief) -> bool:
+        title_tokens = set(tokenize(candidate.title))
+        content_terms = self._content_terms(candidate)
+        topic = str(candidate.metadata.get("topic", "")).lower()
+        return (
+            topic == "retrieval"
+            and ("similarity" in title_tokens or len(content_terms & FOUNDATIONAL_TERMS) >= 2)
+            and not (content_terms & {"hybrid", "overlay", "logic", "jump", "fusion"})
+        )
+
+    def _workflow_prerequisite_signal(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> bool:
+        combined = f"{anchor.title} {anchor.summary} {' '.join(anchor.claims)} {candidate.title} {candidate.summary} {' '.join(candidate.claims)}".lower()
+        anchor_tokens = set(tokenize(anchor.title))
+        candidate_tokens = set(tokenize(candidate.title))
+        if "scout" in anchor_tokens and "judge" in candidate_tokens:
+            return True
+        if any(cue in combined for cue in ORDER_CUES):
+            return metrics["specific_role_score"] >= 0.5 or self._doc_stage(candidate) == "agent_roles"
+        return False
+
+    def _topic_drift_exception(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float]) -> bool:
+        if metrics["topic_drift"] < 1.0:
+            return True
+        if fit_scores["prerequisite"] >= 0.72 and (
+            metrics["specific_role_score"] >= 0.5
+            or self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics) >= 0.22
+            or self._workflow_prerequisite_signal(anchor, candidate, metrics)
+        ):
+            return True
+        if (
+            fit_scores["supporting_evidence"] >= 0.28
+            and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+            and not self._is_foundational_candidate(candidate)
+        ):
+            return True
+        if (
+            fit_scores["implementation_detail"] >= 0.72
+            and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+        ):
+            return True
+        return False
+
+    def _targeted_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
+        anchor_stage = self._doc_stage(anchor)
+        proposals: list[tuple[float, CandidateProposal]] = []
+        for candidate in corpus:
+            if candidate.doc_id == anchor.doc_id:
+                continue
+            metrics = self._candidate_metrics(anchor, candidate)
+            _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            if not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+                continue
+            stage_bonus = max(
+                self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics),
+                self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics),
+                self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics),
+            )
+            score = max(fit_scores.values()) + 0.22 * stage_bonus
+            if anchor_stage == "agent_roles" and fit_scores["prerequisite"] >= 0.72 and (
+                self._has_listing_context(anchor) >= 1.0 or self._workflow_prerequisite_signal(anchor, candidate, metrics)
+            ):
+                proposals.append(
+                    (
+                        score + 0.16,
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted role/workflow prerequisite candidate",
+                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
+                            score_hint=min(score + 0.16, 0.99),
+                        ),
+                    )
+                )
+            if fit_scores["supporting_evidence"] >= 0.28 and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22:
+                proposals.append(
+                    (
+                        score + 0.1,
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted stage-supporting evidence candidate",
+                            query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
+                            score_hint=min(score + 0.1, 0.99),
+                        ),
+                    )
+                )
+            if anchor_stage == "agent_overview" and fit_scores["implementation_detail"] >= 0.78 and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22:
+                proposals.append(
+                    (
+                        score + 0.08,
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted overview implementation-detail candidate",
+                            query=" ".join((candidate.keywords + [candidate.title])[:4]),
+                            score_hint=min(score + 0.08, 0.99),
+                        ),
+                    )
+                )
+        proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
+        dedup: dict[str, tuple[float, CandidateProposal]] = {}
+        for score, proposal in proposals:
+            previous = dedup.get(proposal.doc_id)
+            if previous is None or score > previous[0]:
+                dedup[proposal.doc_id] = (score, proposal)
+        ranked = sorted(dedup.values(), key=lambda item: (-item[0], item[1].doc_id))
+        return ranked[:8]
+
     def _proposal_bucket_quotas(self, anchor: DocBrief, limit: int) -> dict[str, int]:
         stage = self._doc_stage(anchor)
         if stage == "agent_roles":
@@ -613,9 +718,22 @@ class LogicOrchestrator:
                 anchor,
                 candidate,
                 "prerequisite",
-                confidence=max(0.87, float(getattr(result, "confidence", 0.0))),
+                confidence=max(0.9, float(getattr(result, "confidence", 0.0))),
                 reason="Anchor enumerates specialized roles and candidate is one listed role.",
                 support_score=min(0.95, metrics["local_support"] + 0.18),
+            )
+        if (
+            self._doc_stage(anchor) == "agent_roles"
+            and self._workflow_prerequisite_signal(anchor, candidate, metrics)
+            and fit_scores["prerequisite"] >= 0.74
+        ):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "prerequisite",
+                confidence=max(0.9, float(getattr(result, "confidence", 0.0))),
+                reason="Candidate is the next explicit workflow role implied by the anchor's ordering cues.",
+                support_score=min(0.9, metrics["local_support"] + 0.16),
             )
         if (
             metrics["service_surface_score"] < 0.55
@@ -667,7 +785,13 @@ class LogicOrchestrator:
         final_result = result
         fallback = self._local_relation_override(anchor, candidate, metrics, result)
         if fallback is not None:
-            force_override = fallback.relation_type == "prerequisite" and metrics["specific_role_score"] >= 0.5 and metrics["role_listing_score"] >= 0.62
+            force_override = (
+                fallback.relation_type == "prerequisite"
+                and (
+                    (metrics["specific_role_score"] >= 0.5 and fit_scores["prerequisite"] >= 0.72)
+                    or self._workflow_prerequisite_signal(anchor, candidate, metrics)
+                )
+            )
             detail_override = (
                 fallback.relation_type == "implementation_detail"
                 and metrics["dense_score"] >= 0.68
@@ -678,7 +802,17 @@ class LogicOrchestrator:
                     or float(result.confidence) < 0.88
                 )
             )
-            if force_override or detail_override or not result.accepted or result.relation_type in {"same_concept", "comparison"} or float(result.confidence) < 0.84:
+            if (
+                force_override
+                or detail_override
+                or not result.accepted
+                or result.relation_type in {"same_concept", "comparison"}
+                or (
+                    fallback.relation_type == "prerequisite"
+                    and float(result.confidence) < 0.9
+                )
+                or float(result.confidence) < 0.84
+            ):
                 final_result = fallback
 
         if not final_result.accepted:
@@ -693,7 +827,7 @@ class LogicOrchestrator:
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
         threshold = self._relation_threshold(final_result.relation_type)
 
-        if metrics["topic_drift"] >= 1.0:
+        if metrics["topic_drift"] >= 1.0 and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
             return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not threshold.enabled and not self._relation_cues(anchor, candidate, final_result):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -704,6 +838,8 @@ class LogicOrchestrator:
         if final_result.relation_type == "supporting_evidence" and fit_scores["supporting_evidence"] < 0.25:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "prerequisite" and fit_scores["prerequisite"] < 0.38:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._passes_structural_gate(anchor, candidate, metrics, final_result):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -766,9 +902,9 @@ class LogicOrchestrator:
             if candidate.doc_id == anchor.doc_id:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
-            if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
-                continue
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+                continue
             score = (
                 metrics["local_support"]
                 + 0.42 * rerank_score
@@ -803,9 +939,9 @@ class LogicOrchestrator:
             if candidate is None:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
-            if self._is_live_provider() and metrics["topic_drift"] >= 1.0:
-                continue
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+                continue
             score = (
                 0.55 * proposal.score_hint
                 + metrics["local_support"]
@@ -818,6 +954,11 @@ class LogicOrchestrator:
                 merged[proposal.doc_id] = (score, CandidateProposal(doc_id=proposal.doc_id, reason=proposal.reason, query=proposal.query, score_hint=min(score, 0.99)))
 
         for score, proposal in self._local_candidate_proposals(anchor, corpus):
+            previous = merged.get(proposal.doc_id)
+            if previous is None or score > previous[0]:
+                merged[proposal.doc_id] = (score, proposal)
+
+        for score, proposal in self._targeted_candidate_proposals(anchor, corpus):
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
@@ -854,6 +995,9 @@ class LogicOrchestrator:
             prerequisite_group = [item for item in accepted if item.relation_type == "prerequisite" and item.local_support >= 0.42]
             if len(prerequisite_group) >= 2:
                 cap = max(cap, min(4, len(prerequisite_group)))
+        if self._is_live_provider() and self._doc_stage(anchor) == "agent_overview" and len(accepted) >= 2:
+            if accepted[0].score - accepted[1].score <= self._edge_quality().second_edge_margin:
+                cap = max(cap, 2)
 
         kept_ids = {item.candidate_doc_id for item in accepted[:cap]}
         final: list[CandidateAssessment] = []

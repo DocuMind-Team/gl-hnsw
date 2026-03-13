@@ -572,6 +572,142 @@ def test_implementation_stage_direction_rejects_service_to_overview_edge():
     assert assessment.reject_reason in {"wrong_relation_type", "wrong_direction"}
 
 
+def test_listed_role_fallback_overrides_low_confidence():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-12",
+        "Subagents",
+        "Subagents include document profiler, corpus scout, relation judge, and memory curator roles.",
+        ["subagents", "document", "profiler", "corpus", "scout", "relation", "judge", "memory", "curator"],
+        ["subagents"],
+        ["include", "roles"],
+    )
+    anchor.metadata["topic"] = "deepagents"
+    candidate = _brief(
+        "doc-17",
+        "Relation Judge",
+        "The relation judge verifies whether an anchor and candidate should form a logic edge.",
+        ["relation", "judge", "anchor", "candidate", "logic", "edge"],
+        ["judge"],
+        ["accepted or rejected", "relation type"],
+    )
+    candidate.metadata["topic"] = "agents"
+    verdicts = {
+        "doc-17": JudgeResult(
+            accepted=True,
+            relation_type="prerequisite",
+            confidence=0.74,
+            evidence_spans=[
+                "Subagents include relation judge among the listed roles.",
+                "The relation judge verifies whether an anchor and candidate should form a logic edge.",
+            ],
+            rationale="Relation judge is one of the listed specialized roles.",
+            support_score=0.62,
+            contradiction_flags=[],
+            decision_reason="Low confidence but semantically plausible.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "prerequisite"
+
+
+def test_workflow_fallback_accepts_scout_before_judge_pair():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-16",
+        "Corpus Scout",
+        "The corpus scout runs before the relation judge and proposes high-value candidate documents.",
+        ["corpus", "scout", "before", "relation", "judge", "candidate"],
+        ["scout"],
+        ["before", "candidate documents"],
+    )
+    anchor.metadata["topic"] = "agents"
+    candidate = _brief(
+        "doc-17",
+        "Relation Judge",
+        "The relation judge verifies whether an anchor and candidate should form a logic edge.",
+        ["relation", "judge", "anchor", "candidate", "logic", "edge"],
+        ["judge"],
+        ["accepted or rejected", "relation type"],
+    )
+    candidate.metadata["topic"] = "agents"
+    verdicts = {
+        "doc-17": JudgeResult(
+            accepted=False,
+            relation_type="comparison",
+            confidence=0.3,
+            evidence_spans=[],
+            rationale="Model abstained on workflow dependency.",
+            support_score=0.1,
+            contradiction_flags=[],
+            decision_reason="No confident relation chosen.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "prerequisite"
+
+
+def test_supporting_evidence_rejects_foundational_similarity_candidate():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-09",
+        "Jump Policy",
+        "The jump policy gates one-hop expansion using confidence, edge-card matching, and target relevance.",
+        ["jump", "policy", "confidence", "edge-card", "relevance", "expansion"],
+        relation_hints=["one-hop expansion", "target relevance"],
+    )
+    anchor.metadata["topic"] = "logic"
+    candidate = _brief(
+        "doc-06",
+        "Cosine Similarity",
+        "Cosine similarity is a standard metric for vector retrieval and relevance scoring.",
+        ["cosine", "similarity", "metric", "retrieval", "relevance"],
+        relation_hints=["vector retrieval", "relevance scoring"],
+    )
+    candidate.metadata["topic"] = "retrieval"
+    verdicts = {
+        "doc-06": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.9,
+            evidence_spans=["cosine similarity can gate logical expansion and target relevance scoring"],
+            rationale="The similarity metric constrains relevance matching.",
+            support_score=0.82,
+            contradiction_flags=[],
+            decision_reason="Base metric appears relevant to target scoring.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason == "wrong_relation_type"
+
+
 def test_parse_json_tolerates_fenced_json():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     payload = provider._parse_json("```json\n{\"accepted\": true, \"confidence\": 0.9}\n```")
