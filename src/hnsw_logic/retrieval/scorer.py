@@ -49,6 +49,19 @@ class RetrievalScorer:
         self._brief_embedding_cache[key] = cached
         return cached
 
+    def preload_views(self, briefs: list[DocBrief], view_names: tuple[str, ...]) -> None:
+        for view_name in view_names:
+            missing = [brief for brief in briefs if (brief.doc_id, view_name) not in self._brief_embedding_cache]
+            if not missing:
+                continue
+            texts = []
+            for brief in missing:
+                views = self._brief_views(brief)
+                texts.append(views.get(view_name, "") or views.get("full", ""))
+            embeddings = self.provider.embed_texts(texts)
+            for brief, embedding in zip(missing, embeddings):
+                self._brief_embedding_cache[(brief.doc_id, view_name)] = embedding
+
     def _query_tokens(self, query: str) -> set[str]:
         return {token for token in tokenize(query) if len(token) > 2}
 

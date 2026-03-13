@@ -77,6 +77,7 @@ class HybridRetrievalService:
         briefs: dict[str, object],
         existing_ids: set[str],
     ) -> list[tuple[str, float]]:
+        self.scorer.preload_views(list(briefs.values()), ("title", "claims", "relation", "full"))
         scored: list[tuple[float, str]] = []
         for doc_id, brief in briefs.items():
             if doc_id in existing_ids:
