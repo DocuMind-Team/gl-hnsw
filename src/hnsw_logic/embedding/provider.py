@@ -749,7 +749,7 @@ class OpenAICompatibleProvider(StubProvider):
         if not docs:
             return []
         results: dict[str, DocBrief] = {}
-        for batch in self._chunk(docs, 4):
+        for batch in self._chunk(docs, 8):
             try:
                 payload = self._invoke_json(
                     "You are a document profiler. Return JSON only.",
@@ -945,7 +945,7 @@ class OpenAICompatibleProvider(StubProvider):
         if not candidates:
             return {}
         verdicts: dict[str, JudgeResult] = {}
-        for batch in self._chunk(candidates, 6):
+        for batch in self._chunk(candidates, 8):
             try:
                 payload = self._invoke_json(
                     self._judge_instruction(),

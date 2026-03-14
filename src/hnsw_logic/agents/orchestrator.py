@@ -928,13 +928,13 @@ class LogicOrchestrator:
                 selected.update(brief.doc_id for brief in group)
                 continue
             if source_dataset == "arguana":
-                cap = max(12, min(len(group), len(group) // 5 + 8))
+                cap = max(8, min(len(group), len(group) // 15 + 6))
                 floor = 0.5
             elif source_dataset == "scifact":
-                cap = max(16, min(len(group), len(group) // 4))
+                cap = max(10, min(len(group), len(group) // 12 + 4))
                 floor = 0.48
             else:
-                cap = max(14, min(len(group), len(group) // 4))
+                cap = max(10, min(len(group), len(group) // 10 + 4))
                 floor = 0.46
             ranked = sorted(
                 ((self.discovery_anchor_priority(brief), brief.doc_id) for brief in group),
