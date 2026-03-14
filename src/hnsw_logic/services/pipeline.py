@@ -67,6 +67,10 @@ class BuildPipeline:
                 doc for doc in docs
                 if self.discovery_service.orchestrator.should_attempt_discovery(brief_map[doc.doc_id])
             ]
+            selected_ids = self.discovery_service.orchestrator.select_discovery_anchors(
+                [brief_map[doc.doc_id] for doc in docs if doc.doc_id in brief_map]
+            )
+            docs = [doc for doc in docs if doc.doc_id in selected_ids]
         accepted = []
         for doc in docs:
             accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))

@@ -880,6 +880,72 @@ class LogicOrchestrator:
         text_tokens = set(tokenize(self._brief_text(anchor)))
         return bool(text_tokens & DISCOVERY_TERMS) or len(anchor.relation_hints) >= 4
 
+    def discovery_anchor_priority(self, anchor: DocBrief) -> float:
+        source_dataset = self._source_dataset(anchor)
+        content_terms = self._content_terms(anchor)
+        keyword_score = min(len(anchor.keywords) / 8.0, 1.0)
+        entity_score = min(len(anchor.entities) / 4.0, 1.0)
+        claim_score = min(len([claim for claim in anchor.claims if claim.strip()]) / 2.0, 1.0)
+        summary_score = min(len(anchor.summary) / 180.0, 1.0)
+        hint_terms = set(anchor.relation_hints)
+        if source_dataset == "arguana":
+            return (
+                0.3 * (1.0 if self._topic_cluster(anchor) else 0.0)
+                + 0.24 * (1.0 if self._stance(anchor) else 0.0)
+                + 0.18 * claim_score
+                + 0.16 * keyword_score
+                + 0.12 * summary_score
+            )
+        if source_dataset == "scifact":
+            evidence_hint = 1.0 if hint_terms & {"claim", "evidence", "study"} else 0.0
+            return (
+                0.28 * entity_score
+                + 0.24 * claim_score
+                + 0.18 * evidence_hint
+                + 0.16 * keyword_score
+                + 0.14 * min(len(content_terms) / 14.0, 1.0)
+            )
+        if source_dataset == "nfcorpus":
+            clinical_hint = 1.0 if hint_terms & {"clinical", "condition", "treatment"} else 0.0
+            return (
+                0.24 * claim_score
+                + 0.22 * keyword_score
+                + 0.18 * entity_score
+                + 0.18 * clinical_hint
+                + 0.18 * summary_score
+            )
+        return 1.0
+
+    def select_discovery_anchors(self, briefs: list[DocBrief]) -> set[str]:
+        if not briefs:
+            return set()
+        grouped: dict[str, list[DocBrief]] = {}
+        for brief in briefs:
+            grouped.setdefault(self._source_dataset(brief), []).append(brief)
+        selected: set[str] = set()
+        for source_dataset, group in grouped.items():
+            if source_dataset not in {"arguana", "scifact", "nfcorpus"}:
+                selected.update(brief.doc_id for brief in group)
+                continue
+            if source_dataset == "arguana":
+                cap = max(12, min(len(group), len(group) // 5 + 8))
+                floor = 0.5
+            elif source_dataset == "scifact":
+                cap = max(16, min(len(group), len(group) // 4))
+                floor = 0.48
+            else:
+                cap = max(14, min(len(group), len(group) // 4))
+                floor = 0.46
+            ranked = sorted(
+                ((self.discovery_anchor_priority(brief), brief.doc_id) for brief in group),
+                key=lambda item: (-item[0], item[1]),
+            )
+            kept = [doc_id for score, doc_id in ranked if score >= floor][:cap]
+            if not kept:
+                kept = [doc_id for _, doc_id in ranked[: min(cap, max(6, len(group) // 6 or 1))]]
+            selected.update(kept)
+        return selected
+
     def _local_relation_override(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result):
         anchor_text = self._brief_text(anchor)
         candidate_text = self._brief_text(candidate)

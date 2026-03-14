@@ -12,7 +12,7 @@ import numpy as np
 from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.core.facets import enrich_brief
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
-from hnsw_logic.core.utils import deterministic_vector, to_jsonable, tokenize, top_terms
+from hnsw_logic.core.utils import append_jsonl, deterministic_vector, to_jsonable, tokenize, top_terms, utc_now
 
 
 @dataclass(slots=True)
@@ -362,6 +362,8 @@ class OpenAICompatibleProvider(StubProvider):
         self._embeddings = None
         self._local_embedding_model = None
         self._local_embedding_tokenizer = None
+        self.require_remote = os.getenv("GL_HNSW_REQUIRE_REMOTE", "0") == "1"
+        self.trace_path = self.root_dir / "data" / "workspace" / "remote_provider_traces.jsonl" if self.root_dir else None
         if config.embedding_model in {"bge-m3", "BAAI/bge-m3"}:
             self._init_local_bge_m3()
         else:
@@ -370,6 +372,27 @@ class OpenAICompatibleProvider(StubProvider):
                 api_key=api_key,
                 model=config.embedding_model,
             )
+
+    def _trace_remote(self, stage: str, status: str, detail: str = "") -> None:
+        if self.trace_path is None:
+            return
+        append_jsonl(
+            self.trace_path,
+            [
+                {
+                    "timestamp": utc_now(),
+                    "stage": stage,
+                    "status": status,
+                    "detail": detail[:240],
+                    "model": self.config.chat_model,
+                }
+            ],
+        )
+
+    def _handle_remote_failure(self, stage: str, exc: Exception) -> None:
+        self._trace_remote(stage, "fallback", str(exc))
+        if self.require_remote:
+            raise RuntimeError(f"Remote provider call failed during {stage}: {exc}") from exc
 
     def _init_local_bge_m3(self) -> None:
         from huggingface_hub import snapshot_download
@@ -420,7 +443,7 @@ class OpenAICompatibleProvider(StubProvider):
                 raise
             return json.loads(match.group(1))
 
-    def _invoke_json(self, system_prompt: str, user_prompt: str, *, thinking: bool = False):
+    def _invoke_json(self, system_prompt: str, user_prompt: str, *, thinking: bool = False, stage: str = "generic"):
         from langchain_core.messages import HumanMessage, SystemMessage
 
         kwargs = {}
@@ -428,9 +451,15 @@ class OpenAICompatibleProvider(StubProvider):
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        response = self._chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)], **kwargs)
-        content = response.content if isinstance(response.content, str) else "".join(part.get("text", "") for part in response.content)
-        return self._parse_json(content)
+        try:
+            response = self._chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)], **kwargs)
+            content = response.content if isinstance(response.content, str) else "".join(part.get("text", "") for part in response.content)
+            payload = self._parse_json(content)
+            self._trace_remote(stage, "success")
+            return payload
+        except Exception as exc:
+            self._trace_remote(stage, "error", str(exc))
+            raise
 
     def _chunk(self, items: list, size: int) -> list[list]:
         return [items[i : i + size] for i in range(0, len(items), size)]
@@ -662,8 +691,10 @@ class OpenAICompatibleProvider(StubProvider):
                     if part
                 ),
                 thinking=self.live_reasoning["query_strategy"],
+                stage="query_strategy",
             )
-        except Exception:
+        except Exception as exc:
+            self._handle_remote_failure("query_strategy", exc)
             return {}
 
     def _embed_local_bge_m3(self, texts: list[str]) -> np.ndarray:
@@ -707,9 +738,11 @@ class OpenAICompatibleProvider(StubProvider):
                     ]
                 ),
                 thinking=False,
+                stage="profile_doc",
             )
             return self._postprocess_profile(doc, payload)
-        except Exception:
+        except Exception as exc:
+            self._handle_remote_failure("profile_doc", exc)
             return self._postprocess_profile(doc, None)
 
     def profile_docs(self, docs: list[DocRecord]) -> list[DocBrief]:
@@ -740,6 +773,7 @@ class OpenAICompatibleProvider(StubProvider):
                         },
                         ensure_ascii=False,
                     ),
+                    stage="profile_docs_batch",
                 )
                 items = payload if isinstance(payload, list) else payload.get("documents", [])
                 for item in items:
@@ -748,8 +782,8 @@ class OpenAICompatibleProvider(StubProvider):
                     if source is None:
                         continue
                     results[doc_id] = self._postprocess_profile(source, item)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._handle_remote_failure("profile_docs_batch", exc)
             for doc in batch:
                 results.setdefault(doc.doc_id, self._postprocess_profile(doc, None))
         return [results[doc.doc_id] for doc in docs]
@@ -788,6 +822,7 @@ class OpenAICompatibleProvider(StubProvider):
                     ensure_ascii=False,
                 ),
                 thinking=self.live_reasoning["scout"],
+                stage="corpus_scout",
             )
             items = payload if isinstance(payload, list) else payload.get("candidates", [])
             proposals: list[CandidateProposal] = []
@@ -804,7 +839,8 @@ class OpenAICompatibleProvider(StubProvider):
                     )
                 )
             return proposals or super().propose_candidates(anchor, corpus)
-        except Exception:
+        except Exception as exc:
+            self._handle_remote_failure("corpus_scout", exc)
             return super().propose_candidates(anchor, corpus)
 
     def judge_relation(self, anchor: DocBrief, candidate: DocBrief) -> JudgeResult:
@@ -865,9 +901,11 @@ class OpenAICompatibleProvider(StubProvider):
                     if part
                 ),
                 thinking=self.live_reasoning["judge"],
+                stage="judge_relation",
             )
             return self._verdict_from_payload(payload)
-        except Exception:
+        except Exception as exc:
+            self._handle_remote_failure("judge_relation", exc)
             return super().judge_relation(anchor, candidate)
 
     def judge_relations(self, anchor: DocBrief, candidates: list[DocBrief]) -> dict[str, JudgeResult]:
@@ -945,6 +983,7 @@ class OpenAICompatibleProvider(StubProvider):
                         if part
                     ),
                     thinking=self.live_reasoning["judge"],
+                    stage="judge_relations_batch",
                 )
                 items = payload if isinstance(payload, list) else payload.get("verdicts", [])
                 for item in items:
@@ -952,8 +991,8 @@ class OpenAICompatibleProvider(StubProvider):
                     if not candidate_doc_id:
                         continue
                     verdicts[candidate_doc_id] = self._verdict_from_payload(item)
-            except Exception:
-                pass
+            except Exception as exc:
+                self._handle_remote_failure("judge_relations_batch", exc)
             for candidate, signals in batch:
                 verdicts.setdefault(candidate.doc_id, super().judge_relation_with_signals(anchor, candidate, signals))
         return verdicts
@@ -978,6 +1017,7 @@ class OpenAICompatibleProvider(StubProvider):
                     ensure_ascii=False,
                 ),
                 thinking=self.live_reasoning["curator"],
+                stage="curate_memory",
             )
             return {
                 "active_hypotheses": [str(item) for item in payload.get("active_hypotheses", [])][:4],
@@ -992,7 +1032,8 @@ class OpenAICompatibleProvider(StubProvider):
                     for key, values in payload.get("relation_patterns", {}).items()
                 },
             }
-        except Exception:
+        except Exception as exc:
+            self._handle_remote_failure("curate_memory", exc)
             return super().curate_memory(anchor, accepted, rejected)
 
 
