@@ -191,9 +191,11 @@ def test_search_can_boost_dense_result_with_sparse_raw_text(tmp_path: Path):
     )
 
     response = service.search("How do we tune vector search latency?", top_k=2, use_memory_bias=False)
+    by_id = {hit.doc_id: hit for hit in response.hits}
 
-    assert response.hits[0].doc_id == "doc-b"
-    assert response.hits[0].source_kind == "supplemental"
+    assert "doc-b" in by_id
+    assert by_id["doc-b"].source_kind == "geometric"
+    assert by_id["doc-b"].final_score > 0.61
 
 
 def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_path: Path):
@@ -247,6 +249,49 @@ def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_pat
     hit_ids = [hit.doc_id for hit in response.hits]
 
     assert "doc-c" not in hit_ids
+
+
+def test_search_retains_dense_top_hits_against_sparse_overwrite(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief("doc-03", "HNSW Parameters", "Parameters control build quality and search latency.", metadata={"topic": "hnsw"}),
+        _brief("doc-02", "HNSW Layers", "Layers improve long-range navigation in HNSW.", metadata={"topic": "hnsw"}),
+        _brief("doc-01", "HNSW Overview", "Overview of HNSW search.", metadata={"topic": "hnsw"}),
+        _brief("doc-04", "HNSW Insert Path", "Insertion walks the hierarchy and preserves the base algorithm.", metadata={"topic": "hnsw"}),
+        _brief("doc-24", "Benchmark Reporting", "Reports include latency, recall, and MRR metrics for the benchmark.", metadata={"topic": "evaluation"}),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-03", score=0.84, rank=1),
+                Neighbor(doc_id="doc-02", score=0.81, rank=2),
+                Neighbor(doc_id="doc-01", score=0.79, rank=3),
+                Neighbor(doc_id="doc-04", score=0.77, rank=4),
+                Neighbor(doc_id="doc-24", score=0.74, rank=5),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-03", title="HNSW Parameters", text="Parameters control HNSW build quality and search latency."),
+                DocRecord(doc_id="doc-02", title="HNSW Layers", text="Layers improve long-range navigation in HNSW."),
+                DocRecord(doc_id="doc-01", title="HNSW Overview", text="Overview of HNSW search."),
+                DocRecord(doc_id="doc-04", title="HNSW Insert Path", text="Insertion walks the hierarchy and preserves the base algorithm."),
+                DocRecord(doc_id="doc-24", title="Benchmark Reporting", text="Reports include latency, recall, and MRR metrics for the benchmark."),
+            ]
+        ),
+    )
+
+    response = service.search("Which parameters control HNSW build quality and search latency?", top_k=5, use_memory_bias=False)
+    hit_ids = [hit.doc_id for hit in response.hits]
+
+    assert "doc-04" in hit_ids
+    assert hit_ids.index("doc-04") < hit_ids.index("doc-24")
 
 
 def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):

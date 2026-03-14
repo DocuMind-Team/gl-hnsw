@@ -355,6 +355,124 @@ def test_supporting_evidence_rejects_service_surface_pairs():
     assert assessment.reject_reason == "wrong_relation_type"
 
 
+def test_agent_roles_rejects_memory_component_as_implementation_detail():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-12",
+        "Subagents",
+        "Subagents include a document profiler, corpus scout, relation judge, and memory curator.",
+        ["subagents", "document", "profiler", "corpus", "scout", "relation", "judge", "memory", "curator"],
+        ["subagents"],
+        ["include", "roles"],
+    )
+    candidate = _brief(
+        "doc-14",
+        "Long Term Memory",
+        "Persistent memory stores anchor memory and semantic memory on disk.",
+        ["memory", "persistent", "anchor", "semantic", "disk"],
+        ["memory"],
+        ["persistent", "storage"],
+    )
+    verdicts = {
+        "doc-14": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.9,
+            evidence_spans=[
+                "Subagents include a memory curator.",
+                "Persistent memory stores anchor memory and semantic memory on disk.",
+            ],
+            rationale="Shared memory terms suggest a subsystem implementation detail.",
+            support_score=0.8,
+            contradiction_flags=[],
+            decision_reason="Memory subsystem seems semantically related.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason == "wrong_relation_type"
+
+
+def test_workflow_and_revalidation_fallbacks_are_accepted():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    retrieval = RetrievalConfig()
+    scout = _brief(
+        "doc-16",
+        "Corpus Scout",
+        "The corpus scout proposes candidates before the relation judge verifies them.",
+        ["corpus", "scout", "before", "relation", "judge", "candidates"],
+        ["scout"],
+        ["before", "workflow"],
+    )
+    judge = _brief(
+        "doc-17",
+        "Relation Judge",
+        "The relation judge verifies candidate relations after the scout proposes them.",
+        ["relation", "judge", "after", "scout", "candidate", "relations"],
+        ["judge"],
+        ["after", "verify"],
+    )
+    revalidation = _brief(
+        "doc-23",
+        "Edge Revalidation",
+        "Logic edges should be revalidated after corpus changes so relation-judge outputs and judged relations remain trustworthy.",
+        ["edge", "revalidation", "logic", "edges", "judge", "judged", "relations", "trustworthy"],
+        ["revalidation"],
+        ["stale", "validated", "judge outputs"],
+    )
+    verdicts = {
+        "doc-17": JudgeResult(
+            accepted=True,
+            relation_type="prerequisite",
+            confidence=0.9,
+            evidence_spans=[
+                "The corpus scout proposes candidates before the relation judge verifies them.",
+                "The relation judge verifies candidate relations after the scout proposes them.",
+            ],
+            rationale="The workflow explicitly places judging after scouting.",
+            support_score=0.82,
+            contradiction_flags=[],
+            decision_reason="Workflow order is explicit.",
+        ),
+        "doc-23": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.68,
+            evidence_spans=[
+                "Judged relations remain trustworthy through later checks.",
+                "Stale logic edges are revalidated after corpus changes.",
+            ],
+            rationale="Revalidation preserves the quality of judged relations over time.",
+            support_score=0.76,
+            contradiction_flags=[],
+            decision_reason="Downstream validation supports the judging stage.",
+        ),
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=retrieval,
+    )
+
+    scout_assessment = orchestrator.judge_many_with_diagnostics(scout, [judge])[0]
+    judge_assessment = orchestrator.judge_many_with_diagnostics(judge, [revalidation])[0]
+
+    assert scout_assessment.accepted is True
+    assert scout_assessment.relation_type == "prerequisite"
+    assert judge_assessment.accepted is True
+    assert judge_assessment.relation_type == "supporting_evidence"
+
+
 def test_should_attempt_discovery_prefers_structural_topics():
     provider = FakeProvider()
     orchestrator = LogicOrchestrator(
