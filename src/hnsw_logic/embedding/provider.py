@@ -785,7 +785,12 @@ class OpenAICompatibleProvider(StubProvider):
             except Exception as exc:
                 self._handle_remote_failure("profile_docs_batch", exc)
             for doc in batch:
-                results.setdefault(doc.doc_id, self._postprocess_profile(doc, None))
+                if doc.doc_id in results:
+                    continue
+                if self.require_remote:
+                    results[doc.doc_id] = self.profile_doc(doc)
+                else:
+                    results.setdefault(doc.doc_id, self.profile_doc(doc))
         return [results[doc.doc_id] for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
@@ -994,7 +999,9 @@ class OpenAICompatibleProvider(StubProvider):
             except Exception as exc:
                 self._handle_remote_failure("judge_relations_batch", exc)
             for candidate, signals in batch:
-                verdicts.setdefault(candidate.doc_id, super().judge_relation_with_signals(anchor, candidate, signals))
+                if candidate.doc_id in verdicts:
+                    continue
+                verdicts[candidate.doc_id] = self.judge_relation_with_signals(anchor, candidate, signals)
         return verdicts
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
