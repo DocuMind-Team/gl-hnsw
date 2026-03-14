@@ -377,6 +377,84 @@ def test_search_applies_graph_neighborhood_bonus_to_relevant_seed(tmp_path: Path
     assert by_id["doc-07"].final_score > 0.70
 
 
+def test_graph_neighborhood_bonus_requires_target_query_alignment(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    graph_store = GraphStore(tmp_path / "accepted_edges.jsonl")
+    graph_store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="doc-11",
+                dst_doc_id="doc-12",
+                relation_type="implementation_detail",
+                confidence=0.9,
+                evidence_spans=[],
+                discovery_path=["test"],
+                edge_card_text="[REL=implementation_detail] DeepAgents Overview -> Subagents",
+                created_at="2026-03-10T00:00:00Z",
+                last_validated_at="2026-03-10T00:00:00Z",
+            )
+        ]
+    )
+    graph_store.reload()
+    briefs = [
+        _brief(
+            "doc-11",
+            "DeepAgents Overview",
+            "DeepAgents coordinates subagents and tools.",
+            claims=["DeepAgents delegates work to subagents."],
+            keywords=["deepagents", "subagents", "tools"],
+            relation_hints=["overview", "subagents"],
+            metadata={"topic": "agents"},
+        ),
+        _brief(
+            "doc-12",
+            "Subagents",
+            "Subagents list profiler, scout, judge, and curator roles.",
+            claims=["Subagents isolate context for specialized roles."],
+            keywords=["subagents", "profiler", "judge", "curator"],
+            relation_hints=["roles", "workflow"],
+            metadata={"topic": "agents"},
+        ),
+        _brief(
+            "doc-14",
+            "Long Term Memory",
+            "Persistent memory is stored on disk.",
+            claims=["Composite backends persist anchor memory and semantic memory."],
+            keywords=["memory", "persistent", "disk"],
+            relation_hints=["memory", "persistent"],
+            metadata={"topic": "memory"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-14", score=0.79, rank=1),
+                Neighbor(doc_id="doc-11", score=0.74, rank=2),
+                Neighbor(doc_id="doc-12", score=0.70, rank=3),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=graph_store,
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-11", title="DeepAgents Overview", text="DeepAgents coordinates subagents and tools."),
+                DocRecord(doc_id="doc-12", title="Subagents", text="Subagents list profiler, scout, judge, and curator roles."),
+                DocRecord(doc_id="doc-14", title="Long Term Memory", text="Persistent memory is stored on disk."),
+            ]
+        ),
+    )
+
+    response = service.search("How is memory persisted for the agent system?", top_k=3, use_memory_bias=False)
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert by_id["doc-11"].final_score == 0.74
+    assert response.hits[0].doc_id == "doc-14"
+
+
 def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
