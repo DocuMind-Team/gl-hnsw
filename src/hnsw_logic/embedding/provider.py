@@ -72,7 +72,7 @@ class ProviderBase:
             "supporting_evidence": 1.02,
             "implementation_detail": 1.0,
             "same_concept": 0.82,
-            "comparison": 0.68,
+            "comparison": 0.9,
             "prerequisite": 0.98,
         }
         self.judge_few_shot_text = self._build_generic_judge_examples()
@@ -148,6 +148,15 @@ class ProviderBase:
                 "candidate_text": "Only approved logical candidates contribute logic score to the final ranking stage.",
                 "expected_relation_type": "supporting_evidence",
                 "why": "The candidate explains the downstream effect of the policy's approval.",
+            },
+            {
+                "label": "positive",
+                "anchor_title": "Public policy should prioritize public transit",
+                "anchor_text": "The argument claims cities should invest in transit instead of adding highway capacity.",
+                "candidate_title": "Road expansion remains the best congestion solution",
+                "candidate_text": "The counterargument claims adding lanes improves mobility more reliably than transit spending.",
+                "expected_relation_type": "comparison",
+                "why": "Both documents discuss the same policy topic from contrasting positions.",
             },
             {
                 "label": "negative",
@@ -437,7 +446,16 @@ class OpenAICompatibleProvider(StubProvider):
         for idx, brief in enumerate(corpus, start=1):
             overlap = len(anchor_terms & set(brief.keywords + brief.entities))
             dense_score = float(np.dot(anchor_vec, vectors[idx]))
-            score = dense_score + 0.08 * min(overlap, 4)
+            topic_cluster_bonus = 0.0
+            anchor_cluster = str(anchor.metadata.get("topic_cluster", ""))
+            candidate_cluster = str(brief.metadata.get("topic_cluster", ""))
+            if anchor_cluster and anchor_cluster == candidate_cluster:
+                topic_cluster_bonus += 0.14
+            anchor_stance = str(anchor.metadata.get("stance", ""))
+            candidate_stance = str(brief.metadata.get("stance", ""))
+            if anchor_stance and candidate_stance and anchor_stance != candidate_stance:
+                topic_cluster_bonus += 0.08
+            score = dense_score + 0.08 * min(overlap, 4) + topic_cluster_bonus
             ranked.append((score, brief))
         ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
         return [brief for _, brief in ranked[:limit]]
@@ -450,6 +468,7 @@ class OpenAICompatibleProvider(StubProvider):
             "implementation_detail means the candidate defines a mechanism, formula, backend, or component directly used by the anchor. "
             "supporting_evidence means the candidate explains, constrains, or gates a claim in the anchor; do not use it for mere co-usage, API exposure, or two components that share the same registry or service surface. "
             "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor. "
+            "comparison is appropriate for debate or argument corpora when two documents address the same topic from contrasting or alternative positions. "
             "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
         )
 
@@ -486,6 +505,132 @@ class OpenAICompatibleProvider(StubProvider):
             utility_score=float(payload.get("utility_score", 0.0)),
             uncertainty=float(payload.get("uncertainty", max(0.0, 1.0 - float(payload.get("confidence", 0.0))))),
         )
+
+    def _first_sentences(self, text: str, limit: int = 3) -> list[str]:
+        return [piece.strip() for piece in re.split(r"(?<=[.!?])\s+|\n+", text) if piece.strip()][:limit]
+
+    def _merge_unique(self, *groups: list[str], limit: int) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for item in group:
+                value = str(item).strip()
+                if not value:
+                    continue
+                key = value.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(value)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    def _derive_title(self, doc: DocRecord, claims: list[str]) -> str:
+        if doc.title.strip():
+            return doc.title.strip()
+        basis = next((claim.strip() for claim in claims if claim.strip()), "")
+        if not basis:
+            basis = next((piece for piece in self._first_sentences(doc.text, limit=1) if piece.strip()), doc.doc_id)
+        words = basis.split()
+        return (" ".join(words[:12]).strip(" .,:;") or doc.doc_id).strip()
+
+    def _infer_argument_stance(self, doc: DocRecord, title: str, claims: list[str]) -> str:
+        doc_id = doc.doc_id.lower()
+        if "-pro" in doc_id or doc_id.endswith("_pro"):
+            return "pro"
+        if "-con" in doc_id or doc_id.endswith("_con"):
+            return "con"
+        text = " ".join([title, *claims, doc.text[:320]]).lower()
+        positive_hits = sum(1 for cue in {"should", "must", "benefit", "support", "improve", "protect", "effective"} if cue in text)
+        negative_hits = sum(1 for cue in {"not", "never", "harm", "risk", "oppose", "against", "worse", "ineffective"} if cue in text)
+        if positive_hits >= negative_hits + 2:
+            return "pro"
+        if negative_hits >= positive_hits + 2:
+            return "con"
+        return ""
+
+    def _topic_cluster(self, title: str, claims: list[str], doc: DocRecord) -> str:
+        cluster_terms = self._merge_unique(
+            [term for term in top_terms(title, limit=4) if term not in {"study", "paper", "argument", "essay"}],
+            [term for term in top_terms(" ".join(claims), limit=6) if term not in {"study", "paper", "argument", "essay"}],
+            [term for term in top_terms(doc.text, limit=8) if term not in {"study", "paper", "argument", "essay"}],
+            limit=4,
+        )
+        return "-".join(cluster_terms[:3])
+
+    def _profile_dataset_hints(self, doc: DocRecord, title: str, summary: str, claims: list[str]) -> tuple[list[str], list[str], dict]:
+        dataset = str(doc.metadata.get("source_dataset", "")).lower()
+        metadata = dict(doc.metadata)
+        if dataset:
+            metadata["source_dataset"] = dataset
+        keywords: list[str] = []
+        relation_hints: list[str] = []
+        cluster = self._topic_cluster(title, claims, doc)
+        if cluster:
+            metadata["topic_cluster"] = cluster
+        if dataset == "arguana":
+            metadata.setdefault("topic", "argument")
+            metadata["doc_kind"] = "argument"
+            stance = self._infer_argument_stance(doc, title, claims)
+            if stance:
+                metadata["stance"] = stance
+                relation_hints.append(f"stance_{stance}")
+            relation_hints.extend(["debate", "argument", "comparison"])
+            keywords.extend(top_terms(" ".join([title, summary, *claims]), limit=6))
+        elif dataset == "scifact":
+            metadata.setdefault("topic", "scientific_claims")
+            metadata["doc_kind"] = "evidence"
+            relation_hints.extend(["claim", "evidence", "study"])
+            keywords.extend(top_terms(" ".join([title, summary, *claims]), limit=6))
+        elif dataset == "nfcorpus":
+            metadata.setdefault("topic", "clinical_retrieval")
+            metadata["doc_kind"] = "medical_passage"
+            relation_hints.extend(["clinical", "condition", "treatment"])
+            keywords.extend(top_terms(" ".join([title, summary, *claims]), limit=6))
+        return keywords, relation_hints, metadata
+
+    def _postprocess_profile(self, doc: DocRecord, payload: dict | None) -> DocBrief:
+        payload = payload or {}
+        fallback_claims = self._first_sentences(doc.text, limit=3)
+        claims = self._merge_unique([str(item) for item in payload.get("claims", [])], fallback_claims, limit=4)
+        title = self._derive_title(doc, claims)
+        summary = str(payload.get("summary", "")).strip()[:320]
+        if not summary:
+            summary = " ".join(claims[:2])[:320]
+        extra_keywords, extra_hints, metadata = self._profile_dataset_hints(doc, title, summary, claims)
+        keywords = self._merge_unique(
+            [str(item) for item in payload.get("keywords", [])],
+            top_terms(title, limit=4),
+            top_terms(summary, limit=6),
+            extra_keywords,
+            limit=10,
+        )
+        relation_hints = self._merge_unique(
+            [str(item) for item in payload.get("relation_hints", [])],
+            extra_hints,
+            top_terms(" ".join(claims), limit=4),
+            limit=8,
+        )
+        entities = self._merge_unique(
+            [str(item) for item in payload.get("entities", [])],
+            [title] if title and len(title.split()) <= 8 else [],
+            limit=10,
+        )
+        brief = enrich_brief(
+            DocBrief(
+                doc_id=doc.doc_id,
+                title=title,
+                summary=summary,
+                entities=entities,
+                keywords=keywords,
+                claims=claims,
+                relation_hints=relation_hints,
+                metadata=metadata,
+            )
+        )
+        brief.metadata.update({key: value for key, value in metadata.items() if value})
+        return brief
 
     def plan_query_strategy(self, payload: dict) -> dict:
         try:
@@ -563,20 +708,9 @@ class OpenAICompatibleProvider(StubProvider):
                 ),
                 thinking=False,
             )
-            return enrich_brief(
-                DocBrief(
-                    doc_id=doc.doc_id,
-                    title=doc.title,
-                    summary=str(payload.get("summary", ""))[:320],
-                    entities=[str(item) for item in payload.get("entities", [])][:8],
-                    keywords=[str(item) for item in payload.get("keywords", [])][:8],
-                    claims=[str(item) for item in payload.get("claims", [])][:4],
-                    relation_hints=[str(item) for item in payload.get("relation_hints", [])][:4],
-                    metadata=doc.metadata,
-                )
-            )
+            return self._postprocess_profile(doc, payload)
         except Exception:
-            return super().profile_doc(doc)
+            return self._postprocess_profile(doc, None)
 
     def profile_docs(self, docs: list[DocRecord]) -> list[DocBrief]:
         if not docs:
@@ -613,22 +747,11 @@ class OpenAICompatibleProvider(StubProvider):
                     source = next((doc for doc in batch if doc.doc_id == doc_id), None)
                     if source is None:
                         continue
-                    results[doc_id] = enrich_brief(
-                        DocBrief(
-                            doc_id=source.doc_id,
-                            title=source.title,
-                            summary=str(item.get("summary", ""))[:320],
-                            entities=[str(value) for value in item.get("entities", [])][:8],
-                            keywords=[str(value) for value in item.get("keywords", [])][:8],
-                            claims=[str(value) for value in item.get("claims", [])][:4],
-                            relation_hints=[str(value) for value in item.get("relation_hints", [])][:4],
-                            metadata=source.metadata,
-                        )
-                    )
+                    results[doc_id] = self._postprocess_profile(source, item)
             except Exception:
                 pass
             for doc in batch:
-                results.setdefault(doc.doc_id, super().profile_doc(doc))
+                results.setdefault(doc.doc_id, self._postprocess_profile(doc, None))
         return [results[doc.doc_id] for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:

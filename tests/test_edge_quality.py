@@ -413,15 +413,67 @@ def test_should_attempt_discovery_uses_external_dataset_style_gate():
 
     arguana_brief = _brief(
         "arg-1",
-        "Culture and public policy",
-        "A position essay about cultural values and public policy.",
-        ["culture", "policy", "argument"],
-        relation_hints=["debate"],
+        "Public transit should replace highway expansion",
+        "The argument claims public transit investment is better than expanding highways for urban mobility.",
+        ["public", "transit", "highway", "expansion", "urban", "mobility", "investment", "policy"],
+        relation_hints=["debate", "comparison"],
     )
+    arguana_brief.claims = ["Public transit investment is better than highway expansion for urban mobility."]
     arguana_brief.metadata["source_dataset"] = "arguana"
+    arguana_brief.metadata["topic_cluster"] = "public-transit-highway"
 
     assert orchestrator.should_attempt_discovery(scifact_brief) is True
-    assert orchestrator.should_attempt_discovery(arguana_brief) is False
+    assert orchestrator.should_attempt_discovery(arguana_brief) is True
+
+
+def test_argumentative_comparison_edge_is_allowed_for_live_provider():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "arg-2": JudgeResult(
+                    accepted=True,
+                    relation_type="comparison",
+                    confidence=0.91,
+                    evidence_spans=[
+                        "The argument claims cities should fund public transit instead of highway expansion.",
+                        "The counterargument claims highway expansion remains the better congestion solution.",
+                    ],
+                    rationale="Both documents debate the same transportation policy from opposing positions.",
+                    support_score=0.82,
+                    contradiction_flags=[],
+                    decision_reason="Shared topic cluster with contrasting stance.",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "arg-1",
+        "Transit investment should come before highway expansion",
+        "Cities should invest in public transit and avoid highway expansion.",
+        ["transit", "investment", "highway", "expansion", "cities", "policy"],
+        relation_hints=["debate", "comparison"],
+    )
+    anchor.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "transit-highway-expansion", "stance": "pro"})
+    candidate = _brief(
+        "arg-2",
+        "Road expansion remains the best mobility strategy",
+        "Expanding highways remains the best way to reduce congestion in cities.",
+        ["road", "expansion", "mobility", "congestion", "cities", "policy"],
+        relation_hints=["debate", "comparison"],
+    )
+    candidate.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "transit-highway-expansion", "stance": "con"})
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is True
+    assert assessment.relation_type == "comparison"
+    assert assessment.edge is not None
 
 
 def test_stage_reranker_prefers_graph_to_policy_over_fusion():

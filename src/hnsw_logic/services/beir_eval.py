@@ -154,7 +154,7 @@ def build_stub_briefs(app) -> None:
 
 
 def _should_build_offline_graph(dataset: str) -> bool:
-    return dataset.lower() in {"scifact", "nfcorpus"}
+    return dataset.lower() in {"scifact", "nfcorpus", "arguana"}
 
 
 def _metric_bundle(name: str, rows: list[dict], qrels: dict[str, dict[str, int]]) -> EvaluationMetrics:

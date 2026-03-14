@@ -94,4 +94,4 @@ def test_load_beir_dataset_keeps_all_positive_docs_when_sampling(tmp_path: Path)
 def test_should_build_offline_graph_only_for_structured_beir_sets():
     assert _should_build_offline_graph("scifact") is True
     assert _should_build_offline_graph("nfcorpus") is True
-    assert _should_build_offline_graph("arguana") is False
+    assert _should_build_offline_graph("arguana") is True

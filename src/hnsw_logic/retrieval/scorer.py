@@ -147,6 +147,10 @@ class RetrievalScorer:
             return 0.1 + 0.6 * alignment
         if edge.relation_type == "implementation_detail":
             return 0.55 + 0.45 * alignment
+        if edge.relation_type == "comparison":
+            if str(brief.metadata.get("source_dataset", "")).lower() == "arguana":
+                return 0.58 + 0.42 * alignment
+            return 0.45 + 0.45 * alignment
         return 0.4 + 0.6 * alignment
 
     def edge_embedding(self, edge: LogicEdge) -> np.ndarray:

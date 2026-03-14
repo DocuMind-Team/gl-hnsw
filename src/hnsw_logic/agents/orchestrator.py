@@ -52,6 +52,8 @@ DISCOVERY_TERMS = {
     "profiler", "scout", "judge", "curator", "worker", "workers", "job", "jobs", "registry",
     "report", "benchmark", "metrics", "revalidate", "revalidation",
 }
+ARGUMENT_STAGE_TOKENS = {"argument", "debate", "claim", "claims", "position", "positions", "policy", "counterargument"}
+ARGUMENT_COMPARISON_CUES = {"argument", "debate", "contrast", "versus", "vs", "counter", "counterargument", "opposing", "alternative", "position"}
 
 
 @dataclass(slots=True)
@@ -106,6 +108,27 @@ class LogicOrchestrator:
 
     def _brief_text(self, brief: DocBrief) -> str:
         return " ".join([brief.title, brief.summary, *brief.claims]).lower()
+
+    def _source_dataset(self, brief: DocBrief) -> str:
+        return str(brief.metadata.get("source_dataset", "")).lower()
+
+    def _topic_cluster(self, brief: DocBrief) -> str:
+        return str(brief.metadata.get("topic_cluster", "")).lower()
+
+    def _stance(self, brief: DocBrief) -> str:
+        return str(brief.metadata.get("stance", "")).lower()
+
+    def _is_argumentative_doc(self, brief: DocBrief) -> bool:
+        if self._source_dataset(brief) == "arguana":
+            return True
+        topic = str(brief.metadata.get("topic", "")).lower()
+        if topic == "argument":
+            return True
+        content_terms = self._content_terms(brief)
+        return len(content_terms & ARGUMENT_STAGE_TOKENS) >= 2 and "comparison" in set(brief.relation_hints)
+
+    def _is_argumentative_pair(self, anchor: DocBrief, candidate: DocBrief) -> bool:
+        return self._is_argumentative_doc(anchor) and self._is_argumentative_doc(candidate)
 
     def _content_terms(self, brief: DocBrief) -> set[str]:
         tokens = {
@@ -182,6 +205,14 @@ class LogicOrchestrator:
         title_tokens = set(tokenize(brief.title))
         content_terms = self._content_terms(brief)
         topic = str(brief.metadata.get("topic", "")).lower()
+        source_dataset = self._source_dataset(brief)
+
+        if source_dataset == "arguana" or topic == "argument":
+            return "argument_claim"
+        if source_dataset == "scifact" or topic == "scientific_claims":
+            return "scientific_evidence"
+        if source_dataset == "nfcorpus" or topic == "clinical_retrieval":
+            return "clinical_passage"
 
         if title_tokens & {"overlay", "graph"}:
             return "logic_graph"
@@ -285,6 +316,11 @@ class LogicOrchestrator:
                 bonus = max(bonus, 0.3)
             if "scout" in set(tokenize(anchor.title)) and "judge" in set(tokenize(candidate.title)):
                 bonus = max(bonus, 0.24)
+        elif relation_type == "comparison":
+            if pair == ("argument_claim", "argument_claim"):
+                bonus = 0.24 if metrics.get("stance_contrast", 0.0) >= 1.0 else 0.12
+            elif pair == ("scientific_evidence", "scientific_evidence"):
+                bonus = 0.08
         return bonus
 
     def _relation_fit_scores(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> dict[str, float]:
@@ -294,6 +330,7 @@ class LogicOrchestrator:
         cue_terms = self._content_terms(anchor) | self._content_terms(candidate)
         detail_cue_score = min(len(cue_terms & DETAIL_CUES) / 5.0, 1.0)
         support_cue_score = min(len(cue_terms & SUPPORT_CUES) / 4.0, 1.0)
+        comparison_cue_score = min(len(cue_terms & ARGUMENT_COMPARISON_CUES) / 5.0, 1.0)
 
         implementation_detail = (
             0.32 * metrics["dense_score"]
@@ -331,10 +368,32 @@ class LogicOrchestrator:
             + self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics)
             - 0.08 * metrics["service_surface_score"]
         )
+        comparison = (
+            0.2 * metrics["dense_score"]
+            + 0.18 * metrics["overlap_score"]
+            + 0.14 * metrics["content_overlap_score"]
+            + 0.16 * metrics["topic_alignment"]
+            + 0.18 * metrics["topic_cluster_match"]
+            + 0.18 * metrics["stance_contrast"]
+            + 0.08 * comparison_cue_score
+            + self._relation_stage_bonus(anchor, candidate, "comparison", metrics)
+            - 0.12 * metrics["service_surface_score"]
+        )
+        same_concept = (
+            0.26 * metrics["dense_score"]
+            + 0.22 * metrics["overlap_score"]
+            + 0.18 * metrics["content_overlap_score"]
+            + 0.16 * metrics["mention_score"]
+            + 0.16 * metrics["topic_alignment"]
+            + 0.12 * metrics["topic_cluster_match"]
+            - 0.16 * metrics["stance_contrast"]
+        )
         return {
             "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
             "supporting_evidence": max(0.0, min(supporting_evidence, 1.2)),
             "prerequisite": max(0.0, min(prerequisite, 1.2)),
+            "comparison": max(0.0, min(comparison, 1.2)),
+            "same_concept": max(0.0, min(same_concept, 1.1)),
         }
 
     def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
@@ -353,6 +412,8 @@ class LogicOrchestrator:
             score -= 0.24
         if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
             score -= 0.22
+        if relation_type == "comparison":
+            score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
         return max(0.0, min(score, 1.0))
 
     def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
@@ -366,6 +427,8 @@ class LogicOrchestrator:
             risk_flags.append("foundational_support")
         if relation_type == "implementation_detail" and self._implementation_direction_score(anchor, candidate, metrics) < 0.08:
             risk_flags.append("weak_direction")
+        if relation_type == "comparison" and metrics["topic_cluster_match"] < 1.0:
+            risk_flags.append("weak_topic_match")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -429,6 +492,13 @@ class LogicOrchestrator:
             and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
         ):
             return True
+        if (
+            self._is_argumentative_pair(anchor, candidate)
+            and fit_scores["comparison"] >= 0.52
+            and metrics["topic_cluster_match"] >= 1.0
+            and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
+        ):
+            return True
         return False
 
     def _targeted_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
@@ -445,6 +515,7 @@ class LogicOrchestrator:
                 self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics),
                 self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics),
                 self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics),
+                self._relation_stage_bonus(anchor, candidate, "comparison", metrics),
             )
             score = max(fit_scores.values()) + 0.22 * stage_bonus
             if anchor_stage == "agent_roles" and fit_scores["prerequisite"] >= 0.72 and (
@@ -485,6 +556,23 @@ class LogicOrchestrator:
                         ),
                     )
                 )
+            if (
+                self._is_argumentative_pair(anchor, candidate)
+                and metrics["topic_cluster_match"] >= 1.0
+                and fit_scores["comparison"] >= 0.58
+                and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
+            ):
+                proposals.append(
+                    (
+                        score + 0.18 + 0.08 * metrics["stance_contrast"],
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted argumentative comparison candidate",
+                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
+                            score_hint=min(score + 0.18, 0.99),
+                        ),
+                    )
+                )
         proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
         dedup: dict[str, tuple[float, CandidateProposal]] = {}
         for score, proposal in proposals:
@@ -496,6 +584,8 @@ class LogicOrchestrator:
 
     def _proposal_bucket_quotas(self, anchor: DocBrief, limit: int) -> dict[str, int]:
         stage = self._doc_stage(anchor)
+        if stage == "argument_claim":
+            return {"comparison": min(limit, 4), "same_concept": min(limit, 2), "supporting_evidence": min(limit, 1)}
         if stage == "agent_roles":
             return {"prerequisite": min(limit, 4), "implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 1)}
         if stage in {"logic_graph", "retrieval_overview", "ops_overview", "ops_service", "agent_overview"}:
@@ -592,16 +682,23 @@ class LogicOrchestrator:
         family_bridge_score = self._family_bridge_score(anchor_content_terms, candidate_content_terms)
         anchor_family = self._dominant_family(anchor_content_terms)
         candidate_family = self._dominant_family(candidate_content_terms)
-        topic_alignment = 1.0 if anchor.metadata.get("topic") and anchor.metadata.get("topic") == candidate.metadata.get("topic") else 0.0
+        topic_cluster_match = 1.0 if self._topic_cluster(anchor) and self._topic_cluster(anchor) == self._topic_cluster(candidate) else 0.0
+        stance_contrast = 1.0 if self._stance(anchor) and self._stance(candidate) and self._stance(anchor) != self._stance(candidate) else 0.0
+        topic_alignment = 1.0 if (
+            (anchor.metadata.get("topic") and anchor.metadata.get("topic") == candidate.metadata.get("topic"))
+            or topic_cluster_match >= 1.0
+        ) else 0.0
         service_surface_score = min(len(candidate_content_terms & SERVICE_SURFACE_TERMS) / 3.0, 1.0)
         specific_role_score = 1.0 if set(tokenize(candidate.title)) & SPECIFIC_ROLE_TERMS else 0.0
-        topic_drift = 1.0 if mention_score < 0.2 and title_overlap == 0 and keyword_overlap + entity_overlap + hint_overlap == 0 and dense_score < 0.45 else 0.0
+        topic_drift = 1.0 if mention_score < 0.2 and title_overlap == 0 and keyword_overlap + entity_overlap + hint_overlap == 0 and dense_score < 0.45 and topic_cluster_match < 1.0 else 0.0
         local_support = (
             0.42 * dense_score
             + 0.2 * overlap_score
             + 0.22 * mention_score
             + 0.08 * role_listing_score
             + 0.08 * min(length_ratio * 1.5, 1.0)
+            + 0.06 * topic_cluster_match
+            + 0.04 * stance_contrast
         )
         return {
             "dense_score": dense_score,
@@ -619,6 +716,8 @@ class LogicOrchestrator:
             "family_bridge_score": family_bridge_score,
             "shared_dominant_family": 1.0 if anchor_family and anchor_family == candidate_family else 0.0,
             "topic_alignment": topic_alignment,
+            "topic_cluster_match": topic_cluster_match,
+            "stance_contrast": stance_contrast,
             "service_surface_score": service_surface_score,
             "specific_role_score": specific_role_score,
             "topic_drift": topic_drift,
@@ -666,7 +765,7 @@ class LogicOrchestrator:
         if relation_type == "same_concept":
             return any(cue in text for cue in {"same", "alias", "equivalent", "become", "becomes"})
         if relation_type == "comparison":
-            return any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs"})
+            return self._is_argumentative_pair(anchor, candidate) or any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs", "counterargument", "opposing"})
         return False
 
     def _passes_structural_gate(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result) -> bool:
@@ -705,12 +804,39 @@ class LogicOrchestrator:
             return metrics["specific_role_score"] >= 0.5 and (
                 metrics["role_listing_score"] >= 0.5 or (metrics["mention_score"] >= 0.28 and metrics["dense_score"] >= 0.52)
             )
-        if relation_type in {"same_concept", "comparison"}:
-            return False
+        if relation_type == "comparison":
+            return (
+                metrics["topic_cluster_match"] >= 1.0
+                and (
+                    (
+                        metrics["stance_contrast"] >= 1.0
+                        and (
+                            metrics["dense_score"] >= 0.18
+                            or metrics["content_overlap_score"] >= 0.12
+                            or metrics["overlap_score"] >= 0.18
+                        )
+                    )
+                    or metrics["content_overlap_score"] >= 0.22
+                    or metrics["overlap_score"] >= 0.28
+                )
+            )
+        if relation_type == "same_concept":
+            return metrics["dense_score"] >= 0.55 and (
+                metrics["overlap_score"] >= 0.3
+                or metrics["topic_cluster_match"] >= 1.0
+            )
         return True
 
     def _relation_threshold(self, relation_type: str) -> RelationQualityConfig:
         return self._edge_quality().relation_thresholds.get(relation_type, RelationQualityConfig())
+
+    def _effective_threshold(self, anchor: DocBrief, candidate: DocBrief, relation_type: str) -> RelationQualityConfig:
+        threshold = self._relation_threshold(relation_type)
+        if relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
+            return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.26, min_evidence_quality=0.28)
+        if relation_type == "same_concept" and self._is_argumentative_pair(anchor, candidate):
+            return RelationQualityConfig(enabled=True, min_confidence=0.82, min_support=0.3, min_evidence_quality=0.28)
+        return threshold
 
     def _is_live_provider(self) -> bool:
         provider = self._provider()
@@ -739,8 +865,8 @@ class LogicOrchestrator:
         source_dataset = str(anchor.metadata.get("source_dataset", "")).lower()
         anchor_terms = self._content_terms(anchor)
         title_tokens = set(tokenize(anchor.title))
-        if source_dataset in {"arguana"}:
-            return False
+        if source_dataset == "arguana":
+            return len(anchor.claims) >= 1 and len(anchor_terms) >= 8 and bool(self._topic_cluster(anchor))
         if source_dataset in {"scifact", "nfcorpus"}:
             return len(anchor.claims) >= 1 and (len(anchor.keywords) >= 3 or len(anchor.entities) >= 2 or len(anchor_terms) >= 8)
         if topic in {"hnsw", "evaluation"}:
@@ -829,6 +955,20 @@ class LogicOrchestrator:
                 reason="Candidate explains or constrains a behavior that the anchor depends on.",
                 support_score=min(0.9, metrics["local_support"] + 0.1),
             )
+        if (
+            self._is_argumentative_pair(anchor, candidate)
+            and fit_scores["comparison"] >= 0.58
+            and metrics["topic_cluster_match"] >= 1.0
+            and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
+        ):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "comparison",
+                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                reason="The documents argue about the same topic from contrasting or alternative positions.",
+                support_score=min(0.9, metrics["local_support"] + 0.12),
+            )
         return None
 
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
@@ -872,7 +1012,11 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "model_rejected", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
         if final_result.relation_type not in RELATION_TYPES:
             return CandidateAssessment(candidate.doc_id, False, "unsupported_relation", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
-        if self._is_live_provider() and final_result.relation_type in {"same_concept", "comparison"}:
+        if (
+            self._is_live_provider()
+            and final_result.relation_type in {"same_concept", "comparison"}
+            and not (final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate))
+        ):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
         model_support = max(0.0, min(float(getattr(final_result, "support_score", 0.0)), 1.0))
@@ -880,7 +1024,7 @@ class LogicOrchestrator:
         model_utility = max(0.0, min(float(getattr(final_result, "utility_score", 0.0)), 1.0))
         blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * model_utility)
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
-        threshold = self._relation_threshold(final_result.relation_type)
+        threshold = self._effective_threshold(anchor, candidate, final_result.relation_type)
 
         if metrics["topic_drift"] >= 1.0 and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
             return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -893,6 +1037,8 @@ class LogicOrchestrator:
         if final_result.relation_type == "supporting_evidence" and fit_scores["supporting_evidence"] < 0.25:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "prerequisite" and fit_scores["prerequisite"] < 0.38:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "comparison" and fit_scores["comparison"] < 0.4:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -907,6 +1053,8 @@ class LogicOrchestrator:
         if final_result.relation_type == "supporting_evidence":
             if self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) < -0.08:
                 return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate) and metrics["topic_cluster_match"] < 1.0:
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
@@ -968,6 +1116,7 @@ class LogicOrchestrator:
                 + 0.42 * rerank_score
                 + 0.08 * fit_scores["implementation_detail"]
                 + 0.06 * fit_scores["supporting_evidence"]
+                + 0.08 * fit_scores.get("comparison", 0.0)
             )
             proposals.append(
                 (
@@ -985,6 +1134,8 @@ class LogicOrchestrator:
 
     def _live_candidate_limit(self, anchor: DocBrief) -> int:
         anchor_text = self._brief_text(anchor)
+        if self._is_argumentative_doc(anchor):
+            return max(self._edge_quality().max_judge_candidates_live, 8)
         if any(word in anchor_text for word in LISTING_WORDS):
             return max(self._edge_quality().max_judge_candidates_live, 8)
         return max(self._edge_quality().max_judge_candidates_live, 6)
@@ -1006,6 +1157,7 @@ class LogicOrchestrator:
                 + 0.34 * rerank_score
                 + 0.06 * fit_scores["implementation_detail"]
                 + 0.04 * fit_scores["supporting_evidence"]
+                + 0.08 * fit_scores.get("comparison", 0.0)
             )
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
@@ -1062,6 +1214,10 @@ class LogicOrchestrator:
                 cap = max(cap, min(4, len(prerequisite_group)))
         if self._is_live_provider() and self._doc_stage(anchor) == "agent_overview" and len(accepted) >= 2:
             if accepted[0].score - accepted[1].score <= self._edge_quality().second_edge_margin:
+                cap = max(cap, 2)
+        if self._is_live_provider() and self._doc_stage(anchor) == "argument_claim":
+            comparison_group = [item for item in accepted if item.relation_type == "comparison" and item.local_support >= 0.34]
+            if len(comparison_group) >= 2 and comparison_group[0].score - comparison_group[1].score <= self._edge_quality().second_edge_margin + 0.04:
                 cap = max(cap, 2)
 
         kept_ids = {item.candidate_doc_id for item in accepted[:cap]}
