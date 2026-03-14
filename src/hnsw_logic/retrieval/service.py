@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from hnsw_logic.core.models import SearchHit, SearchResponse
 from hnsw_logic.docs.brief_store import BriefStore
 from hnsw_logic.graph.store import GraphStore
@@ -9,6 +11,7 @@ from hnsw_logic.retrieval.jump_policy import JumpPolicy
 from hnsw_logic.retrieval.scorer import ExpandedCandidate, RetrievalScorer
 from hnsw_logic.retrieval.sparse import SparseRetriever
 from hnsw_logic.services.corpus import CorpusStore
+from hnsw_logic.core.utils import tokenize
 
 
 class HybridRetrievalService:
@@ -21,6 +24,7 @@ class HybridRetrievalService:
         jump_policy: JumpPolicy,
         semantic_memory_store: SemanticMemoryStore | None = None,
         corpus_store: CorpusStore | None = None,
+        query_strategy_agent=None,
     ):
         self.searcher = searcher
         self.brief_store = brief_store
@@ -29,6 +33,7 @@ class HybridRetrievalService:
         self.jump_policy = jump_policy
         self.semantic_memory_store = semantic_memory_store
         self.corpus_store = corpus_store
+        self.query_strategy_agent = query_strategy_agent
         self.initial_top_k = jump_policy.config.initial_top_k
         self.supplemental_seed_top_k = jump_policy.config.supplemental_seed_top_k
         self.supplemental_seed_min_score = jump_policy.config.supplemental_seed_min_score
@@ -37,14 +42,35 @@ class HybridRetrievalService:
         self.sparse_seed_weight = jump_policy.config.sparse_seed_weight
         self.sparse_min_score = jump_policy.config.sparse_min_score
         self.novelty_dense_top_k = jump_policy.config.novelty_dense_top_k
+        self.sparse_agreement_top_k = jump_policy.config.sparse_agreement_top_k
+        self.sparse_agreement_floor = jump_policy.config.sparse_agreement_floor
+        self.sparse_only_min_agreement = jump_policy.config.sparse_only_min_agreement
+        self.sparse_only_min_raw_coverage = jump_policy.config.sparse_only_min_raw_coverage
         self._sparse = SparseRetriever()
         self._sparse_doc_count = -1
         self._records_by_id = {}
+        self._record_tokens_by_id = {}
         if self.corpus_store is not None:
             try:
                 self._records_by_id = {doc.doc_id: doc for doc in self.corpus_store.read_processed()}
+                self._record_tokens_by_id = {
+                    doc.doc_id: {token for token in tokenize(f"{doc.title} {doc.text}") if len(token) > 2}
+                    for doc in self._records_by_id.values()
+                }
             except FileNotFoundError:
                 self._records_by_id = {}
+                self._record_tokens_by_id = {}
+        dataset_hints = [
+            str(record.metadata.get("source_dataset", "")).lower()
+            for record in self._records_by_id.values()
+            if str(record.metadata.get("source_dataset", "")).strip()
+        ]
+        if dataset_hints:
+            self._dataset_hint = max(set(dataset_hints), key=dataset_hints.count)
+        elif self._records_by_id:
+            self._dataset_hint = "gl_hnsw_demo"
+        else:
+            self._dataset_hint = ""
 
     def _hits_from_ranked(self, query: str, ranked: list[dict], top_k: int) -> SearchResponse:
         hits = [
@@ -86,13 +112,34 @@ class HybridRetrievalService:
             row["rank"] = rank
         return rows
 
+    def _response_to_rows(self, response: SearchResponse) -> list[dict]:
+        return [
+            {
+                "doc_id": hit.doc_id,
+                "title": hit.title,
+                "final_score": hit.final_score,
+                "geometric_score": hit.geometric_score,
+                "logical_score": hit.logical_score,
+                "source_kind": hit.source_kind,
+                "via_edge": hit.via_edge,
+                "summary": hit.summary,
+                "rank": hit.rank,
+            }
+            for hit in response.hits
+        ]
+
     def _supplemental_seed_rows(
         self,
         query: str,
         query_emb,
         briefs: dict[str, object],
         dense_rows: list[tuple[str, float, str]],
+        sparse_hits,
+        strategy,
     ) -> list[tuple[str, float]]:
+        if getattr(strategy, "sparse_gate", 1.0) <= 0.0 and not getattr(strategy, "allow_sparse_only", True):
+            return []
+        query_tokens = {token for token in tokenize(query) if len(token) > 2}
         brief_rows = list(briefs.values())
         if self._sparse_doc_count != len(brief_rows):
             self._sparse.build(brief_rows, self._records_by_id)
@@ -100,8 +147,15 @@ class HybridRetrievalService:
         dense_rank_map = {doc_id: rank for rank, (doc_id, _, _) in enumerate(dense_rows, start=1)}
         dense_score_map = {doc_id: score for doc_id, score, _ in dense_rows}
         dense_protected = {doc_id for doc_id, _, _ in dense_rows[: self.novelty_dense_top_k]}
-        sparse_hits = self._sparse.search(query, top_k=self.sparse_top_k)
         sparse_score_map = {hit.doc_id: hit.score for hit in sparse_hits}
+        dense_head = {doc_id for doc_id, _, _ in dense_rows[: self.sparse_agreement_top_k]}
+        sparse_head = {hit.doc_id for hit in sparse_hits[: self.sparse_agreement_top_k]}
+        agreement_ratio = len(dense_head & sparse_head) / max(1, len(sparse_head))
+        agreement_gate = min(
+            1.0,
+            self.sparse_agreement_floor + (1.0 - self.sparse_agreement_floor) * agreement_ratio,
+        )
+        agreement_gate *= max(0.0, getattr(strategy, "sparse_gate", 1.0))
         candidate_ids = [hit.doc_id for hit in sparse_hits if hit.score >= self.sparse_min_score]
         if not candidate_ids:
             return []
@@ -121,24 +175,37 @@ class HybridRetrievalService:
                 continue
             dense_rank = dense_rank_map.get(doc_id)
             dense_score = dense_score_map.get(doc_id, 0.0)
+            raw_tokens = self._record_tokens_by_id.get(doc_id, set())
+            raw_coverage = len(query_tokens & raw_tokens) / max(1, min(len(query_tokens), 6)) if query_tokens else 0.0
             rrf = (0.0 if dense_rank is None else 1.0 / (60.0 + dense_rank)) + 1.0 / (60.0 + sparse_rank)
             rrf_score = min(rrf / max_rrf, 1.0)
             novelty_bonus = 0.08 if doc_id not in dense_protected else 0.0
             if dense_rank is not None:
                 boost = (
-                    0.18 * max(0.0, sparse_score - 0.45)
-                    + 0.08 * query_alignment
-                    + 0.05 * rrf_score
+                    agreement_gate
+                    * (
+                        0.18 * max(0.0, sparse_score - 0.45)
+                        + 0.08 * max(query_alignment, raw_coverage)
+                        + 0.05 * rrf_score
+                    )
                     + novelty_bonus
                 )
                 blended = min(dense_score + boost, 0.99)
             else:
+                strong_structure = structure_alignment >= 0.2
+                strong_semantic = query_alignment >= 0.28 and score >= 0.35
+                strong_raw = raw_coverage >= self.sparse_only_min_raw_coverage and score >= 0.4
+                if (not getattr(strategy, "allow_sparse_only", True)) or (
+                    agreement_gate < self.sparse_only_min_agreement and not (strong_structure or strong_semantic or strong_raw)
+                ):
+                    continue
                 blended = (
                     0.52 * sparse_score
-                    + 0.28 * max(score, query_alignment)
+                    + 0.2 * max(score, query_alignment)
+                    + 0.12 * raw_coverage
                     + 0.12 * rrf_score
                     + novelty_bonus
-                ) * self.supplemental_seed_weight
+                ) * self.supplemental_seed_weight * max(agreement_gate, 0.55)
             scored.append((blended, doc_id))
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [(doc_id, min(score, 0.99)) for score, doc_id in scored[: self.supplemental_seed_top_k]]
@@ -147,18 +214,40 @@ class HybridRetrievalService:
         seed_neighbors = self.searcher.search(query_emb, top_k=self.initial_top_k)
         return [(neighbor.doc_id, neighbor.score, "geometric") for neighbor in seed_neighbors]
 
+    def _query_strategy(self, query: str, dense_rows: list[tuple[str, float, str]], sparse_hits, briefs: dict[str, object]):
+        graph_available = bool(self.graph_store.all_edges())
+        if self.query_strategy_agent is None:
+            return type(
+                "Strategy",
+                (),
+                {"sparse_gate": 1.0, "allow_sparse_only": True, "graph_gate": 1.0 if graph_available else 0.0, "rationale": "default"},
+            )()
+        return self.query_strategy_agent.run(
+            query=query,
+            dense_rows=dense_rows,
+            sparse_hits=sparse_hits,
+            briefs=briefs,
+            dataset_hint=self._dataset_hint,
+            graph_available=graph_available,
+        )
+
     def _seed_rows(self, query: str, query_emb, briefs: dict[str, object]) -> list[tuple[str, float, str]]:
         dense_rows = self._seed_rows_dense(query_emb)
+        if self._sparse_doc_count != len(briefs):
+            self._sparse.build(list(briefs.values()), self._records_by_id)
+            self._sparse_doc_count = len(briefs)
+        sparse_hits = self._sparse.search(query, top_k=self.sparse_top_k)
+        strategy = self._query_strategy(query, dense_rows, sparse_hits, briefs)
         merged: dict[str, tuple[float, str]] = {
             doc_id: (score, source_kind) for doc_id, score, source_kind in dense_rows
         }
-        for doc_id, score in self._supplemental_seed_rows(query, query_emb, briefs, dense_rows):
+        for doc_id, score in self._supplemental_seed_rows(query, query_emb, briefs, dense_rows, sparse_hits, strategy):
             current = merged.get(doc_id)
             if current is None or score > current[0]:
                 merged[doc_id] = (score, "supplemental")
         rows = [(doc_id, score, source_kind) for doc_id, (score, source_kind) in merged.items()]
         rows.sort(key=lambda item: (-item[1], item[0]))
-        return rows
+        return rows, strategy
 
     def search_baseline(self, query: str, top_k: int = 10) -> SearchResponse:
         query_emb = self.scorer.encode_query(query)
@@ -187,12 +276,24 @@ class HybridRetrievalService:
     def search(self, query: str, top_k: int = 10, use_memory_bias: bool = True) -> SearchResponse:
         query_emb = self.scorer.encode_query(query)
         briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
-        seed_rows = self._seed_rows(query, query_emb, briefs)
+        seed_rows, strategy = self._seed_rows(query, query_emb, briefs)
+        if getattr(strategy, "sparse_gate", 1.0) <= 0.0 and not getattr(strategy, "allow_sparse_only", True) and getattr(strategy, "graph_gate", 0.0) <= 0.0:
+            baseline = self.search_baseline(query, top_k=top_k)
+            if not use_memory_bias:
+                return baseline
+            rows = self._response_to_rows(baseline)
+            ranked = self._apply_memory_bias(query, rows)
+            return self._hits_from_ranked(query, ranked, top_k)
         seeds = {doc_id: (score, source_kind) for doc_id, score, source_kind in seed_rows}
         expanded: list[ExpandedCandidate] = []
 
-        for doc_id, seed_score, source_kind in seed_rows[: self.jump_policy.max_seeds]:
-            for edge in self.graph_store.get_out_edges(doc_id)[: self.jump_policy.max_expansions_per_seed]:
+        effective_max_seeds = max(1, math.ceil(self.jump_policy.max_seeds * max(0.0, getattr(strategy, "graph_gate", 0.0))))
+        effective_max_expansions = max(
+            0,
+            math.ceil(self.jump_policy.max_expansions_per_seed * max(0.0, getattr(strategy, "graph_gate", 0.0))),
+        )
+        for doc_id, seed_score, source_kind in seed_rows[:effective_max_seeds]:
+            for edge in self.graph_store.get_out_edges(doc_id)[:effective_max_expansions]:
                 brief = briefs.get(edge.dst_doc_id)
                 if brief is None:
                     continue

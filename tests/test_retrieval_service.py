@@ -190,3 +190,94 @@ def test_search_can_boost_dense_result_with_sparse_raw_text(tmp_path: Path):
 
     assert response.hits[0].doc_id == "doc-b"
     assert response.hits[0].source_kind == "supplemental"
+
+
+def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief(
+            "doc-a",
+            "Vector Index Notes",
+            "Notes about dense retrieval tuning.",
+            claims=["Dense retrieval tuning notes."],
+            metadata={"topic": "general"},
+        ),
+        _brief(
+            "doc-b",
+            "Candidate Ranking",
+            "Notes about final ranking.",
+            claims=["Final ranking notes."],
+            metadata={"topic": "general"},
+        ),
+        _brief(
+            "doc-c",
+            "Culture Debate",
+            "A generic cultural discussion.",
+            claims=["A generic cultural discussion."],
+            metadata={"topic": "general"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-a", score=0.66, rank=1),
+                Neighbor(doc_id="doc-b", score=0.62, rank=2),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Vector Index Notes", text="Dense retrieval tuning for vector indexes."),
+                DocRecord(doc_id="doc-b", title="Candidate Ranking", text="Final ranking notes for retrieval systems."),
+                DocRecord(doc_id="doc-c", title="Culture Debate", text="Culture debate about tradition."),
+            ]
+        ),
+    )
+
+    response = service.search("culture debate evidence preserving tradition society policy", top_k=3, use_memory_bias=False)
+    hit_ids = [hit.doc_id for hit in response.hits]
+
+    assert "doc-c" not in hit_ids
+
+
+def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief("doc-a", "Dense Winner", "Dense winner summary.", metadata={"topic": "general"}),
+        _brief("doc-b", "Sparse Distraction", "Sparse distraction summary.", metadata={"topic": "general"}),
+    ]
+
+    class AbstainStrategy:
+        def run(self, **kwargs):
+            return type(
+                "Strategy",
+                (),
+                {"sparse_gate": 0.0, "allow_sparse_only": False, "graph_gate": 0.0, "rationale": "abstain"},
+            )()
+
+    service = HybridRetrievalService(
+        searcher=FakeSearcher([Neighbor(doc_id="doc-a", score=0.72, rank=1)]),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Dense Winner", text="Dense winner summary."),
+                DocRecord(doc_id="doc-b", title="Sparse Distraction", text="sparse distraction keyword keyword keyword"),
+            ]
+        ),
+        query_strategy_agent=AbstainStrategy(),
+    )
+
+    baseline = service.search_baseline("keyword", top_k=2)
+    hybrid = service.search("keyword", top_k=2, use_memory_bias=False)
+
+    assert [hit.doc_id for hit in hybrid.hits] == [hit.doc_id for hit in baseline.hits]

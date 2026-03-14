@@ -107,6 +107,10 @@ class RetrievalConfig(BaseModel):
     sparse_seed_weight: float = 0.78
     sparse_min_score: float = 0.18
     novelty_dense_top_k: int = 12
+    sparse_agreement_top_k: int = 8
+    sparse_agreement_floor: float = 0.2
+    sparse_only_min_agreement: float = 0.35
+    sparse_only_min_raw_coverage: float = 0.45
     jump_policy: JumpPolicyConfig = Field(default_factory=JumpPolicyConfig)
     fusion: FusionConfig = Field(default_factory=FusionConfig)
     edge_quality: EdgeQualityConfig = Field(default_factory=EdgeQualityConfig)

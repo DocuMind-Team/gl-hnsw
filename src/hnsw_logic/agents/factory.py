@@ -7,6 +7,7 @@ from typing import Any
 from hnsw_logic.agents.subagents.corpus_scout import CorpusScoutAgent
 from hnsw_logic.agents.subagents.doc_profiler import DocProfilerAgent
 from hnsw_logic.agents.subagents.memory_curator import MemoryCuratorAgent
+from hnsw_logic.agents.subagents.query_strategy import QueryStrategyAgent
 from hnsw_logic.agents.subagents.relation_judge import RelationJudgeAgent
 from hnsw_logic.agents.tools.registry import build_agent_tools
 from hnsw_logic.config.schema import AgentsConfig, ProviderConfig, RetrievalConfig
@@ -59,6 +60,9 @@ class AgentFactory:
 
     def create_memory_curator(self):
         return MemoryCuratorAgent(self.provider)
+
+    def create_query_strategy(self):
+        return QueryStrategyAgent()
 
     def create_deepagent_specs(self) -> list[dict[str, Any]]:
         subagents: list[dict[str, Any]] = []
