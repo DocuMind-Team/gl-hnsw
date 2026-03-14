@@ -291,6 +291,33 @@ class HybridRetrievalService:
             row["rank"] = rank
         return rows
 
+    def _apply_graph_neighborhood_bonus(self, query: str, query_emb, ranked: list[dict], briefs: dict[str, object]) -> list[dict]:
+        if not ranked:
+            return ranked
+        ranked_ids = {row["doc_id"] for row in ranked}
+        for row in ranked:
+            if row["source_kind"] != "geometric" or row["logical_score"] > 0.0:
+                continue
+            best_bonus = 0.0
+            for edge in self.graph_store.get_out_edges(row["doc_id"])[: self.jump_policy.max_expansions_per_seed]:
+                target_brief = briefs.get(edge.dst_doc_id)
+                if target_brief is None:
+                    continue
+                target_rel = self.scorer.score_target(query, query_emb, target_brief)
+                if target_rel < 0.35:
+                    continue
+                relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
+                bonus = 0.16 * edge.confidence * target_rel * relation_multiplier
+                if edge.dst_doc_id in ranked_ids:
+                    bonus *= 1.15
+                best_bonus = max(best_bonus, bonus)
+            if best_bonus > 0.0:
+                row["final_score"] += best_bonus
+        ranked.sort(key=lambda item: (-item["final_score"], item["doc_id"]))
+        for rank, row in enumerate(ranked, start=1):
+            row["rank"] = rank
+        return ranked
+
     def _query_strategy(self, query: str, dense_rows: list[tuple[str, float, str]], sparse_hits, briefs: dict[str, object]):
         graph_available = bool(self.graph_store.all_edges())
         if self.query_strategy_agent is None:
@@ -411,6 +438,7 @@ class HybridRetrievalService:
                         )
                     )
         ranked = self.scorer.rank(query, query_emb, seeds, expanded, briefs, top_k)
+        ranked = self._apply_graph_neighborhood_bonus(query, query_emb, ranked, briefs)
         ranked = self._retain_dense_top_hits(ranked, briefs, dense_rows, top_k)
         if use_memory_bias:
             ranked = self._apply_memory_bias(query, ranked)

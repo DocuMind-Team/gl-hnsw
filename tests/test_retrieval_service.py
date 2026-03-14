@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from hnsw_logic.config.schema import ProviderConfig, RetrievalConfig
-from hnsw_logic.core.models import DocBrief, DocRecord
+from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.embedding.provider import StubProvider
 from hnsw_logic.graph.store import GraphStore
 from hnsw_logic.hnsw.searcher import Neighbor
@@ -292,6 +292,85 @@ def test_search_retains_dense_top_hits_against_sparse_overwrite(tmp_path: Path):
 
     assert "doc-04" in hit_ids
     assert hit_ids.index("doc-04") < hit_ids.index("doc-24")
+
+
+def test_search_applies_graph_neighborhood_bonus_to_relevant_seed(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    graph_store = GraphStore(tmp_path / "accepted_edges.jsonl")
+    graph_store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="doc-07",
+                dst_doc_id="doc-10",
+                relation_type="implementation_detail",
+                confidence=0.9,
+                evidence_spans=[],
+                discovery_path=["test"],
+                edge_card_text="[REL=implementation_detail] Hybrid Retrieval -> Candidate Fusion",
+                created_at="2026-03-10T00:00:00Z",
+                last_validated_at="2026-03-10T00:00:00Z",
+            )
+        ]
+    )
+    graph_store.reload()
+    briefs = [
+        _brief(
+            "doc-07",
+            "Hybrid Retrieval",
+            "Hybrid retrieval merges geometric seeds with logical overlay candidates.",
+            claims=["Hybrid retrieval uses a logical overlay sidecar."],
+            keywords=["hybrid", "retrieval", "logical", "overlay"],
+            relation_hints=["overlay", "sidecar"],
+            metadata={"topic": "retrieval"},
+        ),
+        _brief(
+            "doc-10",
+            "Candidate Fusion",
+            "Candidate fusion combines HNSW score and logic score.",
+            claims=["Candidate fusion computes weighted ranking from logic paths."],
+            keywords=["candidate", "fusion", "logic", "score"],
+            relation_hints=["weighted", "logic"],
+            metadata={"topic": "logic"},
+        ),
+        _brief(
+            "doc-24",
+            "Benchmark Reporting",
+            "Benchmark reporting summarizes latency and recall.",
+            claims=["Benchmark reports compare HNSW and hybrid retrieval."],
+            keywords=["benchmark", "latency", "recall", "hybrid"],
+            relation_hints=["report"],
+            metadata={"topic": "evaluation"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-24", score=0.74, rank=1),
+                Neighbor(doc_id="doc-07", score=0.70, rank=2),
+                Neighbor(doc_id="doc-10", score=0.69, rank=3),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=graph_store,
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-07", title="Hybrid Retrieval", text="Hybrid retrieval merges geometric seeds with logical overlay candidates."),
+                DocRecord(doc_id="doc-10", title="Candidate Fusion", text="Candidate fusion combines HNSW score and logic score."),
+                DocRecord(doc_id="doc-24", title="Benchmark Reporting", text="Benchmark reporting summarizes latency and recall."),
+            ]
+        ),
+    )
+
+    response = service.search("What is the role of the logic overlay graph?", top_k=3, use_memory_bias=False)
+    hit_ids = [hit.doc_id for hit in response.hits]
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert hit_ids.index("doc-07") < hit_ids.index("doc-10")
+    assert by_id["doc-07"].final_score > 0.70
 
 
 def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):

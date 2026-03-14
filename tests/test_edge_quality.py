@@ -473,6 +473,95 @@ def test_workflow_and_revalidation_fallbacks_are_accepted():
     assert judge_assessment.relation_type == "supporting_evidence"
 
 
+def test_reverse_role_to_listing_support_is_rejected():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-15",
+        "Document Profiler",
+        "The profiler creates a DocBrief for later discovery steps.",
+        ["document", "profiler", "docbrief", "discovery", "steps"],
+        ["profiler"],
+        ["creates"],
+    )
+    candidate = _brief(
+        "doc-12",
+        "Subagents",
+        "Subagents include the profiler, scout, judge, and curator roles.",
+        ["subagents", "profiler", "scout", "judge", "curator", "roles"],
+        ["subagents"],
+        ["include", "roles"],
+    )
+    verdicts = {
+        "doc-12": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.86,
+            evidence_spans=[
+                "The profiler creates a DocBrief for later discovery steps.",
+                "Subagents include the profiler, scout, judge, and curator roles.",
+            ],
+            rationale="The listing mentions the profiler role described by the anchor.",
+            support_score=0.78,
+            contradiction_flags=[],
+            decision_reason="Shared agent workflow context appears supportive.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason == "wrong_direction"
+
+
+def test_ops_overview_accepts_registry_implementation_detail():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-20",
+        "Jobs and Workers",
+        "Background jobs use a lightweight worker pool and a SQLite registry.",
+        ["jobs", "workers", "background", "sqlite", "registry", "queue"],
+        ["jobs"],
+        ["background jobs", "sqlite registry"],
+    )
+    candidate = _brief(
+        "doc-22",
+        "SQLite Job Registry",
+        "The registry stores job id, state, payload, timestamps, and recent messages.",
+        ["sqlite", "job", "registry", "state", "payload", "timestamps"],
+        ["sqlite"],
+        ["state", "payload"],
+    )
+    verdicts = {
+        "doc-22": JudgeResult(
+            accepted=False,
+            relation_type="comparison",
+            confidence=0.52,
+            evidence_spans=[],
+            rationale="Shared operational context only.",
+            support_score=0.3,
+            contradiction_flags=[],
+            decision_reason="Model abstained on direct implementation detail.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
+
+
 def test_should_attempt_discovery_prefers_structural_topics():
     provider = FakeProvider()
     orchestrator = LogicOrchestrator(

@@ -784,11 +784,21 @@ class LogicOrchestrator:
                     or metrics["mention_score"] >= 0.18
                 )
             )
+            stage_detail_bridge = (
+                self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+                and metrics["service_surface_score"] < 0.55
+                and (
+                    metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.14
+                    or metrics["mention_score"] >= 0.16
+                )
+            )
             return (
                 metrics["mention_score"] >= 0.3
                 or metrics["role_listing_score"] >= 0.55
                 or (metrics["overlap_score"] >= 0.6 and metrics["dense_score"] >= 0.55)
                 or semantic_detail_bridge
+                or stage_detail_bridge
             )
         if relation_type == "supporting_evidence":
             stage_supported = (
@@ -1042,6 +1052,25 @@ class LogicOrchestrator:
                 support_score=min(0.9, metrics["local_support"] + 0.1),
             )
         if (
+            self._doc_stage(anchor) in {"ops_overview", "ops_service"}
+            and self._doc_stage(candidate) == "ops_registry"
+            and metrics["service_surface_score"] < 0.55
+            and fit_scores["implementation_detail"] >= 0.58
+            and (
+                metrics["topic_alignment"] >= 1.0
+                or metrics["content_overlap_score"] >= 0.16
+                or metrics["mention_score"] >= 0.18
+            )
+        ):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "implementation_detail",
+                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
+                reason="The registry is the concrete persistence mechanism used by the jobs or service overview.",
+                support_score=min(0.9, metrics["local_support"] + 0.1),
+            )
+        if (
             metrics["service_surface_score"] < 0.35
             and fit_scores["supporting_evidence"] >= 0.45
             and direct_title_link
@@ -1163,6 +1192,14 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "implementation_detail" and fit_scores["implementation_detail"] + 0.04 < max(fit_scores["supporting_evidence"], fit_scores["prerequisite"]):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if (
+            final_result.relation_type == "supporting_evidence"
+            and self._doc_stage(anchor) == "agent_roles"
+            and self._doc_stage(candidate) == "agent_roles"
+            and set(tokenize(anchor.title)) & SPECIFIC_ROLE_TERMS
+            and self._has_listing_context(candidate) >= 1.0
+        ):
+            return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "supporting_evidence" and fit_scores["supporting_evidence"] < 0.25:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "prerequisite" and fit_scores["prerequisite"] < 0.38:
@@ -1175,7 +1212,12 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "implementation_detail":
             direction_score = self._implementation_direction_score(anchor, candidate, metrics)
-            if direction_score < 0.08:
+            stage_driven_detail = (
+                self._doc_stage(anchor) in {"ops_overview", "ops_service"}
+                and self._doc_stage(candidate) == "ops_registry"
+                and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+            )
+            if direction_score < 0.08 and not stage_driven_detail:
                 return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
             if self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) < -0.08:
                 return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
