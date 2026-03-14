@@ -202,22 +202,7 @@ class HybridRetrievalService:
             rrf_score = min(rrf / max_rrf, 1.0)
             novelty_bonus = 0.08 * novelty_bias if doc_id not in dense_protected else 0.0
             if dense_rank is not None:
-                boost = (
-                    agreement_gate
-                    * sparse_boost
-                    * (
-                        0.18 * max(0.0, sparse_score - 0.45)
-                        + 0.08 * max(query_alignment, raw_coverage)
-                        + 0.05 * rrf_score
-                    )
-                    + novelty_bonus
-                )
-                capped_boost = min(
-                    boost,
-                    0.03,
-                    0.1 * max(dense_score, 0.08) + 0.02 * max(query_alignment, raw_coverage, structure_alignment),
-                )
-                blended = min(dense_score + capped_boost, 0.99)
+                blended = dense_score
             else:
                 strong_structure = structure_alignment >= 0.2
                 strong_semantic = query_alignment >= 0.28 and score >= 0.35
@@ -298,6 +283,12 @@ class HybridRetrievalService:
         for row in ranked:
             if row["source_kind"] != "geometric" or row["logical_score"] > 0.0:
                 continue
+            source_brief = briefs.get(row["doc_id"])
+            if source_brief is None:
+                continue
+            source_alignment = self.scorer.query_alignment(query, source_brief)
+            if source_alignment < 0.24:
+                continue
             best_bonus = 0.0
             for edge in self.graph_store.get_out_edges(row["doc_id"])[: self.jump_policy.max_expansions_per_seed]:
                 target_brief = briefs.get(edge.dst_doc_id)
@@ -307,7 +298,7 @@ class HybridRetrievalService:
                 if target_rel < 0.35:
                     continue
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
-                bonus = 0.16 * edge.confidence * target_rel * relation_multiplier
+                bonus = 0.16 * edge.confidence * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
                 if edge.dst_doc_id in ranked_ids:
                     bonus *= 1.15
                 best_bonus = max(best_bonus, bonus)
@@ -365,7 +356,6 @@ class HybridRetrievalService:
                 continue
             current_score, current_source = current
             if current_source == "geometric":
-                merged[doc_id] = (max(current_score, min(score, current_score + max(0.005, 0.1 * current_score))), "geometric")
                 continue
             if score > current_score:
                 merged[doc_id] = (score, "supplemental")

@@ -153,7 +153,7 @@ def test_search_uses_claim_view_for_profiler_query(tmp_path: Path):
     assert by_id["doc-15"].final_score > 0.35
 
 
-def test_search_can_boost_dense_result_with_sparse_raw_text(tmp_path: Path):
+def test_search_keeps_dense_result_score_when_sparse_raw_text_agrees(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
     briefs = [
@@ -195,7 +195,7 @@ def test_search_can_boost_dense_result_with_sparse_raw_text(tmp_path: Path):
 
     assert "doc-b" in by_id
     assert by_id["doc-b"].source_kind == "geometric"
-    assert by_id["doc-b"].final_score > 0.61
+    assert by_id["doc-b"].final_score == 0.61
 
 
 def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_path: Path):
@@ -365,7 +365,11 @@ def test_search_applies_graph_neighborhood_bonus_to_relevant_seed(tmp_path: Path
         ),
     )
 
-    response = service.search("What is the role of the logic overlay graph?", top_k=3, use_memory_bias=False)
+    response = service.search(
+        "How does hybrid retrieval use candidate fusion and logic scores?",
+        top_k=3,
+        use_memory_bias=False,
+    )
     hit_ids = [hit.doc_id for hit in response.hits]
     by_id = {hit.doc_id: hit for hit in response.hits}
 
