@@ -153,6 +153,10 @@ def build_stub_briefs(app) -> None:
         app.brief_store.write(provider.profile_doc(doc))
 
 
+def _should_build_offline_graph(dataset: str) -> bool:
+    return dataset.lower() in {"scifact", "nfcorpus"}
+
+
 def _metric_bundle(name: str, rows: list[dict], qrels: dict[str, dict[str, int]]) -> EvaluationMetrics:
     recalls = []
     mrrs = []
@@ -226,7 +230,12 @@ def evaluate_beir_dataset(
     app = build_app(work_root)
     app.pipeline.build_embeddings()
     app.pipeline.build_hnsw()
-    build_stub_briefs(app)
+    if app.settings.app.provider.kind == "openai_compatible":
+        app.pipeline.profile_docs()
+        if _should_build_offline_graph(dataset):
+            app.pipeline.discover_edges()
+    else:
+        build_stub_briefs(app)
 
     baseline_rows = []
     supplemental_rows = []

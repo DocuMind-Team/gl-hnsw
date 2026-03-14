@@ -391,6 +391,39 @@ def test_should_attempt_discovery_prefers_structural_topics():
     assert orchestrator.should_attempt_discovery(logic_brief) is True
 
 
+def test_should_attempt_discovery_uses_external_dataset_style_gate():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=SimpleNamespace(provider=provider),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    scifact_brief = _brief(
+        "paper-1",
+        "Interleukin-2 signaling and regulatory T cell function",
+        "The paper claims reduced IL-2 signaling impairs regulatory T cell function and increases autoimmunity risk.",
+        ["interleukin", "signaling", "regulatory", "cells", "autoimmunity"],
+        relation_hints=["claim", "evidence", "disease"],
+    )
+    scifact_brief.entities = ["IL-2", "T cells"]
+    scifact_brief.claims = ["Reduced IL-2 signaling impairs regulatory T cell function."]
+    scifact_brief.metadata["source_dataset"] = "scifact"
+
+    arguana_brief = _brief(
+        "arg-1",
+        "Culture and public policy",
+        "A position essay about cultural values and public policy.",
+        ["culture", "policy", "argument"],
+        relation_hints=["debate"],
+    )
+    arguana_brief.metadata["source_dataset"] = "arguana"
+
+    assert orchestrator.should_attempt_discovery(scifact_brief) is True
+    assert orchestrator.should_attempt_discovery(arguana_brief) is False
+
+
 def test_stage_reranker_prefers_graph_to_policy_over_fusion():
     provider = FakeProvider()
     orchestrator = LogicOrchestrator(

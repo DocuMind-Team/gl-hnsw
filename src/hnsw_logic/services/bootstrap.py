@@ -98,7 +98,6 @@ def build_app(root_dir=None) -> AppContainer:
         jump_policy=JumpPolicy(settings.retrieval),
         semantic_memory_store=semantic_memory_store,
         corpus_store=corpus_store,
-        query_strategy_agent=agent_factory.create_query_strategy(),
     )
     pipeline = BuildPipeline(
         corpus_store=corpus_store,

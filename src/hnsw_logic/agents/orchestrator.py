@@ -736,8 +736,13 @@ class LogicOrchestrator:
 
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
         topic = str(anchor.metadata.get("topic", "")).lower()
+        source_dataset = str(anchor.metadata.get("source_dataset", "")).lower()
         anchor_terms = self._content_terms(anchor)
         title_tokens = set(tokenize(anchor.title))
+        if source_dataset in {"arguana"}:
+            return False
+        if source_dataset in {"scifact", "nfcorpus"}:
+            return len(anchor.claims) >= 1 and (len(anchor.keywords) >= 3 or len(anchor.entities) >= 2 or len(anchor_terms) >= 8)
         if topic in {"hnsw", "evaluation"}:
             return False
         if "similarity" in title_tokens:

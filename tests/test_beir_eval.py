@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from hnsw_logic.core.models import DocRecord
-from hnsw_logic.services.beir_eval import load_beir_dataset, prepare_beir_work_root
+from hnsw_logic.services.beir_eval import _should_build_offline_graph, load_beir_dataset, prepare_beir_work_root
 from hnsw_logic.core.utils import read_jsonl
 
 
@@ -89,3 +89,9 @@ def test_load_beir_dataset_keeps_all_positive_docs_when_sampling(tmp_path: Path)
     kept_ids = {doc.doc_id for doc in dataset.corpus}
     assert {"d1", "d2"} <= kept_ids
     assert len(kept_ids) == 3
+
+
+def test_should_build_offline_graph_only_for_structured_beir_sets():
+    assert _should_build_offline_graph("scifact") is True
+    assert _should_build_offline_graph("nfcorpus") is True
+    assert _should_build_offline_graph("arguana") is False
