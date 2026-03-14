@@ -34,8 +34,12 @@ class FakeBriefStore:
 class FakeCorpusStore:
     def __init__(self, docs: list[DocRecord]):
         self._docs = docs
+        self._fail_first = False
 
     def read_processed(self) -> list[DocRecord]:
+        if self._fail_first:
+            self._fail_first = False
+            raise FileNotFoundError
         return list(self._docs)
 
 
@@ -281,3 +285,37 @@ def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
     hybrid = service.search("keyword", top_k=2, use_memory_bias=False)
 
     assert [hit.doc_id for hit in hybrid.hits] == [hit.doc_id for hit in baseline.hits]
+
+
+def test_search_refreshes_corpus_cache_after_initial_missing_processed_docs(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief("doc-a", "Dense Winner", "Dense winner summary.", metadata={"topic": "general"}),
+        _brief("doc-b", "Sparse Match", "Sparse match summary.", metadata={"topic": "general"}),
+    ]
+    corpus = FakeCorpusStore(
+        [
+            DocRecord(doc_id="doc-a", title="Dense Winner", text="Dense winner summary.", metadata={"source_dataset": "scifact"}),
+            DocRecord(doc_id="doc-b", title="Sparse Match", text="Protein evidence supports the study claim.", metadata={"source_dataset": "scifact"}),
+        ]
+    )
+    corpus._fail_first = True
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-a", score=0.66, rank=1),
+                Neighbor(doc_id="doc-b", score=0.61, rank=2),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=corpus,
+    )
+
+    service.search("Which protein evidence supports the study claim?", top_k=2, use_memory_bias=False)
+
+    assert service._dataset_hint == "scifact"

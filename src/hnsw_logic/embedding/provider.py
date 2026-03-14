@@ -66,6 +66,7 @@ class ProviderBase:
             "scout": True,
             "judge": True,
             "curator": True,
+            "query_strategy": True,
         }
         self.relation_priors = {
             "supporting_evidence": 1.02,
@@ -75,6 +76,7 @@ class ProviderBase:
             "prerequisite": 0.98,
         }
         self.judge_few_shot_text = self._build_generic_judge_examples()
+        self.query_strategy_few_shot_text = self._build_query_strategy_examples()
 
     @property
     def embedding_dim(self) -> int:
@@ -85,6 +87,7 @@ class ProviderBase:
             "scout": live_reasoning_config.enable_scout_thinking,
             "judge": live_reasoning_config.enable_judge_thinking,
             "curator": live_reasoning_config.enable_curator_thinking,
+            "query_strategy": live_reasoning_config.enable_query_strategy_thinking,
         }
 
     def embed_texts(self, texts: Iterable[str]) -> np.ndarray:
@@ -110,6 +113,9 @@ class ProviderBase:
 
     def judge_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals]]) -> dict[str, JudgeResult]:
         return {candidate.doc_id: self.judge_relation_with_signals(anchor, candidate, signals) for candidate, signals in candidates}
+
+    def plan_query_strategy(self, payload: dict) -> dict:
+        return {}
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
         raise NotImplementedError
@@ -169,6 +175,65 @@ class ProviderBase:
                 "candidate_text": "The service exposes endpoints that can submit jobs to the registry.",
                 "expected_relation_type": "none",
                 "why": "A service using the same registry is not by itself durable supporting evidence for the worker design.",
+            },
+        ]
+        return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
+
+    def _build_query_strategy_examples(self) -> str:
+        examples = [
+            {
+                "query": "culture debate about tradition and public policy",
+                "signals": {
+                    "dataset_hint": "arguana",
+                    "agreement_ratio": 0.0,
+                    "query_specificity": 0.16,
+                    "graph_available": False,
+                },
+                "expected": {
+                    "mode": "dense_only",
+                    "sparse_gate": 0.0,
+                    "allow_sparse_only": False,
+                    "graph_gate": 0.0,
+                    "sparse_boost": 0.0,
+                    "novelty_bias": 0.0,
+                    "reason": "Argumentative query with disagreement between dense and sparse signals.",
+                },
+            },
+            {
+                "query": "Which evidence supports the study claim about disease?",
+                "signals": {
+                    "dataset_hint": "scifact",
+                    "agreement_ratio": 0.5,
+                    "query_specificity": 0.48,
+                    "graph_available": False,
+                },
+                "expected": {
+                    "mode": "dense_plus_sparse",
+                    "sparse_gate": 0.9,
+                    "allow_sparse_only": True,
+                    "graph_gate": 0.0,
+                    "sparse_boost": 1.1,
+                    "novelty_bias": 0.95,
+                    "reason": "Scientific claim query with exact terminology support.",
+                },
+            },
+            {
+                "query": "How does jump policy affect hybrid retrieval scoring?",
+                "signals": {
+                    "dataset_hint": "gl_hnsw_demo",
+                    "agreement_ratio": 0.5,
+                    "query_specificity": 0.34,
+                    "graph_available": True,
+                },
+                "expected": {
+                    "mode": "dense_sparse_graph",
+                    "sparse_gate": 0.95,
+                    "allow_sparse_only": True,
+                    "graph_gate": 0.95,
+                    "sparse_boost": 1.0,
+                    "novelty_bias": 1.0,
+                    "reason": "Technical query over a structured corpus with durable graph edges.",
+                },
             },
         ]
         return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
@@ -282,6 +347,8 @@ class OpenAICompatibleProvider(StubProvider):
             api_key=api_key,
             model=config.chat_model,
             temperature=0,
+            timeout=30,
+            max_retries=1,
         )
         self._embeddings = None
         self._local_embedding_model = None
@@ -386,6 +453,17 @@ class OpenAICompatibleProvider(StubProvider):
             "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
         )
 
+    def _query_strategy_instruction(self) -> str:
+        return (
+            "You are a query strategy agent for retrieval. Return JSON only. "
+            "You receive local retrieval signals and must decide whether to use dense only, dense plus sparse, "
+            "or dense plus sparse plus graph expansion. Prefer stable recall gains over aggressive lexical drift. "
+            "When signals look argumentative, opinion-oriented, or dense and sparse strongly disagree, choose dense_only. "
+            "When terminology is exact and supported by both query and candidate evidence, choose dense_plus_sparse. "
+            "Only enable graph expansion for structured technical corpora with durable graph edges. "
+            "You are not ranking documents directly; you are selecting a safe retrieval strategy."
+        )
+
     def _verdict_from_payload(self, payload: dict) -> JudgeResult:
         canonical_relation = str(payload.get("canonical_relation", payload.get("relation_type", "comparison")))
         accepted = bool(payload.get("accepted", False))
@@ -408,6 +486,40 @@ class OpenAICompatibleProvider(StubProvider):
             utility_score=float(payload.get("utility_score", 0.0)),
             uncertainty=float(payload.get("uncertainty", max(0.0, 1.0 - float(payload.get("confidence", 0.0))))),
         )
+
+    def plan_query_strategy(self, payload: dict) -> dict:
+        try:
+            return self._invoke_json(
+                self._query_strategy_instruction(),
+                "\n".join(
+                    part
+                    for part in [
+                        json.dumps(
+                            {
+                                "task": "Choose a retrieval strategy from local signals.",
+                                "payload": payload,
+                                "output_schema": {
+                                    "mode": "string",
+                                    "sparse_gate": "float",
+                                    "allow_sparse_only": "boolean",
+                                    "graph_gate": "float",
+                                    "sparse_boost": "float",
+                                    "novelty_bias": "float",
+                                    "reason": "string",
+                                    "uncertainty": "float",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "Few-shot examples:" if self.query_strategy_few_shot_text else "",
+                        self.query_strategy_few_shot_text,
+                    ]
+                    if part
+                ),
+                thinking=self.live_reasoning["query_strategy"],
+            )
+        except Exception:
+            return {}
 
     def _embed_local_bge_m3(self, texts: list[str]) -> np.ndarray:
         import torch

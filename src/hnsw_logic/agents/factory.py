@@ -62,7 +62,10 @@ class AgentFactory:
         return MemoryCuratorAgent(self.provider)
 
     def create_query_strategy(self):
-        return QueryStrategyAgent()
+        return QueryStrategyAgent(
+            provider=self.provider,
+            trace_path=self.workspace_root / "query_strategy_traces.jsonl",
+        )
 
     def create_deepagent_specs(self) -> list[dict[str, Any]]:
         subagents: list[dict[str, Any]] = []

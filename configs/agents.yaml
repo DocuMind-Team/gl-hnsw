@@ -4,6 +4,7 @@ live_reasoning:
   enable_scout_thinking: true
   enable_judge_thinking: true
   enable_curator_thinking: true
+  enable_query_strategy_thinking: true
 subagents:
   doc_profiler:
     enabled: true
