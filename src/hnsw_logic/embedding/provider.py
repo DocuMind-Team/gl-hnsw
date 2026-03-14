@@ -356,8 +356,8 @@ class OpenAICompatibleProvider(StubProvider):
             api_key=api_key,
             model=config.chat_model,
             temperature=0,
-            timeout=30,
-            max_retries=1,
+            timeout=60,
+            max_retries=2,
         )
         self._embeddings = None
         self._local_embedding_model = None
@@ -488,6 +488,9 @@ class OpenAICompatibleProvider(StubProvider):
             ranked.append((score, brief))
         ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
         return [brief for _, brief in ranked[:limit]]
+
+    def _prefer_local_scout(self, anchor: DocBrief) -> bool:
+        return str(anchor.metadata.get("source_dataset", "")).lower() in {"arguana", "scifact", "nfcorpus"}
 
     def _judge_instruction(self) -> str:
         return (
@@ -794,6 +797,17 @@ class OpenAICompatibleProvider(StubProvider):
         return [results[doc.doc_id] for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
+        if self._prefer_local_scout(anchor):
+            shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=6)
+            return [
+                CandidateProposal(
+                    doc_id=brief.doc_id,
+                    reason="local semantic shortlist for offline discovery",
+                    query=" ".join((brief.keywords + brief.relation_hints + [brief.title])[:4]),
+                    score_hint=0.72,
+                )
+                for brief in shortlist
+            ]
         try:
             shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=8)
             candidate_rows = [
