@@ -490,7 +490,7 @@ class OpenAICompatibleProvider(StubProvider):
         return [brief for _, brief in ranked[:limit]]
 
     def _prefer_local_scout(self, anchor: DocBrief) -> bool:
-        return str(anchor.metadata.get("source_dataset", "")).lower() in {"arguana", "scifact", "nfcorpus"}
+        return True
 
     def _judge_instruction(self) -> str:
         return (
