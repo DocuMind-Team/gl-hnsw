@@ -76,7 +76,7 @@ class RetrievalScorer:
             sum(1 for token in query_tokens if any(char.isdigit() for char in token)) / len(query_tokens),
             1.0,
         )
-        return min(1.0, 0.55 * short_query + 0.35 * content_rich + 0.1 * alpha_numeric)
+        return min(1.0, 0.75 * short_query + 0.2 * content_rich + 0.05 * alpha_numeric)
 
     def encode_query(self, query: str) -> np.ndarray:
         return self.provider.embed_texts([query])[0]
@@ -134,6 +134,16 @@ class RetrievalScorer:
             + 0.38 * min(claim_overlap / max(1, min(len(query_tokens), 3)), 1.0)
         )
         return min(score, 1.0)
+
+    def title_alignment(self, query: str, brief: DocBrief) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        title_tokens = {token for token in tokenize(brief.title) if len(token) > 2}
+        overlap = query_tokens & title_tokens
+        if not overlap:
+            return 0.0
+        return min(len(overlap) / max(1, min(len(query_tokens), 2)), 1.0)
 
     def seed_score(self, query: str, query_emb: np.ndarray, brief: DocBrief) -> float:
         title_emb = self._view_embedding(brief, "title")

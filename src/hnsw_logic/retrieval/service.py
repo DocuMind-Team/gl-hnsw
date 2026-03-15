@@ -201,6 +201,7 @@ class HybridRetrievalService:
             query_alignment = self.scorer.query_alignment(query, brief)
             structure_alignment = self.scorer.structure_alignment(query, brief)
             title_claim_alignment = self.scorer.title_claim_alignment(query, brief)
+            title_alignment = self.scorer.title_alignment(query, brief)
             if query_alignment <= 0.0 and structure_alignment <= 0.0 and sparse_score < 0.55 and score < 0.7:
                 continue
             dense_rank = dense_rank_map.get(doc_id)
@@ -268,6 +269,11 @@ class HybridRetrievalService:
                     + semantic_hint_bonus
                 ) * self.supplemental_seed_weight * max(agreement_gate, 0.55) * sparse_boost
                 novelty_strength = max(raw_coverage, query_alignment, structure_alignment)
+                if query_specificity >= 0.7:
+                    precision_factor = max(title_alignment, 0.35 * query_alignment)
+                    blended *= 0.2 + 0.8 * precision_factor
+                    guard_cap = dense_guard_score + 0.01 + 0.05 * max(title_alignment, raw_coverage)
+                    blended = min(blended, guard_cap)
                 if dense_guard_score > 0.0 and novelty_strength < 0.78:
                     guard_cap = dense_guard_score - 0.02 + 0.09 * novelty_strength + 0.03 * rrf_score
                     blended = min(blended, guard_cap)
