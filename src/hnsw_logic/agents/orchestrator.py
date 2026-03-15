@@ -1525,62 +1525,108 @@ class LogicOrchestrator:
             "evidence_ratio": evidence_ratio,
         }
 
-    def _dense_anchor_centrality(self, briefs: list[DocBrief]) -> dict[str, float]:
+    def _dense_anchor_neighborhoods(self, briefs: list[DocBrief], *, top_k: int = 6, min_similarity: float = 0.52) -> tuple[dict[str, float], dict[str, list[tuple[str, float]]]]:
         vectors = {brief.doc_id: self._embed_brief(brief) for brief in briefs}
         scores: dict[str, float] = {}
+        neighborhoods: dict[str, list[tuple[str, float]]] = {}
         for brief in briefs:
             vector = vectors.get(brief.doc_id)
             if vector is None:
                 scores[brief.doc_id] = 0.0
+                neighborhoods[brief.doc_id] = [(brief.doc_id, 1.0)]
                 continue
-            sims = [
-                max(cosine(vector, other_vec), 0.0)
-                for other in briefs
-                if other.doc_id != brief.doc_id
-                for other_vec in [vectors.get(other.doc_id)]
-                if other_vec is not None
-            ]
-            sims.sort(reverse=True)
+            sims: list[tuple[float, str]] = []
+            for other in briefs:
+                if other.doc_id == brief.doc_id:
+                    continue
+                other_vec = vectors.get(other.doc_id)
+                if other_vec is None:
+                    continue
+                sims.append((max(cosine(vector, other_vec), 0.0), other.doc_id))
+            sims.sort(key=lambda item: (-item[0], item[1]))
             if not sims:
                 scores[brief.doc_id] = 0.0
+                neighborhoods[brief.doc_id] = [(brief.doc_id, 1.0)]
                 continue
             top = sims[: min(5, len(sims))]
-            scores[brief.doc_id] = sum(top) / len(top)
-        return scores
+            scores[brief.doc_id] = sum(score for score, _ in top) / len(top)
+            neighbors = [(brief.doc_id, 1.0)]
+            for score, doc_id in sims[:top_k]:
+                if score < min_similarity:
+                    continue
+                neighbors.append((doc_id, score))
+            neighborhoods[brief.doc_id] = neighbors
+        return scores, neighborhoods
 
-    def select_discovery_anchors(self, briefs: list[DocBrief]) -> set[str]:
+    def rank_discovery_anchors(self, briefs: list[DocBrief]) -> list[str]:
         if not briefs:
-            return set()
+            return []
         grouped: dict[str, list[DocBrief]] = {}
         for brief in briefs:
             grouped.setdefault(self._source_dataset(brief), []).append(brief)
-        selected: set[str] = set()
+        ordered: list[str] = []
         for _, group in grouped.items():
             profile = self._corpus_graph_profile(group)
             if profile["graph_potential"] < 0.16:
-                selected.update(brief.doc_id for brief in group[: min(len(group), 6)])
+                ordered.extend(brief.doc_id for brief in group[: min(len(group), 6)])
                 continue
-            centrality = self._dense_anchor_centrality(group)
+            centrality, neighborhoods = self._dense_anchor_neighborhoods(group)
             cap_base = max(6, min(len(group), len(group) // 8 + 4))
             cap = max(6, min(len(group), int(round(cap_base * (0.9 + 0.42 * profile["graph_potential"])))))
             floor = max(0.34, min(0.54, 0.54 - 0.16 * profile["graph_potential"] + 0.04 * profile["argument_ratio"]))
-            ranked = sorted(
-                ((0.72 * self.discovery_anchor_priority(brief) + 0.28 * centrality.get(brief.doc_id, 0.0), brief) for brief in group),
-                key=lambda item: (-item[0], item[1].doc_id),
-            )
-            diverse = self._select_diverse_dataset_anchors(ranked, cap=cap, floor=floor)
-            hub_core = self._select_dataset_hub_anchors(group, cap=max(2, cap // 4))
-            kept = []
-            for doc_id in hub_core + diverse:
-                if doc_id in kept:
-                    continue
-                kept.append(doc_id)
-                if len(kept) >= cap:
+            priority_map = {
+                brief.doc_id: 0.72 * self.discovery_anchor_priority(brief) + 0.28 * centrality.get(brief.doc_id, 0.0)
+                for brief in group
+            }
+            eligible = [brief for brief in group if priority_map.get(brief.doc_id, 0.0) >= floor]
+            if not eligible:
+                eligible = list(group)
+            coverage: dict[str, float] = {}
+            kept: list[str] = []
+            selected_clusters: set[str] = set()
+            while eligible and len(kept) < cap:
+                best_id = ""
+                best_score = float("-inf")
+                best_index = 0
+                for index, brief in enumerate(eligible):
+                    base_score = priority_map.get(brief.doc_id, 0.0)
+                    coverage_gain = 0.0
+                    for neighbor_id, weight in neighborhoods.get(brief.doc_id, [(brief.doc_id, 1.0)]):
+                        coverage_gain += max(0.0, weight - coverage.get(neighbor_id, 0.0))
+                    cluster_bonus = 0.06 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
+                    specificity_bonus = 0.04 * max(self._title_specificity_score(brief), 0.0)
+                    score = 0.58 * base_score + 0.34 * coverage_gain + cluster_bonus + specificity_bonus
+                    if score > best_score:
+                        best_score = score
+                        best_id = brief.doc_id
+                        best_index = index
+                if not best_id:
                     break
+                chosen = eligible.pop(best_index)
+                kept.append(best_id)
+                for neighbor_id, weight in neighborhoods.get(best_id, [(best_id, 1.0)]):
+                    coverage[neighbor_id] = max(coverage.get(neighbor_id, 0.0), weight)
+                cluster = self._topic_cluster(chosen)
+                if cluster:
+                    selected_clusters.add(cluster)
             if not kept:
+                ranked = sorted(
+                    ((priority_map.get(brief.doc_id, 0.0), brief) for brief in group),
+                    key=lambda item: (-item[0], item[1].doc_id),
+                )
                 kept = [brief.doc_id for _, brief in ranked[: min(cap, max(6, len(group) // 6 or 1))]]
-            selected.update(kept)
-        return selected
+            ordered.extend(kept)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for doc_id in ordered:
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            deduped.append(doc_id)
+        return deduped
+
+    def select_discovery_anchors(self, briefs: list[DocBrief]) -> set[str]:
+        return set(self.rank_discovery_anchors(briefs))
 
     def _select_dataset_hub_anchors(self, group: list[DocBrief], *, cap: int) -> list[str]:
         if cap <= 0 or not group:
