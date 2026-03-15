@@ -70,13 +70,21 @@ class RetrievalScorer:
         query_tokens = list(self._query_tokens(query))
         if not query_tokens:
             return 0.0
-        short_query = min(1.0, 3.0 / len(query_tokens))
+        token_count = len(query_tokens)
+        if token_count <= 1:
+            short_query = 1.0
+        elif token_count == 2:
+            short_query = 0.8
+        elif token_count == 3:
+            short_query = 0.55
+        else:
+            short_query = 0.3
         content_rich = min(sum(1 for token in query_tokens if len(token) >= 5) / len(query_tokens), 1.0)
         alpha_numeric = min(
             sum(1 for token in query_tokens if any(char.isdigit() for char in token)) / len(query_tokens),
             1.0,
         )
-        return min(1.0, 0.75 * short_query + 0.2 * content_rich + 0.05 * alpha_numeric)
+        return min(1.0, 0.85 * short_query + 0.1 * content_rich + 0.05 * alpha_numeric)
 
     def encode_query(self, query: str) -> np.ndarray:
         return self.provider.embed_texts([query])[0]

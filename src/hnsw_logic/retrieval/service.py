@@ -256,6 +256,8 @@ class HybridRetrievalService:
                 precision_guard = title_claim_alignment >= (0.14 + 0.18 * query_specificity)
                 if query_specificity >= 0.7 and not precision_guard and score < 0.72:
                     continue
+                if query_specificity >= 0.7 and title_alignment <= 0.0 and query_alignment < 0.5:
+                    continue
                 if (not getattr(strategy, "allow_sparse_only", True)) or (
                     agreement_gate < self.sparse_only_min_agreement and not (strong_structure or strong_semantic or strong_raw)
                 ):
@@ -499,10 +501,17 @@ class HybridRetrievalService:
             current_score, current_source = current
             if current_source == "geometric":
                 if self._dataset_hint in {"scifact", "nfcorpus", "arguana"}:
-                    continue
-                if self._dataset_hint in {"scifact", "nfcorpus"} and score > current_score:
-                    dense_boost_cap = 0.045 if self._dataset_hint == "scifact" else 0.025
-                    merged[doc_id] = (min(score, current_score + dense_boost_cap), "geometric")
+                    brief = briefs.get(doc_id)
+                    if brief is None or score <= current_score:
+                        continue
+                    query_specificity = self.scorer.query_specificity(query)
+                    title_alignment = self.scorer.title_alignment(query, brief)
+                    query_alignment = self.scorer.query_alignment(query, brief)
+                    dense_boost_cap = 0.0
+                    if query_specificity >= 0.7 and (title_alignment > 0.0 or query_alignment >= 0.5):
+                        dense_boost_cap = 0.05
+                    if dense_boost_cap > 0.0:
+                        merged[doc_id] = (min(score, current_score + dense_boost_cap), "geometric")
                 continue
             if score > current_score:
                 merged[doc_id] = (score, "supplemental")
