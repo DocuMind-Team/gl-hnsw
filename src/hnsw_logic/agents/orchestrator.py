@@ -1757,7 +1757,6 @@ class LogicOrchestrator:
                 for brief in group
             }
             cap_base = max(6, min(len(group), len(group) // 8 + 4))
-            cap = max(6, min(len(group), int(round(cap_base * (0.9 + 0.42 * profile["graph_potential"])))))
             floor = max(0.34, min(0.54, 0.54 - 0.16 * profile["graph_potential"] + 0.04 * profile["argument_ratio"]))
             priority_map = {
                 brief.doc_id: (
@@ -1770,6 +1769,11 @@ class LogicOrchestrator:
             eligible = [brief for brief in group if priority_map.get(brief.doc_id, 0.0) >= floor]
             if not eligible:
                 eligible = list(group)
+            eligibility_pressure = len(eligible) / max(1, len(group))
+            bridge_pressure = sum(1 for brief in group if specific_bridge_potential.get(brief.doc_id, 0.0) >= 0.75) / max(1, len(group))
+            pressure = max(eligibility_pressure, 0.6 * eligibility_pressure + 0.4 * bridge_pressure)
+            cap_multiplier = 0.9 + 0.42 * profile["graph_potential"] + 0.8 * pressure
+            cap = max(6, min(len(group), int(round(cap_base * cap_multiplier))))
             coverage: dict[str, float] = {}
             kept: list[str] = []
             selected_clusters: set[str] = set()
@@ -1782,7 +1786,7 @@ class LogicOrchestrator:
                     coverage_gain = 0.0
                     for neighbor_id, weight in neighborhoods.get(brief.doc_id, [(brief.doc_id, 1.0)]):
                         coverage_gain += max(0.0, weight - coverage.get(neighbor_id, 0.0))
-                    cluster_bonus = 0.06 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
+                    cluster_bonus = 0.12 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
                     specificity_bonus = 0.04 * max(self._title_specificity_score(brief), 0.0)
                     bridge_bonus = 0.08 * specific_bridge_potential.get(brief.doc_id, 0.0)
                     score = 0.54 * base_score + 0.3 * coverage_gain + cluster_bonus + specificity_bonus + bridge_bonus
@@ -1799,6 +1803,39 @@ class LogicOrchestrator:
                 cluster = self._topic_cluster(chosen)
                 if cluster:
                     selected_clusters.add(cluster)
+            reserve_cap = max(0, min(len(group) - len(kept), max(4, cap // 2)))
+            if reserve_cap > 0:
+                reserve_ranked: list[tuple[float, DocBrief]] = []
+                for brief in group:
+                    if brief.doc_id in kept:
+                        continue
+                    bridge_potential = specific_bridge_potential.get(brief.doc_id, 0.0)
+                    if bridge_potential < 0.5:
+                        continue
+                    cluster = self._topic_cluster(brief)
+                    cluster_bonus = 0.14 if cluster and cluster not in selected_clusters else 0.0
+                    reserve_score = (
+                        0.48 * bridge_potential
+                        + 0.26 * self.discovery_anchor_priority(brief)
+                        + 0.16 * centrality.get(brief.doc_id, 0.0)
+                        + 0.1 * max(self._title_specificity_score(brief), 0.0)
+                        + cluster_bonus
+                    )
+                    reserve_ranked.append((reserve_score, brief))
+                reserve_ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
+                reserve_kept = 0
+                reserve_clusters: set[str] = set()
+                for _, brief in reserve_ranked:
+                    cluster = self._topic_cluster(brief)
+                    if cluster and cluster in reserve_clusters:
+                        continue
+                    kept.append(brief.doc_id)
+                    reserve_kept += 1
+                    if cluster:
+                        reserve_clusters.add(cluster)
+                        selected_clusters.add(cluster)
+                    if reserve_kept >= reserve_cap:
+                        break
             if not kept:
                 ranked = sorted(
                     ((priority_map.get(brief.doc_id, 0.0), brief) for brief in group),
