@@ -17,7 +17,8 @@ class JumpPolicy:
 
     def allow_jump(self, query_emb: np.ndarray, edge_emb: np.ndarray, edge: LogicEdge, target_rel_score: float) -> bool:
         edge_match = float(np.dot(query_emb, edge_emb))
-        if edge.confidence < self.tau_conf:
+        effective_conf = 0.7 * edge.confidence + 0.3 * getattr(edge, "utility_score", edge.confidence)
+        if effective_conf < self.tau_conf:
             return False
         if edge_match < self.tau_edge:
             return False

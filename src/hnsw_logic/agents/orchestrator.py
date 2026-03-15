@@ -478,6 +478,7 @@ class LogicOrchestrator:
             + 0.16 * metrics["topic_alignment"]
             + 0.18 * metrics["topic_cluster_match"]
             + 0.18 * metrics["stance_contrast"]
+            + 0.08 * metrics["novelty_bridge_score"]
             + 0.08 * comparison_cue_score
             + self._relation_stage_bonus(anchor, candidate, "comparison", metrics)
             - 0.12 * metrics["service_surface_score"]
@@ -489,9 +490,12 @@ class LogicOrchestrator:
             + 0.16 * metrics["mention_score"]
             + 0.16 * metrics["topic_alignment"]
             + 0.12 * metrics["topic_cluster_match"]
+            + 0.14 * metrics["novelty_bridge_score"]
             + max(self._relation_stage_bonus(anchor, candidate, "same_concept", metrics), 0.0)
             - 0.16 * metrics["stance_contrast"]
             - 0.22 * methodology_penalty
+            - 0.12 * max(0.0, 0.14 - metrics["novel_term_ratio"])
+            - 0.1 * max(0.0, metrics["novel_term_ratio"] - 0.82)
         )
         return {
             "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
@@ -527,8 +531,12 @@ class LogicOrchestrator:
             score += 0.1 * metrics["family_bridge_score"] + 0.04 * metrics["topic_alignment"]
         if relation_type == "comparison":
             score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
+            score += 0.08 * metrics["novelty_bridge_score"]
         if relation_type == "same_concept":
             score -= 0.3 * methodology_penalty
+            score += 0.16 * metrics["novelty_bridge_score"]
+            score -= 0.14 * max(0.0, 0.14 - metrics["novel_term_ratio"])
+            score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
         if relation_type == "supporting_evidence" and methodology_penalty > 0.0:
             score += 0.06 * methodology_penalty
         return max(0.0, min(score, 1.0))
@@ -548,6 +556,10 @@ class LogicOrchestrator:
             risk_flags.append("weak_topic_match")
         if relation_type == "same_concept" and self._same_concept_methodology_penalty(anchor, candidate) >= 0.45:
             risk_flags.append("methodology_gap")
+        if relation_type == "same_concept" and metrics["novel_term_ratio"] < 0.14:
+            risk_flags.append("low_novelty")
+        if relation_type == "same_concept" and metrics["novel_term_ratio"] > 0.82:
+            risk_flags.append("excess_novelty")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -875,6 +887,14 @@ class LogicOrchestrator:
         overlap_score = min((keyword_overlap + entity_overlap + hint_overlap + title_overlap) / 5.0, 1.0)
         content_overlap = len(anchor_content_terms & candidate_content_terms)
         content_overlap_score = min(content_overlap / 6.0, 1.0)
+        candidate_only_terms = candidate_content_terms - anchor_content_terms
+        anchor_only_terms = anchor_content_terms - candidate_content_terms
+        novel_term_ratio = min(len(candidate_only_terms) / max(1, min(len(candidate_content_terms), 8)), 1.0)
+        mutual_novelty = min((len(candidate_only_terms) + len(anchor_only_terms)) / max(1, min(len(anchor_content_terms | candidate_content_terms), 10)), 1.0)
+        if 0.18 <= novel_term_ratio <= 0.72:
+            novelty_bridge_score = 1.0 - abs(novel_term_ratio - 0.42) / 0.42
+        else:
+            novelty_bridge_score = max(0.0, 0.35 - min(abs(novel_term_ratio - 0.42), 0.42))
         mention_score = self._mention_score(anchor, candidate)
         role_listing_score = self._role_listing_score(anchor, candidate)
         forward_reference_score = self._reference_score(anchor, candidate)
@@ -908,6 +928,9 @@ class LogicOrchestrator:
             "dense_score": dense_score,
             "overlap_score": overlap_score,
             "content_overlap_score": content_overlap_score,
+            "novel_term_ratio": novel_term_ratio,
+            "mutual_novelty": mutual_novelty,
+            "novelty_bridge_score": novelty_bridge_score,
             "keyword_overlap": float(keyword_overlap),
             "entity_overlap": float(entity_overlap),
             "hint_overlap": float(hint_overlap),
@@ -1975,6 +1998,7 @@ class LogicOrchestrator:
             edge_card_text=f"[REL={final_result.relation_type}] {anchor.title} -> {candidate.title}: {final_result.rationale}",
             created_at=DEFAULT_TIMESTAMP,
             last_validated_at=DEFAULT_TIMESTAMP,
+            utility_score=max(0.0, min(1.0, blended_utility)),
         )
         return CandidateAssessment(
             candidate_doc_id=candidate.doc_id,

@@ -35,6 +35,7 @@ class LogicEdge:
     edge_card_text: str
     created_at: str
     last_validated_at: str | None = None
+    utility_score: float = 0.0
 
 
 @dataclass(slots=True)

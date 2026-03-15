@@ -190,7 +190,8 @@ class RetrievalScorer:
         for candidate in expanded:
             target_brief = briefs[candidate.doc_id]
             relation_multiplier = self.relation_query_multiplier(query, target_brief, candidate.edge)
-            logic_score = candidate.seed_score * candidate.edge.confidence * candidate.edge_match * candidate.target_rel_score * relation_multiplier
+            utility_multiplier = 0.5 + 0.5 * getattr(candidate.edge, "utility_score", candidate.edge.confidence)
+            logic_score = candidate.seed_score * candidate.edge.confidence * utility_multiplier * candidate.edge_match * candidate.target_rel_score * relation_multiplier
             row = merged.setdefault(
                 candidate.doc_id,
                 {

@@ -341,7 +341,8 @@ class HybridRetrievalService:
                 if target_alignment < 0.24:
                     continue
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
-                bonus = 0.16 * edge.confidence * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
+                utility_multiplier = 0.5 + 0.5 * getattr(edge, "utility_score", edge.confidence)
+                bonus = 0.16 * edge.confidence * utility_multiplier * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
                 if edge.dst_doc_id in ranked_ids:
                     bonus *= 1.15
                 best_bonus = max(best_bonus, bonus)

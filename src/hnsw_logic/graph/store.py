@@ -27,7 +27,10 @@ class GraphStore:
             self._edges_by_src[edge.src_doc_id].append(edge)
 
     def get_out_edges(self, doc_id: str) -> list[LogicEdge]:
-        return sorted(self._edges_by_src.get(doc_id, []), key=lambda edge: (-edge.confidence, edge.dst_doc_id))
+        return sorted(
+            self._edges_by_src.get(doc_id, []),
+            key=lambda edge: (-(0.65 * edge.confidence + 0.35 * getattr(edge, "utility_score", 0.0)), -getattr(edge, "utility_score", 0.0), edge.dst_doc_id),
+        )
 
     def all_edges(self) -> list[LogicEdge]:
         edges: list[LogicEdge] = []
