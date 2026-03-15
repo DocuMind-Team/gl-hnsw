@@ -96,6 +96,7 @@ class LogicOrchestrator:
     corpus_scout: object
     relation_judge: object
     memory_curator: object
+    edge_reviewer: object | None = None
     deepagent: object | None = None
     retrieval_config: RetrievalConfig | None = None
     _embedding_cache: dict[str, Any] | None = None
@@ -1152,6 +1153,160 @@ class LogicOrchestrator:
             decision_reason="Accepted by local fallback after strong lexical and structural match.",
         )
 
+    def _merge_spans(self, *groups: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for span in group:
+                value = str(span).strip()
+                if not value:
+                    continue
+                key = value.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(value)
+                if len(merged) >= 4:
+                    return merged
+        return merged
+
+    def _review_consensus_result(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        result,
+        review_result,
+        metrics: dict[str, float],
+        fit_scores: dict[str, float],
+        signal_bundle: JudgeSignals,
+    ):
+        if review_result is None:
+            return result
+        model_relation = result.relation_type if result.relation_type in RELATION_TYPES else signal_bundle.best_relation
+        reviewer_relation = review_result.relation_type if review_result.relation_type in RELATION_TYPES else model_relation
+        best_relation = signal_bundle.best_relation if signal_bundle.best_relation in RELATION_TYPES else model_relation
+        local_strength = 0.56 * signal_bundle.utility_score + 0.44 * signal_bundle.local_support
+        risk_flags = set(signal_bundle.risk_flags)
+        model_accepts = bool(result.accepted)
+        reviewer_accepts = bool(review_result.accepted)
+        reviewer_uncertain = float(getattr(review_result, "uncertainty", 0.0)) >= 0.55
+        reviewer_veto = (
+            not reviewer_accepts
+            and not reviewer_uncertain
+            and (
+                {"service_surface", "foundational_support"} & risk_flags
+                or ("weak_direction" in risk_flags and model_relation == "implementation_detail")
+            )
+        )
+
+        resolved_relation = model_relation
+        if reviewer_relation in RELATION_TYPES and fit_scores.get(reviewer_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) - 0.04:
+            resolved_relation = reviewer_relation
+        elif best_relation in RELATION_TYPES and fit_scores.get(best_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) + 0.08:
+            resolved_relation = best_relation
+
+        accepted = model_accepts
+        rescued_by_reviewer = False
+        if model_accepts and reviewer_accepts:
+            accepted = True
+        elif model_accepts and not reviewer_accepts:
+            accepted = not reviewer_veto and reviewer_uncertain and local_strength >= 0.48 and fit_scores.get(model_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.08
+        elif not model_accepts and reviewer_accepts:
+            accepted = (
+                float(review_result.confidence) >= 0.82
+                and max(signal_bundle.utility_score, float(getattr(review_result, "utility_score", 0.0))) >= 0.42
+                and not ({"service_surface", "foundational_support"} & risk_flags)
+                and fit_scores.get(resolved_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.06
+            )
+            rescued_by_reviewer = accepted
+        else:
+            accepted = False
+
+        if not accepted:
+            return SimpleNamespace(
+                accepted=False,
+                relation_type=resolved_relation,
+                confidence=max(0.0, min(0.78, 0.5 * float(result.confidence) + 0.5 * float(review_result.confidence))),
+                evidence_spans=self._merge_spans(result.evidence_spans, getattr(review_result, "evidence_spans", [])),
+                rationale=(getattr(review_result, "rationale", "") or result.rationale)[:200],
+                support_score=max(float(getattr(result, "support_score", 0.0)), float(getattr(review_result, "support_score", 0.0))),
+                contradiction_flags=self._merge_spans(
+                    [str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
+                    [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
+                ),
+                decision_reason=(
+                    f"Consensus rejection after judge/reviewer cross-check. "
+                    f"judge={model_relation}:{float(result.confidence):.2f}, "
+                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
+                )[:200],
+                semantic_relation_label=str(getattr(review_result, "semantic_relation_label", resolved_relation))[:80],
+                canonical_relation="none",
+                utility_score=max(
+                    signal_bundle.utility_score * 0.6,
+                    0.5 * float(getattr(result, "utility_score", 0.0)) + 0.5 * float(getattr(review_result, "utility_score", 0.0)),
+                ),
+                uncertainty=min(1.0, 0.5 * float(getattr(result, "uncertainty", 0.0)) + 0.5 * float(getattr(review_result, "uncertainty", 0.0)) + 0.15),
+            )
+
+        if rescued_by_reviewer:
+            confidence = (
+                0.72 * float(review_result.confidence)
+                + 0.12 * fit_scores.get(resolved_relation, 0.0)
+                + 0.16 * max(signal_bundle.utility_score, signal_bundle.local_support)
+            )
+            confidence = max(confidence, 0.84 + 0.06 * fit_scores.get(resolved_relation, 0.0))
+            support_score = max(
+                float(getattr(review_result, "support_score", 0.0)),
+                0.65 * float(getattr(review_result, "support_score", 0.0)) + 0.35 * signal_bundle.local_support,
+            )
+            utility_score = max(
+                signal_bundle.utility_score,
+                0.25 * float(getattr(result, "utility_score", 0.0)) + 0.75 * float(getattr(review_result, "utility_score", 0.0)),
+            )
+        else:
+            confidence = (
+                0.44 * float(result.confidence)
+                + 0.38 * float(review_result.confidence)
+                + 0.18 * fit_scores.get(resolved_relation, 0.0)
+                - (0.06 if model_relation != reviewer_relation and reviewer_accepts and model_accepts else 0.0)
+            )
+            support_score = max(
+                float(getattr(result, "support_score", 0.0)),
+                0.5 * float(getattr(result, "support_score", 0.0)) + 0.5 * float(getattr(review_result, "support_score", 0.0)),
+                signal_bundle.local_support,
+            )
+            utility_score = max(
+                signal_bundle.utility_score,
+                0.45 * float(getattr(result, "utility_score", 0.0)) + 0.55 * float(getattr(review_result, "utility_score", 0.0)),
+            )
+        uncertainty = min(
+            1.0,
+            0.45 * float(getattr(result, "uncertainty", max(0.0, 1.0 - float(result.confidence))))
+            + 0.55 * float(getattr(review_result, "uncertainty", max(0.0, 1.0 - float(review_result.confidence))))
+            + (0.06 if model_relation != reviewer_relation else 0.0),
+        )
+        return SimpleNamespace(
+            accepted=True,
+            relation_type=resolved_relation,
+            confidence=max(0.0, min(confidence, 0.99)),
+            evidence_spans=self._merge_spans(result.evidence_spans, getattr(review_result, "evidence_spans", [])),
+            rationale=(getattr(review_result, "rationale", "") or result.rationale)[:200],
+            support_score=max(0.0, min(1.0, support_score)),
+            contradiction_flags=self._merge_spans(
+                [str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
+                [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
+            ),
+            decision_reason=(
+                f"Consensus edge review kept {resolved_relation}. "
+                f"judge={model_relation}:{float(result.confidence):.2f}, "
+                f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
+            )[:200],
+            semantic_relation_label=str(getattr(review_result, "semantic_relation_label", getattr(result, "semantic_relation_label", resolved_relation)))[:80],
+            canonical_relation=resolved_relation,
+            utility_score=max(0.0, min(1.0, utility_score)),
+            uncertainty=uncertainty,
+        )
+
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
         topic = str(anchor.metadata.get("topic", "")).lower()
         source_dataset = str(anchor.metadata.get("source_dataset", "")).lower()
@@ -1589,12 +1744,12 @@ class LogicOrchestrator:
                 )
         return None
 
-    def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
+    def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result, review_result=None) -> CandidateAssessment:
         metrics = self._candidate_metrics(anchor, candidate)
         rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
         signal_bundle = self._signal_bundle(anchor, candidate, metrics, fit_scores, rerank_relation)
-        final_result = result
-        fallback = self._local_relation_override(anchor, candidate, metrics, result)
+        final_result = self._review_consensus_result(anchor, candidate, result, review_result, metrics, fit_scores, signal_bundle)
+        fallback = self._local_relation_override(anchor, candidate, metrics, final_result)
         if fallback is not None:
             force_override = (
                 fallback.relation_type == "prerequisite"
@@ -1664,9 +1819,17 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
         model_support = max(0.0, min(float(getattr(final_result, "support_score", 0.0)), 1.0))
-        blended_support = 0.7 * metrics["local_support"] + 0.3 * model_support
+        reviewer_support = max(0.0, min(float(getattr(review_result, "support_score", model_support)) if review_result is not None else model_support, 1.0))
+        if review_result is not None and review_result.accepted and not result.accepted:
+            blended_support = 0.5 * metrics["local_support"] + 0.5 * max(model_support, reviewer_support)
+        else:
+            blended_support = 0.7 * metrics["local_support"] + 0.3 * max(model_support, reviewer_support)
         model_utility = max(0.0, min(float(getattr(final_result, "utility_score", 0.0)), 1.0))
-        blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * model_utility)
+        reviewer_utility = max(0.0, min(float(getattr(review_result, "utility_score", model_utility)) if review_result is not None else model_utility, 1.0))
+        if review_result is not None and review_result.accepted and not result.accepted:
+            blended_utility = max(signal_bundle.utility_score, 0.4 * signal_bundle.utility_score + 0.6 * max(model_utility, reviewer_utility))
+        else:
+            blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * max(model_utility, reviewer_utility))
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
         threshold = self._effective_threshold(anchor, candidate, final_result.relation_type)
         anchor_stage = self._doc_stage(anchor)
@@ -1808,7 +1971,7 @@ class LogicOrchestrator:
             relation_type=final_result.relation_type,
             confidence=edge_confidence,
             evidence_spans=final_result.evidence_spans,
-            discovery_path=["scout", "judge", "gate"],
+            discovery_path=["scout", "judge", "review", "gate"] if self.edge_reviewer is not None else ["scout", "judge", "gate"],
             edge_card_text=f"[REL={final_result.relation_type}] {anchor.title} -> {candidate.title}: {final_result.rationale}",
             created_at=DEFAULT_TIMESTAMP,
             last_validated_at=DEFAULT_TIMESTAMP,
@@ -1940,24 +2103,47 @@ class LogicOrchestrator:
 
     def judge(self, anchor: DocBrief, candidate: DocBrief) -> LogicEdge | None:
         result = self.relation_judge.run(anchor, candidate)
-        assessment = self._assessment_for(anchor, candidate, result)
+        review = None
+        if self.edge_reviewer is not None and hasattr(self.edge_reviewer, "run_with_signals"):
+            metrics = self._candidate_metrics(anchor, candidate)
+            _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+            review = self.edge_reviewer.run_with_signals(anchor, candidate, self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type), result)
+        assessment = self._assessment_for(anchor, candidate, result, review)
         return assessment.edge if assessment.accepted else None
 
     def judge_many_with_diagnostics(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[CandidateAssessment]:
         candidate_map = {candidate.doc_id: candidate for candidate in candidates}
+        signal_map: dict[str, JudgeSignals] = {}
         if hasattr(self.relation_judge, "run_many_with_signals"):
             candidate_pairs = []
             for candidate in candidates:
                 metrics = self._candidate_metrics(anchor, candidate)
                 _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-                candidate_pairs.append((candidate, self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)))
+                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+                candidate_pairs.append((candidate, signal_map[candidate.doc_id]))
             verdicts = self.relation_judge.run_many_with_signals(anchor, candidate_pairs)
         elif hasattr(self.relation_judge, "run_many"):
             verdicts = self.relation_judge.run_many(anchor, candidates)
         else:
             verdicts = {candidate.doc_id: self.relation_judge.run(anchor, candidate) for candidate in candidates}
-
-        assessments = [self._assessment_for(anchor, candidate, verdicts.get(candidate.doc_id)) for candidate in candidates if verdicts.get(candidate.doc_id) is not None]
+        if not signal_map:
+            for candidate in candidates:
+                metrics = self._candidate_metrics(anchor, candidate)
+                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+        reviews: dict[str, Any] = {}
+        if self.edge_reviewer is not None and hasattr(self.edge_reviewer, "run_many_with_signals"):
+            review_pairs = [
+                (candidate, signal_map[candidate.doc_id], verdicts[candidate.doc_id])
+                for candidate in candidates
+                if candidate.doc_id in verdicts and signal_map.get(candidate.doc_id) is not None
+            ]
+            reviews = self.edge_reviewer.run_many_with_signals(anchor, review_pairs)
+        assessments = [
+            self._assessment_for(anchor, candidate, verdicts.get(candidate.doc_id), reviews.get(candidate.doc_id))
+            for candidate in candidates
+            if verdicts.get(candidate.doc_id) is not None
+        ]
         accepted = [item for item in assessments if item.accepted and item.edge is not None]
         accepted.sort(key=lambda item: (-item.score, item.candidate_doc_id))
 

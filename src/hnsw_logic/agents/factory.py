@@ -6,6 +6,7 @@ from typing import Any
 
 from hnsw_logic.agents.subagents.corpus_scout import CorpusScoutAgent
 from hnsw_logic.agents.subagents.doc_profiler import DocProfilerAgent
+from hnsw_logic.agents.subagents.edge_reviewer import EdgeReviewerAgent
 from hnsw_logic.agents.subagents.memory_curator import MemoryCuratorAgent
 from hnsw_logic.agents.subagents.query_strategy import QueryStrategyAgent
 from hnsw_logic.agents.subagents.relation_judge import RelationJudgeAgent
@@ -44,6 +45,7 @@ class AgentFactory:
             doc_profiler=self.create_doc_profiler(),
             corpus_scout=self.create_corpus_scout(),
             relation_judge=self.create_relation_judge(),
+            edge_reviewer=self.create_edge_reviewer(),
             memory_curator=self.create_memory_curator(),
             deepagent=self.try_create_deep_agent(),
             retrieval_config=self.retrieval_config,
@@ -57,6 +59,9 @@ class AgentFactory:
 
     def create_relation_judge(self):
         return RelationJudgeAgent(self.provider)
+
+    def create_edge_reviewer(self):
+        return EdgeReviewerAgent(self.provider)
 
     def create_memory_curator(self):
         return MemoryCuratorAgent(self.provider)

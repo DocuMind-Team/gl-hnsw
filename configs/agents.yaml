@@ -3,6 +3,7 @@ sandbox_enabled: false
 live_reasoning:
   enable_scout_thinking: true
   enable_judge_thinking: true
+  enable_reviewer_thinking: true
   enable_curator_thinking: true
   enable_query_strategy_thinking: true
 subagents:
@@ -20,6 +21,11 @@ subagents:
     skills:
       - evidence_linking
       - relation_typing
+  edge_reviewer:
+    enabled: true
+    skills:
+      - edge_utility
+      - signal_fusion
   memory_curator:
     enabled: true
     skills:

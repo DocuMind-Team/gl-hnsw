@@ -38,6 +38,18 @@ class FakeJudge:
         return self._verdicts[candidate.doc_id]
 
 
+class FakeReviewer:
+    def __init__(self, provider, verdicts):
+        self.provider = provider
+        self._verdicts = verdicts
+
+    def run_many_with_signals(self, anchor, candidates):
+        return {candidate.doc_id: self._verdicts[candidate.doc_id] for candidate, _, _ in candidates}
+
+    def run_with_signals(self, anchor, candidate, signals, verdict):
+        return self._verdicts[candidate.doc_id]
+
+
 def _brief(
     doc_id: str,
     title: str,
@@ -215,6 +227,134 @@ def test_local_gate_rejects_topic_drift_or_low_support():
     assessment = orchestrator.judge_many_with_diagnostics(anchor, [unrelated])[0]
     assert assessment.accepted is False
     assert assessment.reject_reason in {"topic_drift", "low_support"}
+
+
+def test_edge_reviewer_rejects_generic_service_surface_edge():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-20",
+        "Background Jobs",
+        "Workers run expensive offline tasks through a lightweight registry.",
+        ["workers", "jobs", "offline", "registry", "tasks"],
+        ["workers"],
+        ["registry", "offline"],
+    )
+    candidate = _brief(
+        "doc-21",
+        "Public API Service",
+        "The API service exposes endpoints that submit jobs to the same registry.",
+        ["api", "service", "endpoints", "jobs", "registry"],
+        ["api"],
+        ["service", "registry"],
+    )
+    judge_verdicts = {
+        "doc-21": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.88,
+            evidence_spans=["The jobs use a registry.", "The API submits jobs to the same registry."],
+            rationale="Shared registry implies support.",
+            support_score=0.62,
+            contradiction_flags=[],
+            decision_reason="Shared registry looked supportive.",
+            utility_score=0.34,
+            uncertainty=0.22,
+            canonical_relation="supporting_evidence",
+            semantic_relation_label="supporting_evidence",
+        )
+    }
+    review_verdicts = {
+        "doc-21": JudgeResult(
+            accepted=False,
+            relation_type="supporting_evidence",
+            confidence=0.41,
+            evidence_spans=["Both documents mention the registry surface."],
+            rationale="The link is generic service-surface overlap, not durable support.",
+            support_score=0.28,
+            contradiction_flags=["service_surface"],
+            decision_reason="Generic co-usage should not enter the graph.",
+            utility_score=0.12,
+            uncertainty=0.18,
+            canonical_relation="none",
+            semantic_relation_label="generic_overlap",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, judge_verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        edge_reviewer=FakeReviewer(provider, review_verdicts),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is False
+    assert assessment.reject_reason in {"low_utility", "wrong_relation_type", "weak_link", "model_rejected"}
+
+
+def test_edge_reviewer_can_recover_high_utility_pair():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-07",
+        "Hybrid Retrieval",
+        "Hybrid retrieval merges geometric seeds with logical expansions and weighted scoring.",
+        ["hybrid", "retrieval", "geometric", "logical", "weighted", "scoring"],
+        ["hybrid retrieval"],
+        ["weighted", "logic"],
+    )
+    candidate = _brief(
+        "doc-10",
+        "Candidate Fusion",
+        "Candidate fusion computes alpha times the HNSW score plus beta times the logic score.",
+        ["candidate", "fusion", "hnsw", "logic", "score", "alpha", "beta"],
+        ["candidate fusion"],
+        ["formula", "score"],
+    )
+    judge_verdicts = {
+        "doc-10": JudgeResult(
+            accepted=False,
+            relation_type="comparison",
+            confidence=0.44,
+            evidence_spans=[],
+            rationale="The model was unsure.",
+            support_score=0.18,
+            contradiction_flags=[],
+            decision_reason="Initial model abstained.",
+            utility_score=0.18,
+            uncertainty=0.62,
+            canonical_relation="none",
+            semantic_relation_label="uncertain_related",
+        )
+    }
+    review_verdicts = {
+        "doc-10": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.9,
+            evidence_spans=["Hybrid retrieval uses weighted scoring.", "Candidate fusion defines the weighted score formula."],
+            rationale="The candidate defines the retrieval scoring mechanism used by the anchor.",
+            support_score=0.8,
+            contradiction_flags=[],
+            decision_reason="High retrieval utility and mechanism-level alignment.",
+            utility_score=0.82,
+            uncertainty=0.18,
+            canonical_relation="implementation_detail",
+            semantic_relation_label="mechanism_detail",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, judge_verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        edge_reviewer=FakeReviewer(provider, review_verdicts),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
 
 
 def test_scientific_same_concept_is_allowed_for_live_provider():
