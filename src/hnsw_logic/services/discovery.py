@@ -28,6 +28,37 @@ class LogicDiscoveryService:
         self.graph_memory_store = graph_memory_store
         self.curator_service = curator_service
 
+    def _augment_with_mirror_edges(self, accepted: list[LogicEdge]) -> list[LogicEdge]:
+        if not accepted:
+            return accepted
+        existing = {(edge.src_doc_id, edge.dst_doc_id, edge.relation_type) for edge in self.graph_store.all_edges()}
+        existing.update((edge.src_doc_id, edge.dst_doc_id, edge.relation_type) for edge in accepted)
+        mirrored: list[LogicEdge] = []
+        for edge in accepted:
+            if edge.relation_type not in {"same_concept", "comparison"}:
+                continue
+            if edge.confidence < 0.82 or getattr(edge, "utility_score", 0.0) < 0.48:
+                continue
+            reverse_key = (edge.dst_doc_id, edge.src_doc_id, edge.relation_type)
+            if reverse_key in existing:
+                continue
+            mirrored.append(
+                LogicEdge(
+                    src_doc_id=edge.dst_doc_id,
+                    dst_doc_id=edge.src_doc_id,
+                    relation_type=edge.relation_type,
+                    confidence=max(0.7, edge.confidence * 0.96),
+                    evidence_spans=list(edge.evidence_spans),
+                    discovery_path=[*edge.discovery_path, "mirror"],
+                    edge_card_text=f"[MIRROR][REL={edge.relation_type}] {edge.dst_doc_id} -> {edge.src_doc_id}",
+                    created_at=edge.created_at,
+                    last_validated_at=edge.last_validated_at,
+                    utility_score=max(0.0, min(1.0, getattr(edge, "utility_score", 0.0) * 0.96)),
+                )
+            )
+            existing.add(reverse_key)
+        return accepted + mirrored
+
     def ensure_briefs(self, docs: list[DocRecord]) -> list[DocBrief]:
         briefs: list[DocBrief] = []
         missing_docs: list[DocRecord] = []
@@ -52,6 +83,7 @@ class LogicDiscoveryService:
         candidate_docs = [brief_map[proposal.doc_id] for proposal in proposals if proposal.doc_id in brief_map]
         assessments = self.orchestrator.judge_many_with_diagnostics(anchor, candidate_docs)
         accepted = [item.edge for item in assessments if item.accepted and item.edge is not None]
+        accepted = self._augment_with_mirror_edges(accepted)
         accepted_ids = {edge.dst_doc_id for edge in accepted}
         rejected = [item.candidate_doc_id for item in assessments if not item.accepted]
         rejection_reasons = {item.candidate_doc_id: item.reject_reason for item in assessments if not item.accepted}

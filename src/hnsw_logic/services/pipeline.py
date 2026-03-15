@@ -71,6 +71,12 @@ class BuildPipeline:
                 [brief_map[doc.doc_id] for doc in docs if doc.doc_id in brief_map]
             )
             docs = [doc for doc in docs if doc.doc_id in selected_ids]
+            docs.sort(
+                key=lambda doc: (
+                    -self.discovery_service.orchestrator.discovery_anchor_priority(brief_map[doc.doc_id]),
+                    doc.doc_id,
+                )
+            )
         accepted = []
         for doc in docs:
             accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))
