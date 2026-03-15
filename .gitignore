@@ -17,3 +17,4 @@ data/memories/*
 data/jobs.sqlite3
 
 data/workspace/
+data/external/
