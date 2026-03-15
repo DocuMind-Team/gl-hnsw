@@ -257,3 +257,25 @@ def test_judge_relations_malformed_batch_retries_single_remote_calls():
     assert verdicts["candidate"].relation_type == "implementation_detail"
     assert "judge_relations_batch" in calls
     assert "judge_relation" in calls
+
+
+def test_invoke_json_retries_after_empty_remote_response():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.trace_path = None
+
+    class FakeChat:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return type("Response", (), {"content": ""})()
+            return type("Response", (), {"content": '{"ok": true}'})()
+
+    provider._chat = FakeChat()
+    payload = provider._invoke_json("system", "user", stage="generic")
+
+    assert payload == {"ok": True}
+    assert provider._chat.calls == 2

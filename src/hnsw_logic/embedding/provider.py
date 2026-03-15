@@ -10,6 +10,7 @@ from typing import Iterable
 import numpy as np
 
 from hnsw_logic.config.schema import ProviderConfig
+from hnsw_logic.core.constants import RELATION_TYPES
 from hnsw_logic.core.facets import enrich_brief
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.core.utils import append_jsonl, deterministic_vector, to_jsonable, tokenize, top_terms, utc_now
@@ -65,6 +66,7 @@ class ProviderBase:
         self.live_reasoning = {
             "scout": True,
             "judge": True,
+            "reviewer": True,
             "curator": True,
             "query_strategy": True,
         }
@@ -76,6 +78,7 @@ class ProviderBase:
             "prerequisite": 0.98,
         }
         self.judge_few_shot_text = self._build_generic_judge_examples()
+        self.review_few_shot_text = self._build_generic_review_examples()
         self.query_strategy_few_shot_text = self._build_query_strategy_examples()
 
     @property
@@ -86,6 +89,7 @@ class ProviderBase:
         self.live_reasoning = {
             "scout": live_reasoning_config.enable_scout_thinking,
             "judge": live_reasoning_config.enable_judge_thinking,
+            "reviewer": live_reasoning_config.enable_reviewer_thinking,
             "curator": live_reasoning_config.enable_curator_thinking,
             "query_strategy": live_reasoning_config.enable_query_strategy_thinking,
         }
@@ -113,6 +117,15 @@ class ProviderBase:
 
     def judge_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals]]) -> dict[str, JudgeResult]:
         return {candidate.doc_id: self.judge_relation_with_signals(anchor, candidate, signals) for candidate, signals in candidates}
+
+    def review_relation_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> JudgeResult:
+        return verdict
+
+    def review_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals, JudgeResult]]) -> dict[str, JudgeResult]:
+        return {
+            candidate.doc_id: self.review_relation_with_signals(anchor, candidate, signals, verdict)
+            for candidate, signals, verdict in candidates
+        }
 
     def plan_query_strategy(self, payload: dict) -> dict:
         return {}
@@ -247,6 +260,74 @@ class ProviderBase:
         ]
         return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
 
+    def _build_generic_review_examples(self) -> str:
+        examples = [
+            {
+                "label": "approve",
+                "anchor_title": "Hybrid Retrieval",
+                "candidate_title": "Candidate Fusion",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "implementation_detail",
+                    "confidence": 0.88,
+                    "utility_score": 0.79,
+                },
+                "signals": {
+                    "best_relation": "implementation_detail",
+                    "utility_score": 0.74,
+                    "risk_flags": [],
+                },
+                "expected": {
+                    "accepted": True,
+                    "canonical_relation": "implementation_detail",
+                    "why": "Mechanism-level detail with aligned utility and no major risk.",
+                },
+            },
+            {
+                "label": "reject",
+                "anchor_title": "Background Jobs",
+                "candidate_title": "Public API Service",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "supporting_evidence",
+                    "confidence": 0.82,
+                    "utility_score": 0.31,
+                },
+                "signals": {
+                    "best_relation": "supporting_evidence",
+                    "utility_score": 0.22,
+                    "risk_flags": ["service_surface"],
+                },
+                "expected": {
+                    "accepted": False,
+                    "canonical_relation": "none",
+                    "why": "Shared service surface is too generic to be a durable retrieval edge.",
+                },
+            },
+            {
+                "label": "downgrade",
+                "anchor_title": "Scientific claim about disease risk",
+                "candidate_title": "Measurement protocol for the same condition",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "same_concept",
+                    "confidence": 0.84,
+                    "utility_score": 0.43,
+                },
+                "signals": {
+                    "best_relation": "supporting_evidence",
+                    "utility_score": 0.47,
+                    "risk_flags": ["methodology_gap"],
+                },
+                "expected": {
+                    "accepted": True,
+                    "canonical_relation": "supporting_evidence",
+                    "why": "The pair is related, but the candidate looks more like supporting context than the same concept.",
+                },
+            },
+        ]
+        return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
+
 
 class StubProvider(ProviderBase):
     def embed_texts(self, texts: Iterable[str]) -> np.ndarray:
@@ -326,6 +407,91 @@ class StubProvider(ProviderBase):
             canonical_relation=relation,
             utility_score=min(1.0, confidence * 0.9),
             uncertainty=max(0.0, 1.0 - confidence),
+        )
+
+    def review_relation_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> JudgeResult:
+        fit_scores = dict(signals.relation_fit_scores or {})
+        current_relation = verdict.relation_type if verdict.relation_type in RELATION_TYPES else signals.best_relation
+        if current_relation not in RELATION_TYPES:
+            current_relation = "implementation_detail"
+        best_relation = signals.best_relation if signals.best_relation in RELATION_TYPES else current_relation
+        current_fit = float(fit_scores.get(current_relation, 0.0))
+        best_fit = float(fit_scores.get(best_relation, current_fit))
+        risk_flags = set(signals.risk_flags or [])
+        local_alignment = (
+            0.34 * signals.local_support
+            + 0.24 * signals.utility_score
+            + 0.16 * max(signals.overlap_score, signals.content_overlap_score)
+            + 0.14 * signals.mention_score
+            + 0.12 * max(current_fit, best_fit)
+        )
+        risk_penalty = 0.12 * len(risk_flags)
+        if "service_surface" in risk_flags:
+            risk_penalty += 0.16
+        if "foundational_support" in risk_flags:
+            risk_penalty += 0.18
+        if "weak_direction" in risk_flags:
+            risk_penalty += 0.12
+        if "methodology_gap" in risk_flags:
+            risk_penalty += 0.12
+
+        reviewed_relation = current_relation
+        if best_relation in RELATION_TYPES and best_fit >= current_fit + 0.08:
+            reviewed_relation = best_relation
+        if reviewed_relation == "same_concept" and "methodology_gap" in risk_flags and fit_scores.get("supporting_evidence", 0.0) >= current_fit - 0.05:
+            reviewed_relation = "supporting_evidence"
+
+        reviewer_accepts = verdict.accepted
+        reject_reason = ""
+        if local_alignment - risk_penalty < 0.24:
+            reviewer_accepts = False
+            reject_reason = "low_alignment"
+        if reviewed_relation == "supporting_evidence" and {"service_surface", "foundational_support"} & risk_flags:
+            reviewer_accepts = False
+            reject_reason = "generic_support"
+        if reviewed_relation == "implementation_detail" and "weak_direction" in risk_flags and best_fit < 0.72:
+            reviewer_accepts = False
+            reject_reason = "weak_direction"
+        if not verdict.accepted and reviewer_accepts:
+            reviewer_accepts = best_fit >= 0.56 and signals.utility_score >= 0.38 and not {"service_surface", "foundational_support"} & risk_flags
+            if not reviewer_accepts:
+                reject_reason = reject_reason or "insufficient_recovery"
+
+        confidence = max(0.0, min(0.98, 0.52 * verdict.confidence + 0.28 * max(current_fit, best_fit) + 0.2 * signals.local_support - 0.12 * len(risk_flags)))
+        utility = max(signals.utility_score, 0.5 * verdict.utility_score + 0.5 * local_alignment - 0.1 * len(risk_flags))
+        uncertainty = max(verdict.uncertainty, 0.18 + 0.16 * len(risk_flags))
+        if not reviewer_accepts:
+            return JudgeResult(
+                accepted=False,
+                relation_type=reviewed_relation,
+                confidence=max(0.0, min(confidence, 0.72)),
+                evidence_spans=verdict.evidence_spans[:4],
+                rationale=verdict.rationale[:200],
+                support_score=max(0.0, min(1.0, 0.5 * verdict.support_score + 0.5 * signals.local_support)),
+                contradiction_flags=sorted(risk_flags)[:4],
+                decision_reason=f"Rejected by generic reviewer: {reject_reason or 'low utility'}."[:200],
+                semantic_relation_label=verdict.semantic_relation_label or reviewed_relation,
+                canonical_relation="none",
+                utility_score=max(0.0, min(utility, 0.45)),
+                uncertainty=min(1.0, uncertainty + 0.12),
+            )
+
+        return JudgeResult(
+            accepted=True,
+            relation_type=reviewed_relation,
+            confidence=confidence,
+            evidence_spans=verdict.evidence_spans[:4],
+            rationale=(verdict.rationale or "Approved by generic reviewer after cross-checking local signals.")[:200],
+            support_score=max(0.0, min(1.0, 0.45 * verdict.support_score + 0.55 * signals.local_support)),
+            contradiction_flags=sorted(risk_flags)[:4],
+            decision_reason=(
+                f"Reviewed for edge utility with relation {reviewed_relation}; "
+                f"local alignment={local_alignment:.2f}, risk_penalty={risk_penalty:.2f}."
+            )[:200],
+            semantic_relation_label=verdict.semantic_relation_label or reviewed_relation,
+            canonical_relation=reviewed_relation,
+            utility_score=max(0.0, min(1.0, utility)),
+            uncertainty=min(1.0, uncertainty),
         )
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
@@ -467,15 +633,31 @@ class OpenAICompatibleProvider(StubProvider):
             kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
         else:
             kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        try:
-            response = self._chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)], **kwargs)
-            content = response.content if isinstance(response.content, str) else "".join(part.get("text", "") for part in response.content)
-            payload = self._parse_json(content)
-            self._trace_remote(stage, "success")
-            return payload
-        except Exception as exc:
-            self._trace_remote(stage, "error", str(exc))
-            raise
+        current_user_prompt = user_prompt
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = self._chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=current_user_prompt)], **kwargs)
+                content = response.content if isinstance(response.content, str) else "".join(part.get("text", "") for part in response.content)
+                if not str(content).strip():
+                    raise ValueError("empty response body")
+                payload = self._parse_json(content)
+                self._trace_remote(stage, "success", f"attempt={attempt + 1}")
+                return payload
+            except Exception as exc:
+                last_exc = exc
+                self._trace_remote(stage, "error", f"attempt={attempt + 1}: {exc}")
+                if attempt == 0 and (self._is_response_parse_error(exc) or "empty response body" in str(exc).lower()):
+                    current_user_prompt = (
+                        f"{user_prompt}\n\n"
+                        "Previous response was not valid JSON. Return exactly one JSON object or JSON array matching the schema. "
+                        "Do not include markdown fences, prose, or explanations outside JSON."
+                    )
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"Remote provider call failed during {stage}: unknown error")
 
     def _chunk(self, items: list, size: int) -> list[list]:
         return [items[i : i + size] for i in range(0, len(items), size)]
@@ -546,6 +728,17 @@ class OpenAICompatibleProvider(StubProvider):
             "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor. "
             "comparison is appropriate for debate or argument corpora when two documents address the same topic from contrasting or alternative positions. "
             "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
+        )
+
+    def _review_instruction(self) -> str:
+        return (
+            "You are an edge reviewer for offline retrieval indexing. Return JSON only. "
+            "You do not start from scratch: you review an existing judge verdict together with local signals. "
+            "Focus on durable retrieval utility, uncertainty, and generic failure modes such as weak direction, "
+            "methodology-only overlap, generic service-surface overlap, and foundational-but-not-actionable support. "
+            "Approve only when the edge is likely to help retrieval across many queries, not just because the pair is topically related. "
+            "If the pair is related but not durable or not useful, set canonical_relation='none'. "
+            "You may keep the original relation, reject it, or replace it with a safer canonical relation."
         )
 
     def _query_strategy_instruction(self) -> str:
@@ -1127,6 +1320,126 @@ class OpenAICompatibleProvider(StubProvider):
                 if candidate.doc_id in verdicts:
                     continue
                 verdicts[candidate.doc_id] = self.judge_relation_with_signals(anchor, candidate, signals)
+        return verdicts
+
+    def review_relation_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> JudgeResult:
+        try:
+            payload = self._invoke_json(
+                self._review_instruction(),
+                "\n".join(
+                    part
+                    for part in [
+                        json.dumps(
+                            {
+                                "task": "Review the judged edge and decide whether it should survive into the offline retrieval graph.",
+                                "anchor": to_jsonable(anchor),
+                                "candidate": to_jsonable(candidate),
+                                "signals": to_jsonable(signals),
+                                "judge_verdict": to_jsonable(verdict),
+                                "output_schema": {
+                                    "accepted": "boolean",
+                                    "canonical_relation": "string",
+                                    "semantic_relation_label": "string",
+                                    "confidence": "float",
+                                    "utility_score": "float",
+                                    "uncertainty": "float",
+                                    "evidence_spans": ["string"],
+                                    "rationale": "string",
+                                    "support_score": "float",
+                                    "contradiction_flags": ["string"],
+                                    "decision_reason": "string",
+                                },
+                            },
+                            ensure_ascii=False,
+                        ),
+                        "Few-shot examples:" if self.review_few_shot_text else "",
+                        self.review_few_shot_text,
+                    ]
+                    if part
+                ),
+                thinking=self.live_reasoning["reviewer"],
+                stage="review_relation",
+            )
+            return self._verdict_from_payload(payload)
+        except Exception as exc:
+            if self._is_content_filter_error(exc):
+                self._trace_remote("review_relation", "blocked_local", candidate.doc_id)
+                return super().review_relation_with_signals(anchor, candidate, signals, verdict)
+            self._handle_remote_failure("review_relation", exc)
+            return super().review_relation_with_signals(anchor, candidate, signals, verdict)
+
+    def review_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals, JudgeResult]]) -> dict[str, JudgeResult]:
+        if not candidates:
+            return {}
+        verdicts: dict[str, JudgeResult] = {}
+        for batch in self._chunk(candidates, 6):
+            try:
+                payload = self._invoke_json(
+                    self._review_instruction(),
+                    "\n".join(
+                        part
+                        for part in [
+                            json.dumps(
+                                {
+                                    "task": "Review each judged edge and return a JSON array.",
+                                    "anchor": to_jsonable(anchor),
+                                    "candidates": [
+                                        {
+                                            "candidate": to_jsonable(candidate),
+                                            "signals": to_jsonable(signals),
+                                            "judge_verdict": to_jsonable(verdict),
+                                        }
+                                        for candidate, signals, verdict in batch
+                                    ],
+                                    "output_schema": [
+                                        {
+                                            "candidate_doc_id": "string",
+                                            "accepted": "boolean",
+                                            "canonical_relation": "string",
+                                            "semantic_relation_label": "string",
+                                            "confidence": "float",
+                                            "utility_score": "float",
+                                            "uncertainty": "float",
+                                            "evidence_spans": ["string"],
+                                            "rationale": "string",
+                                            "support_score": "float",
+                                            "contradiction_flags": ["string"],
+                                            "decision_reason": "string",
+                                        }
+                                    ],
+                                },
+                                ensure_ascii=False,
+                            ),
+                            "Few-shot examples:" if self.review_few_shot_text else "",
+                            self.review_few_shot_text,
+                        ]
+                        if part
+                    ),
+                    thinking=self.live_reasoning["reviewer"],
+                    stage="review_relations_batch",
+                )
+                items = payload if isinstance(payload, list) else payload.get("verdicts", [])
+                for item in items:
+                    candidate_doc_id = str(item.get("candidate_doc_id", ""))
+                    if not candidate_doc_id:
+                        continue
+                    verdicts[candidate_doc_id] = self._verdict_from_payload(item)
+            except Exception as exc:
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc)) and len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    for partial in (batch[:midpoint], batch[midpoint:]):
+                        verdicts.update(self.review_relations_with_signals(anchor, partial))
+                    continue
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                    blocked_ids = ",".join(candidate.doc_id for candidate, _, _ in batch)
+                    status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
+                    self._trace_remote("review_relations_batch", status, blocked_ids)
+                else:
+                    self._handle_remote_failure("review_relations_batch", exc)
+            for candidate, signals, verdict in batch:
+                if candidate.doc_id in verdicts:
+                    continue
+                verdicts[candidate.doc_id] = self.review_relation_with_signals(anchor, candidate, signals, verdict)
         return verdicts
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
