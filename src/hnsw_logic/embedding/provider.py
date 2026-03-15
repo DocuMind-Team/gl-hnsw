@@ -452,6 +452,9 @@ class StubProvider(ProviderBase):
         if reviewed_relation == "implementation_detail" and "weak_direction" in risk_flags and best_fit < 0.72:
             reviewer_accepts = False
             reject_reason = "weak_direction"
+        if reviewed_relation == "same_concept" and {"low_novelty", "excess_novelty"} & risk_flags:
+            reviewer_accepts = False
+            reject_reason = "poor_novelty_bridge"
         if not verdict.accepted and reviewer_accepts:
             reviewer_accepts = best_fit >= 0.56 and signals.utility_score >= 0.38 and not {"service_surface", "foundational_support"} & risk_flags
             if not reviewer_accepts:
