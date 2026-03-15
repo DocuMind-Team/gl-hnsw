@@ -38,7 +38,15 @@ class FakeJudge:
         return self._verdicts[candidate.doc_id]
 
 
-def _brief(doc_id: str, title: str, summary: str, keywords: list[str], entities: list[str] | None = None, relation_hints: list[str] | None = None):
+def _brief(
+    doc_id: str,
+    title: str,
+    summary: str,
+    keywords: list[str],
+    entities: list[str] | None = None,
+    relation_hints: list[str] | None = None,
+    metadata: dict | None = None,
+):
     return DocBrief(
         doc_id=doc_id,
         title=title,
@@ -47,7 +55,7 @@ def _brief(doc_id: str, title: str, summary: str, keywords: list[str], entities:
         entities=entities or [],
         relation_hints=relation_hints or [],
         claims=[summary],
-        metadata={},
+        metadata=metadata or {},
     )
 
 
@@ -209,6 +217,122 @@ def test_local_gate_rejects_topic_drift_or_low_support():
     assert assessment.reject_reason in {"topic_drift", "low_support"}
 
 
+def test_scientific_same_concept_is_allowed_for_live_provider():
+    class ScientificProvider(FakeProvider):
+        def embed_texts(self, texts):
+            rows = []
+            for text in texts:
+                if "IL2RA" in text or "type 1 diabetes" in text.lower():
+                    rows.append(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+                else:
+                    rows.append(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+            return np.vstack(rows)
+
+    provider = type("OpenAICompatibleProvider", (ScientificProvider,), {})()
+    anchor = _brief(
+        "11899391",
+        "IL2RA variation lowers IL-2 signaling",
+        "IL2RA variation lowers IL-2 responsiveness and is associated with type 1 diabetes risk.",
+        ["il2ra", "signaling", "type", "diabetes", "treg"],
+        ["IL2RA", "type 1 diabetes"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "il2ra-diabetes"},
+    )
+    candidate = _brief(
+        "13940200",
+        "IL2RA polymorphism implicates type 1 diabetes",
+        "Fine mapping implicates IL2RA polymorphism in type 1 diabetes susceptibility.",
+        ["il2ra", "polymorphism", "type", "diabetes", "susceptibility"],
+        ["IL2RA", "type 1 diabetes"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "il2ra-diabetes"},
+    )
+    verdicts = {
+        "13940200": JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.86,
+            evidence_spans=[
+                "Both passages describe IL2RA-associated type 1 diabetes susceptibility.",
+                "The candidate restates the same disease-gene association at finer granularity.",
+            ],
+            rationale="The candidate reframes the same IL2RA diabetes association.",
+            support_score=0.72,
+            contradiction_flags=[],
+            decision_reason="Scientific passages describe the same finding family.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "same_concept"
+
+
+def test_scientific_methodology_match_does_not_stay_same_concept():
+    class ScientificProvider(FakeProvider):
+        def embed_texts(self, texts):
+            rows = []
+            for text in texts:
+                lowered = text.lower()
+                if "radioiodine" in lowered or "goitre" in lowered or "goiter" in lowered:
+                    rows.append(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+                else:
+                    rows.append(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+            return np.vstack(rows)
+
+    provider = type("OpenAICompatibleProvider", (ScientificProvider,), {})()
+    anchor = _brief(
+        "43122426",
+        "131-I radioiodine therapy for hyperthyroidism in patients with Graves' disease, uninodular goitre and multinodular goitre",
+        "Radioiodine therapy reduces thyroid volume for multinodular goitre and compares outcomes across thyroid disease cohorts.",
+        ["radioiodine", "therapy", "multinodular", "goitre", "thyroid", "volume"],
+        ["radioiodine therapy", "multinodular goitre"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "radioiodine-goitre"},
+    )
+    methodology_candidate = _brief(
+        "26026009",
+        "Magnetic resonance imaging for volume estimation of large multinodular goitres: a comparison with scintigraphy",
+        "Magnetic resonance imaging estimates goitre volume and compares the measurement with scintigraphy.",
+        ["magnetic", "resonance", "imaging", "volume", "estimation", "multinodular", "goitres"],
+        ["goitre imaging", "volume estimation"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "radioiodine-goitre"},
+    )
+    verdicts = {
+        "26026009": JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.84,
+            evidence_spans=[
+                "Both documents discuss multinodular goitre and thyroid volume.",
+                "The candidate focuses on imaging-based volume estimation rather than the primary treatment effect.",
+            ],
+            rationale="The documents are related by the same disease setting.",
+            support_score=0.7,
+            contradiction_flags=[],
+            decision_reason="Shared disease topic suggested a same-concept relation.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [methodology_candidate])[0]
+    assert not (assessment.accepted and assessment.relation_type == "same_concept")
+
+
 def test_semantic_detail_bridge_accepts_high_dense_mechanism_pair():
     class SemanticProvider(FakeProvider):
         def embed_texts(self, texts):
@@ -261,6 +385,363 @@ def test_semantic_detail_bridge_accepts_high_dense_mechanism_pair():
     assert assessment.accepted is True
     assert assessment.relation_type == "implementation_detail"
     assert assessment.edge is not None
+
+
+def test_agent_overview_keeps_memory_edge_as_second_result():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-11",
+        "DeepAgents Overview",
+        "Overview of DeepAgents with subagents, persistent memory, and retrieval workflows.",
+        ["deepagents", "overview", "subagents", "memory", "retrieval"],
+        ["deepagents"],
+        ["overview", "persistent", "memory"],
+    )
+    subagents = _brief(
+        "doc-12",
+        "Subagents",
+        "Subagents isolate context for profiler, scout, judge, and curator roles.",
+        ["subagents", "profiler", "scout", "judge", "curator"],
+        ["subagents"],
+        ["roles", "context"],
+    )
+    memory = _brief(
+        "doc-14",
+        "Persistent Memory Backend",
+        "Persistent memory stores anchor memories and semantic patterns for the runtime.",
+        ["persistent", "memory", "anchor", "semantic", "runtime"],
+        ["memory"],
+        ["persistent", "backend"],
+    )
+    verdicts = {
+        "doc-12": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.95,
+            evidence_spans=["The overview covers subagents.", "Subagents isolate context for profiler, scout, judge, and curator roles."],
+            rationale="Subagents are a concrete mechanism covered by the overview.",
+            support_score=0.88,
+            contradiction_flags=[],
+            decision_reason="Strong component overlap.",
+        ),
+        "doc-14": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.84,
+            evidence_spans=["The overview covers persistent memory.", "Persistent memory stores anchor memories and semantic patterns for the runtime."],
+            rationale="Persistent memory is another concrete subsystem covered by the overview.",
+            support_score=0.7,
+            contradiction_flags=[],
+            decision_reason="Strong subsystem overlap.",
+        ),
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessments = orchestrator.judge_many_with_diagnostics(anchor, [subagents, memory])
+    accepted_ids = [item.candidate_doc_id for item in assessments if item.accepted]
+
+    assert accepted_ids == ["doc-12", "doc-14"]
+
+
+def test_scientific_risk_docs_receive_higher_discovery_priority():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    rich = _brief(
+        "risk-rich",
+        "Global disease burden from metabolic risk",
+        "A population health study measures chronic disease burden from dietary and metabolic risks.",
+        ["population", "health", "risk", "nutrition", "metabolic", "disease"],
+        ["chronic disease"],
+        ["claim", "study", "population risk", "chronic disease burden", "nutrition"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    plain = _brief(
+        "risk-plain",
+        "Generic findings",
+        "A study reports generic findings without explicit bridge hints.",
+        ["study", "finding"],
+        ["finding"],
+        ["study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+
+    assert orchestrator.discovery_anchor_priority(rich) > orchestrator.discovery_anchor_priority(plain)
+
+
+def test_scientific_hub_anchor_selection_keeps_central_docs():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    hub_a = _brief(
+        "25516011",
+        "Purification and characterization of mouse hematopoietic stem cells",
+        "Hematopoietic stem cells are purified and characterized across stem cell assays.",
+        ["hematopoietic", "stem", "cells", "assays", "purification"],
+        ["hematopoietic stem cells"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    hub_b = _brief(
+        "13116880",
+        "Hematopoietic stem cell self-renewal versus differentiation",
+        "Self-renewal and differentiation define hematopoietic stem cell behavior.",
+        ["hematopoietic", "stem", "cell", "self-renewal", "differentiation"],
+        ["hematopoietic stem cells"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    niche = _brief(
+        "5415832",
+        "Normal and leukemic stem cell niches",
+        "Stem cell niches shape hematopoietic stem cell behavior and therapy.",
+        ["stem", "cell", "niche", "hematopoietic", "therapy"],
+        ["stem cell niche"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    niche_detail = _brief(
+        "3391547",
+        "Bone marrow microenvironment in disease pathogenesis",
+        "Bone marrow microenvironment shapes hematopoietic disease and stem cell maintenance.",
+        ["bone", "marrow", "microenvironment", "stem", "cell", "hematopoietic"],
+        ["bone marrow microenvironment"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    outlier_a = _brief(
+        "doc-x",
+        "Fruit fly lifespan extension by rapamycin",
+        "Rapamycin extends lifespan in drosophila.",
+        ["rapamycin", "lifespan", "drosophila"],
+        ["rapamycin"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    outlier_b = _brief(
+        "doc-y",
+        "Radioiodine treatment of multinodular non-toxic goitre",
+        "Radioiodine treatment reduces thyroid volume for multinodular goitre.",
+        ["radioiodine", "treatment", "goitre", "thyroid", "volume"],
+        ["multinodular goitre"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+
+    selected = orchestrator._select_dataset_hub_anchors([hub_a, hub_b, niche, niche_detail, outlier_a, outlier_b], cap=2)
+    assert "25516011" in selected or "13116880" in selected
+
+
+def test_scientific_candidate_metrics_normalize_plural_title_overlap():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "11141995",
+        "Organization of the mitotic chromosome",
+        "Mitotic chromosome organization remains unresolved.",
+        ["mitotic", "chromosome", "organization"],
+        ["chromosome"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+    candidate = _brief(
+        "4381486",
+        "Haematopoietic stem cells do not asymmetrically segregate chromosomes or retain BrdU",
+        "Hematopoietic stem cells do not asymmetrically segregate chromosomes.",
+        ["stem", "cells", "segregate", "chromosomes"],
+        ["hematopoietic stem cells"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims"},
+    )
+
+    metrics = orchestrator._candidate_metrics(anchor, candidate)
+    assert metrics["title_overlap"] >= 1.0
+
+
+def test_logic_graph_can_fallback_to_retrieval_supporting_evidence():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "doc-07": JudgeResult(
+                    accepted=False,
+                    relation_type="comparison",
+                    confidence=0.41,
+                    evidence_spans=[],
+                    rationale="Shared retrieval context only.",
+                    support_score=0.2,
+                    contradiction_flags=[],
+                    decision_reason="Model abstained on directionality.",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "doc-08",
+        "Logic Overlay Graph",
+        "The logic overlay graph adds one-hop logical expansion after HNSW recall.",
+        ["logic", "overlay", "graph", "hnsw", "jump", "policy"],
+        ["graph"],
+        ["one-hop", "expansion"],
+    )
+    candidate = _brief(
+        "doc-07",
+        "Hybrid Retrieval",
+        "Hybrid retrieval uses the logic overlay graph as a sidecar after initial HNSW recall.",
+        ["hybrid", "retrieval", "logic", "overlay", "graph", "hnsw"],
+        ["hybrid retrieval"],
+        ["sidecar", "recall"],
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is True
+    assert assessment.relation_type == "supporting_evidence"
+
+
+def test_evaluation_docs_can_attempt_discovery():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    brief = _brief(
+        "doc-05",
+        "ANN Benchmark Metrics",
+        "This report summarizes ANN recall, MRR, and NDCG metrics for benchmark reporting.",
+        ["ann", "benchmark", "recall", "mrr", "ndcg", "reporting"],
+        ["ann"],
+        ["metrics", "reporting"],
+        {"topic": "evaluation"},
+    )
+
+    assert orchestrator.should_attempt_discovery(brief) is True
+
+
+def test_evaluation_metrics_prefer_reporting_component():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "doc-24": JudgeResult(
+                    accepted=False,
+                    relation_type="comparison",
+                    confidence=0.42,
+                    evidence_spans=[],
+                    rationale="Shared evaluation context only.",
+                    support_score=0.2,
+                    contradiction_flags=[],
+                    decision_reason="Model abstained.",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "doc-05",
+        "ANN Metrics",
+        "This report summarizes ANN recall, MRR, and NDCG metrics for benchmark reporting.",
+        ["ann", "benchmark", "recall", "mrr", "ndcg", "reporting"],
+        ["ann"],
+        ["metrics", "reporting"],
+        {"topic": "evaluation"},
+    )
+    candidate = _brief(
+        "doc-24",
+        "Benchmark Reporting",
+        "Benchmark reporting specifies Recall at 5, MRR at 10, NDCG at 10, edge precision, and query latency.",
+        ["benchmark", "reporting", "recall", "mrr", "ndcg", "latency"],
+        ["benchmark reporting"],
+        ["reporting", "include", "metrics"],
+        {"topic": "evaluation"},
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
+
+
+def test_evaluation_metrics_reject_retrieval_overview_detail():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "doc-07": JudgeResult(
+                    accepted=True,
+                    relation_type="implementation_detail",
+                    confidence=0.9,
+                    evidence_spans=["Benchmarks compare against hybrid retrieval.", "Hybrid retrieval merges dense and logic scores."],
+                    rationale="Shared benchmark and retrieval context.",
+                    support_score=0.7,
+                    contradiction_flags=[],
+                    decision_reason="Overly broad implementation guess.",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "doc-05",
+        "ANN Metrics",
+        "This report summarizes ANN recall, MRR, and NDCG metrics for benchmark reporting.",
+        ["ann", "benchmark", "recall", "mrr", "ndcg", "reporting"],
+        ["ann"],
+        ["metrics", "reporting"],
+        {"topic": "evaluation"},
+    )
+    candidate = _brief(
+        "doc-07",
+        "Hybrid Retrieval",
+        "Hybrid retrieval combines geometric and logical scores.",
+        ["hybrid", "retrieval", "logic", "scores"],
+        ["hybrid retrieval"],
+        ["hybrid", "logic"],
+        {"topic": "retrieval"},
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is False
+    assert assessment.reject_reason == "wrong_relation_type"
 
 
 def test_directionality_rejects_reverse_implementation_pair():
@@ -972,7 +1453,7 @@ def test_supporting_evidence_rejects_foundational_similarity_candidate():
         "Cosine Similarity",
         "Cosine similarity is a standard metric for vector retrieval and relevance scoring.",
         ["cosine", "similarity", "metric", "retrieval", "relevance"],
-        relation_hints=["vector retrieval", "relevance scoring"],
+        relation_hints=["vector retrieval", "relevance scoring", "hybrid retrieval", "logic overlay"],
     )
     candidate.metadata["topic"] = "retrieval"
     verdicts = {
@@ -998,6 +1479,166 @@ def test_supporting_evidence_rejects_foundational_similarity_candidate():
     assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
     assert assessment.accepted is False
     assert assessment.reject_reason == "wrong_relation_type"
+
+
+def test_ops_registry_stage_bridge_accepts_shared_registry_implementation_detail():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-20",
+        "Jobs and Workers",
+        "Offline build, profiling, discovery, and revalidation tasks run as background jobs with a lightweight worker pool and SQLite registry.",
+        ["jobs", "workers", "background", "build", "discovery", "sqlite", "registry"],
+        ["jobs", "sqlite registry"],
+        ["background jobs", "sqlite registry"],
+        {"topic": "ops"},
+    )
+    candidate = _brief(
+        "doc-22",
+        "SQLite Job Registry",
+        "A SQLite job registry stores job ID, type, state, payload, timestamps, and recent messages as a simple queue replacement.",
+        ["sqlite", "job", "registry", "payload", "timestamps", "messages"],
+        ["sqlite registry"],
+        ["queue replacement", "job inspection"],
+        {"topic": "ops"},
+    )
+    verdicts = {
+        "doc-22": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.88,
+            evidence_spans=[
+                "Background jobs use a SQLite registry.",
+                "The SQLite job registry stores job state and payload for the worker system.",
+            ],
+            rationale="The registry is the concrete persistence layer used by background jobs.",
+            support_score=0.74,
+            contradiction_flags=[],
+            decision_reason="Shared registry mechanism is explicit.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
+
+
+def test_ops_service_registry_fallback_overrides_contradiction_flag():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-21",
+        "FastAPI Service",
+        "Describes a FastAPI service exposing endpoints for build, search, revalidation, health checks, and job inspection, with synchronous search and scheduled build tasks.",
+        ["public service", "synchronous search", "job registry", "health checks", "fastapi", "service", "build", "search", "checks", "describes"],
+        ["FastAPI service", "build endpoints", "search", "job inspection", "sqlite registry"],
+        ["Uses SQLite Job Registry for task scheduling.", "Provides interface for Jobs and Workers tasks.", "build", "search", "endpoints", "exposes", "ops", "service"],
+        {"topic": "ops"},
+    )
+    candidate = _brief(
+        "doc-22",
+        "SQLite Job Registry",
+        "Explains a SQLite job registry storing job ID, type, state, payload, timestamps, and messages as a simple queue replacement for single-node deployment.",
+        ["payload", "timestamps", "recent messages", "single-node deployment", "registry", "sqlite", "deployment", "explains", "messages", "queue"],
+        ["SQLite job registry", "job id", "job type", "job state", "sqlite registry"],
+        ["Directly used by Jobs and Workers for task management.", "Supports FastAPI Service job inspection endpoints.", "queue", "registry", "replacement", "simple", "ops"],
+        {"topic": "ops"},
+    )
+    verdicts = {
+        "doc-22": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.9,
+            evidence_spans=[
+                "The service schedules expensive tasks through the job registry.",
+                "The SQLite job registry stores job state and payload.",
+            ],
+            rationale="The registry is the concrete persistence layer for service-triggered jobs.",
+            support_score=0.78,
+            contradiction_flags=["surface_overlap"],
+            decision_reason="Shared surfaces create mild ambiguity.",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "implementation_detail"
+
+
+def test_logic_graph_keeps_detail_and_support_pair():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    anchor = _brief(
+        "doc-08",
+        "Logic Overlay Graph",
+        "Logic overlay graph stores offline-discovered document relations as a sidecar to HNSW, used after initial recall for enhanced retrieval.",
+        ["logic overlay", "document relations", "sidecar graph", "initial recall", "graph", "logic", "overlay", "after", "document", "enhanced"],
+        ["Logic Overlay Graph", "Document Relations", "Sidecar Graph", "logic graph"],
+        ["Connects to doc-06 (cosine), doc-07 (hybrid retrieval)", "graph", "acts", "after", "document-to-document", "logic", "recall"],
+        {"topic": "logic"},
+    )
+    policy = _brief(
+        "doc-09",
+        "Jump Policy",
+        "Explains the jump policy for one-hop logical expansion, gating by confidence, edge-card cosine, and target relevance.",
+        ["one-hop expansion", "confidence", "edge-card cosine", "target relevance", "jump", "policy", "confidence", "edge-card", "gating", "explains"],
+        ["Jump Policy", "Confidence", "Target Relevance"],
+        ["Connects to doc-08 (graph), doc-10 (fusion)", "doc-08", "doc-10", "gating", "jump", "logic", "policy"],
+        {"topic": "logic"},
+    )
+    overview = _brief(
+        "doc-07",
+        "Hybrid Retrieval",
+        "Describes hybrid retrieval combining HNSW geometric recall with one-hop logical expansion from a sidecar graph, then ranking merged candidates.",
+        ["hybrid retrieval", "HNSW recall", "logic expansion", "candidate fusion", "hybrid", "retrieval", "hnsw", "logic", "overview", "describes"],
+        ["Hybrid Retrieval", "HNSW", "logic graph"],
+        ["Builds on doc-08 graph and doc-10 fusion", "builds", "candidate", "doc-08", "doc-10", "logic", "retrieval", "sidecar"],
+        {"topic": "retrieval"},
+    )
+    verdicts = {
+        "doc-09": JudgeResult(
+            accepted=True,
+            relation_type="implementation_detail",
+            confidence=0.93,
+            evidence_spans=["The jump policy gates one-hop expansion.", "The logic graph is queried through jump-policy gates."],
+            rationale="Policy is the concrete gating mechanism used by the logic graph.",
+            support_score=0.86,
+            contradiction_flags=[],
+            decision_reason="Mechanism relation is explicit.",
+        ),
+        "doc-07": JudgeResult(
+            accepted=True,
+            relation_type="supporting_evidence",
+            confidence=0.88,
+            evidence_spans=["Hybrid retrieval consumes logic-graph expansions.", "The logic graph provides one-hop logical candidates after recall."],
+            rationale="The overview depends on the logic graph for logical expansion.",
+            support_score=0.7,
+            contradiction_flags=[],
+            decision_reason="Downstream overview is supported by the graph layer.",
+        ),
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+
+    assessments = orchestrator.judge_many_with_diagnostics(anchor, [policy, overview])
+    accepted = [item.candidate_doc_id for item in assessments if item.accepted]
+    assert accepted == ["doc-09", "doc-07"]
 
 
 def test_parse_json_tolerates_fenced_json():

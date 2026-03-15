@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -26,6 +27,16 @@ FOUNDATIONAL_TERMS = {"similarity", "metric", "metrics", "benchmark", "heuristic
 HIGH_SPECIFICITY_TITLE_TERMS = {"fusion", "policy", "registry", "backend", "profiler", "scout", "judge", "curator", "revalidation"}
 MEDIUM_SPECIFICITY_TITLE_TERMS = {"subagents", "memory", "workers", "jobs"}
 LOW_SPECIFICITY_TITLE_TERMS = {"retrieval", "graph", "overview", "service", "metrics", "reporting", "dataset", "similarity", "layers", "parameters", "path"}
+METHOD_TITLE_TERMS = {
+    "comparison", "comparative", "dosimetry", "estimate", "estimates", "estimating", "imaging",
+    "measurement", "measurements", "method", "methods", "protocol", "protocols", "review", "reviews",
+    "risk", "risks", "volume",
+}
+OUTCOME_TITLE_TERMS = {
+    "association", "associated", "benefit", "benefits", "decrease", "decreases", "effect", "effects",
+    "efficacy", "improve", "improves", "outcome", "outcomes", "reduce", "reduces", "response",
+    "responses", "risk", "risks", "therapy", "therapies", "treatment", "treatments",
+}
 CONTENT_STOPWORDS = {
     "this", "that", "with", "from", "into", "through", "used", "using", "only", "when", "then", "than",
     "their", "there", "about", "project", "system", "document", "documents", "candidate", "candidates",
@@ -54,6 +65,16 @@ DISCOVERY_TERMS = {
 }
 ARGUMENT_STAGE_TOKENS = {"argument", "debate", "claim", "claims", "position", "positions", "policy", "counterargument"}
 ARGUMENT_COMPARISON_CUES = {"argument", "debate", "contrast", "versus", "vs", "counter", "counterargument", "opposing", "alternative", "position"}
+EVAL_METRIC_STAGE_TOKENS = {"ann", "metric", "metrics", "recall", "mrr", "ndcg", "latency", "benchmark", "benchmarking"}
+EVAL_REPORT_STAGE_TOKENS = {"report", "reporting", "compare", "comparison", "edge", "precision", "include", "includes"}
+SCIENTIFIC_BRIDGE_TERMS = {
+    "claim", "evidence", "study", "nutrition", "diet", "dietary", "metabolic", "risk", "risks",
+    "burden", "mortality", "exposure", "disease", "diseases", "health", "population", "susceptibility",
+}
+CLINICAL_BRIDGE_TERMS = {
+    "clinical", "condition", "treatment", "therapy", "diagnosis", "symptom", "patient", "patients",
+    "disease", "risk", "metabolic", "nutrition", "outcome", "outcomes",
+}
 
 
 @dataclass(slots=True)
@@ -141,6 +162,65 @@ class LogicOrchestrator:
         }
         return {token for token in tokens if len(token) > 3 and token not in CONTENT_STOPWORDS}
 
+    def _normalize_token(self, token: str) -> str:
+        if len(token) <= 4:
+            return token
+        if token.endswith("ies") and len(token) > 5:
+            return token[:-3] + "y"
+        if token.endswith("s") and not token.endswith("ss"):
+            return token[:-1]
+        return token
+
+    def _normalized_tokens(self, tokens: set[str]) -> set[str]:
+        return {self._normalize_token(token) for token in tokens}
+
+    def _dataset_edge_signal(self, brief: DocBrief) -> float:
+        source_dataset = self._source_dataset(brief)
+        content_terms = self._content_terms(brief)
+        hint_terms = {token for token in tokenize(" ".join(brief.keywords + brief.relation_hints + brief.entities)) if len(token) > 2}
+        terms = content_terms | hint_terms
+        if source_dataset == "scifact":
+            return min(len(terms & SCIENTIFIC_BRIDGE_TERMS) / 4.0, 1.0)
+        if source_dataset == "nfcorpus":
+            return min(len(terms & CLINICAL_BRIDGE_TERMS) / 4.0, 1.0)
+        if source_dataset == "arguana":
+            score = 0.0
+            if self._topic_cluster(brief):
+                score += 0.5
+            if self._stance(brief):
+                score += 0.3
+            if content_terms & ARGUMENT_COMPARISON_CUES:
+                score += 0.2
+            return min(score, 1.0)
+        return 0.0
+
+    def _same_concept_methodology_penalty(self, anchor: DocBrief, candidate: DocBrief) -> float:
+        source_dataset = self._source_dataset(anchor)
+        if source_dataset not in {"scifact", "nfcorpus"} or self._source_dataset(candidate) != source_dataset:
+            return 0.0
+        anchor_stage = self._doc_stage(anchor)
+        if anchor_stage not in {"scientific_evidence", "clinical_passage"} or self._doc_stage(candidate) != anchor_stage:
+            return 0.0
+        anchor_title_tokens = {token for token in tokenize(anchor.title) if len(token) > 2}
+        candidate_title_tokens = {token for token in tokenize(candidate.title) if len(token) > 2}
+        candidate_method_terms = candidate_title_tokens & METHOD_TITLE_TERMS
+        if not candidate_method_terms:
+            return 0.0
+        anchor_method_terms = anchor_title_tokens & METHOD_TITLE_TERMS
+        anchor_outcome_terms = anchor_title_tokens & OUTCOME_TITLE_TERMS
+        candidate_outcome_terms = candidate_title_tokens & OUTCOME_TITLE_TERMS
+        shared_focus = len((anchor_title_tokens - METHOD_TITLE_TERMS) & (candidate_title_tokens - METHOD_TITLE_TERMS))
+        penalty = 0.0
+        if candidate_method_terms - anchor_method_terms:
+            penalty += 0.38
+        if not candidate_outcome_terms:
+            penalty += 0.18
+        if anchor_outcome_terms and not (anchor_outcome_terms & candidate_outcome_terms):
+            penalty += 0.12
+        if shared_focus <= 1:
+            penalty += 0.12
+        return min(penalty, 0.8)
+
     def _family_bridge_score(self, anchor_terms: set[str], candidate_terms: set[str]) -> float:
         best = 0.0
         for _, family in DETAIL_FAMILIES:
@@ -213,6 +293,13 @@ class LogicOrchestrator:
             return "scientific_evidence"
         if source_dataset == "nfcorpus" or topic == "clinical_retrieval":
             return "clinical_passage"
+        if topic == "evaluation":
+            metric_hits = len(content_terms & EVAL_METRIC_STAGE_TOKENS) + (2 if title_tokens & {"ann", "metric", "metrics"} else 0)
+            report_hits = len(content_terms & EVAL_REPORT_STAGE_TOKENS) + (2 if title_tokens & {"report", "reporting"} else 0)
+            if metric_hits >= max(2, report_hits):
+                return "eval_metrics"
+            if report_hits >= 2:
+                return "eval_report"
 
         if title_tokens & {"overlay", "graph"}:
             return "logic_graph"
@@ -264,6 +351,11 @@ class LogicOrchestrator:
                 return "ops_revalidation"
             if len(content_terms & OVERVIEW_STAGE_TOKENS) >= 2:
                 return "ops_overview"
+        if topic == "evaluation":
+            if len(content_terms & EVAL_METRIC_STAGE_TOKENS) >= max(2, len(content_terms & EVAL_REPORT_STAGE_TOKENS)):
+                return "eval_metrics"
+            if len(content_terms & EVAL_REPORT_STAGE_TOKENS) >= 2:
+                return "eval_report"
         return ""
 
     def _relation_stage_bonus(self, anchor: DocBrief, candidate: DocBrief, relation_type: str, metrics: dict[str, float]) -> float:
@@ -279,6 +371,7 @@ class LogicOrchestrator:
                 ("agent_overview", "agent_memory"): 0.28,
                 ("ops_overview", "ops_registry"): 0.32,
                 ("ops_service", "ops_registry"): 0.28,
+                ("eval_metrics", "eval_report"): 0.26,
             }
             negative = {
                 ("logic_fusion", "retrieval_overview"): -0.3,
@@ -288,6 +381,7 @@ class LogicOrchestrator:
                 ("ops_registry", "ops_overview"): -0.34,
                 ("ops_registry", "ops_service"): -0.28,
                 ("ops_service", "ops_overview"): -0.32,
+                ("eval_report", "eval_metrics"): -0.26,
             }
             bonus = positive.get(pair, negative.get(pair, 0.0))
             if bonus == 0.0:
@@ -299,6 +393,8 @@ class LogicOrchestrator:
             positive = {
                 ("logic_graph", "retrieval_overview"): 0.28,
                 ("logic_policy", "logic_fusion"): 0.3,
+                ("scientific_evidence", "scientific_evidence"): 0.18,
+                ("clinical_passage", "clinical_passage"): 0.16,
             }
             negative = {
                 ("retrieval_overview", "logic_graph"): -0.28,
@@ -321,6 +417,11 @@ class LogicOrchestrator:
                 bonus = 0.24 if metrics.get("stance_contrast", 0.0) >= 1.0 else 0.12
             elif pair == ("scientific_evidence", "scientific_evidence"):
                 bonus = 0.08
+        elif relation_type == "same_concept":
+            if pair == ("scientific_evidence", "scientific_evidence"):
+                bonus = 0.14
+            elif pair == ("clinical_passage", "clinical_passage"):
+                bonus = 0.12
         return bonus
 
     def _relation_fit_scores(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> dict[str, float]:
@@ -331,6 +432,7 @@ class LogicOrchestrator:
         detail_cue_score = min(len(cue_terms & DETAIL_CUES) / 5.0, 1.0)
         support_cue_score = min(len(cue_terms & SUPPORT_CUES) / 4.0, 1.0)
         comparison_cue_score = min(len(cue_terms & ARGUMENT_COMPARISON_CUES) / 5.0, 1.0)
+        methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
 
         implementation_detail = (
             0.32 * metrics["dense_score"]
@@ -386,7 +488,9 @@ class LogicOrchestrator:
             + 0.16 * metrics["mention_score"]
             + 0.16 * metrics["topic_alignment"]
             + 0.12 * metrics["topic_cluster_match"]
+            + max(self._relation_stage_bonus(anchor, candidate, "same_concept", metrics), 0.0)
             - 0.16 * metrics["stance_contrast"]
+            - 0.22 * methodology_penalty
         )
         return {
             "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
@@ -397,6 +501,8 @@ class LogicOrchestrator:
         }
 
     def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
+        stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
+        methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
         score = (
             0.28 * metrics["dense_score"]
             + 0.22 * metrics["local_support"]
@@ -407,13 +513,23 @@ class LogicOrchestrator:
             + 0.08 * metrics["topic_alignment"]
             + max(self._relation_stage_bonus(anchor, candidate, relation_type, metrics), 0.0) * 0.1
         )
-        score -= 0.16 * metrics["service_surface_score"]
+        if relation_type == "implementation_detail" and stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}:
+            score += 0.1 * metrics["family_bridge_score"] + 0.05 * metrics["topic_alignment"]
+            score -= 0.04 * metrics["service_surface_score"]
+        else:
+            score -= 0.16 * metrics["service_surface_score"]
         if metrics["topic_drift"] >= 1.0:
             score -= 0.24
         if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
             score -= 0.22
+        if relation_type == "supporting_evidence" and stage_pair == ("logic_graph", "retrieval_overview"):
+            score += 0.1 * metrics["family_bridge_score"] + 0.04 * metrics["topic_alignment"]
         if relation_type == "comparison":
             score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
+        if relation_type == "same_concept":
+            score -= 0.3 * methodology_penalty
+        if relation_type == "supporting_evidence" and methodology_penalty > 0.0:
+            score += 0.06 * methodology_penalty
         return max(0.0, min(score, 1.0))
 
     def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
@@ -429,6 +545,8 @@ class LogicOrchestrator:
             risk_flags.append("weak_direction")
         if relation_type == "comparison" and metrics["topic_cluster_match"] < 1.0:
             risk_flags.append("weak_topic_match")
+        if relation_type == "same_concept" and self._same_concept_methodology_penalty(anchor, candidate) >= 0.45:
+            risk_flags.append("methodology_gap")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -454,7 +572,7 @@ class LogicOrchestrator:
 
     def _is_foundational_candidate(self, candidate: DocBrief) -> bool:
         title_tokens = set(tokenize(candidate.title))
-        content_terms = self._content_terms(candidate)
+        content_terms = set(tokenize(" ".join([candidate.title, candidate.summary, *candidate.claims, *candidate.keywords])))
         topic = str(candidate.metadata.get("topic", "")).lower()
         return (
             topic == "retrieval"
@@ -485,6 +603,27 @@ class LogicOrchestrator:
             fit_scores["supporting_evidence"] >= 0.28
             and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
             and not self._is_foundational_candidate(candidate)
+        ):
+            return True
+        if (
+            self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
+            and self._doc_stage(candidate) == self._doc_stage(anchor)
+            and (
+                (
+                    fit_scores["supporting_evidence"] >= 0.4
+                    and metrics["topic_alignment"] >= 1.0
+                    and (metrics["content_overlap_score"] >= 0.14 or metrics["dense_score"] >= 0.58)
+                )
+                or (
+                    fit_scores["same_concept"] >= 0.46
+                    and (
+                        metrics["topic_cluster_match"] >= 1.0
+                        or metrics["topic_alignment"] >= 1.0
+                        or metrics["content_overlap_score"] >= 0.18
+                    )
+                    and metrics["dense_score"] >= 0.56
+                )
+            )
         ):
             return True
         if (
@@ -544,6 +683,23 @@ class LogicOrchestrator:
                         ),
                     )
                 )
+            if (
+                anchor_stage == "logic_graph"
+                and self._doc_stage(candidate) == "logic_policy"
+                and fit_scores["implementation_detail"] >= 0.72
+                and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+            ):
+                proposals.append(
+                    (
+                        score + 0.14,
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted logic graph to policy implementation candidate",
+                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
+                            score_hint=min(score + 0.14, 0.99),
+                        ),
+                    )
+                )
             if anchor_stage == "agent_overview" and fit_scores["implementation_detail"] >= 0.78 and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22:
                 proposals.append(
                     (
@@ -573,6 +729,48 @@ class LogicOrchestrator:
                         ),
                     )
                 )
+            if (
+                anchor_stage in {"scientific_evidence", "clinical_passage"}
+                and self._doc_stage(candidate) == anchor_stage
+                and fit_scores["supporting_evidence"] >= 0.42
+                and metrics["topic_alignment"] >= 1.0
+                and (metrics["content_overlap_score"] >= 0.14 or metrics["dense_score"] >= 0.58)
+            ):
+                proposals.append(
+                    (
+                        score + 0.16 + 0.06 * metrics["topic_cluster_match"],
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted scientific/clinical supporting evidence candidate",
+                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
+                            score_hint=min(score + 0.16, 0.99),
+                        ),
+                    )
+                )
+            if (
+                anchor_stage in {"scientific_evidence", "clinical_passage"}
+                and self._doc_stage(candidate) == anchor_stage
+                and fit_scores["same_concept"] >= 0.62
+                and (
+                    metrics["topic_cluster_match"] >= 1.0
+                    or metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.22
+                )
+                and metrics["dense_score"] >= 0.62
+            ):
+                bridge_bonus = 0.14 + 0.08 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate))
+                bridge_bonus *= max(0.6, 1.0 - 0.35 * self._same_concept_methodology_penalty(anchor, candidate))
+                proposals.append(
+                    (
+                        score + bridge_bonus,
+                        CandidateProposal(
+                            doc_id=candidate.doc_id,
+                            reason="targeted scientific/clinical same-concept candidate",
+                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
+                            score_hint=min(score + bridge_bonus, 0.99),
+                        ),
+                    )
+                )
         proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
         dedup: dict[str, tuple[float, CandidateProposal]] = {}
         for score, proposal in proposals:
@@ -586,6 +784,8 @@ class LogicOrchestrator:
         stage = self._doc_stage(anchor)
         if stage == "argument_claim":
             return {"comparison": min(limit, 4), "same_concept": min(limit, 2), "supporting_evidence": min(limit, 1)}
+        if stage in {"scientific_evidence", "clinical_passage"}:
+            return {"supporting_evidence": min(limit, 3), "same_concept": min(limit, 2), "implementation_detail": min(limit, 1)}
         if stage == "agent_roles":
             return {"prerequisite": min(limit, 4), "implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 1)}
         if stage in {"logic_graph", "retrieval_overview", "ops_overview", "ops_service", "agent_overview"}:
@@ -662,12 +862,15 @@ class LogicOrchestrator:
     def _candidate_metrics(self, anchor: DocBrief, candidate: DocBrief) -> dict[str, float]:
         anchor_terms = self._brief_terms(anchor)
         candidate_terms = self._brief_terms(candidate)
-        anchor_content_terms = self._content_terms(anchor)
-        candidate_content_terms = self._content_terms(candidate)
+        anchor_content_terms = self._normalized_tokens(self._content_terms(anchor))
+        candidate_content_terms = self._normalized_tokens(self._content_terms(candidate))
         keyword_overlap = len(set(anchor.keywords) & set(candidate.keywords))
         entity_overlap = len(set(anchor.entities) & set(candidate.entities))
         hint_overlap = len(set(anchor.relation_hints) & set(candidate.relation_hints))
-        title_overlap = len(set(tokenize(anchor.title)) & set(tokenize(candidate.title)))
+        title_overlap = len(
+            self._normalized_tokens(set(tokenize(anchor.title)))
+            & self._normalized_tokens(set(tokenize(candidate.title)))
+        )
         overlap_score = min((keyword_overlap + entity_overlap + hint_overlap + title_overlap) / 5.0, 1.0)
         content_overlap = len(anchor_content_terms & candidate_content_terms)
         content_overlap_score = min(content_overlap / 6.0, 1.0)
@@ -772,6 +975,7 @@ class LogicOrchestrator:
         relation_type = result.relation_type
         if relation_type == "implementation_detail":
             direction_score = self._implementation_direction_score(anchor, candidate, metrics)
+            stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
             semantic_detail_bridge = (
                 metrics["dense_score"] >= 0.68
                 and metrics["service_surface_score"] < 0.55
@@ -786,11 +990,24 @@ class LogicOrchestrator:
             )
             stage_detail_bridge = (
                 self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-                and metrics["service_surface_score"] < 0.55
                 and (
-                    metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.14
-                    or metrics["mention_score"] >= 0.16
+                    (
+                        metrics["service_surface_score"] < 0.55
+                        and (
+                            metrics["topic_alignment"] >= 1.0
+                            or metrics["content_overlap_score"] >= 0.14
+                            or metrics["mention_score"] >= 0.16
+                        )
+                    )
+                    or (
+                        stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
+                        and metrics["family_bridge_score"] >= 0.9
+                        and (
+                            metrics["topic_alignment"] >= 1.0
+                            or metrics["content_overlap_score"] >= 0.2
+                            or metrics["mention_score"] >= 0.08
+                        )
+                    )
                 )
             )
             return (
@@ -810,6 +1027,17 @@ class LogicOrchestrator:
                     or metrics["topic_alignment"] >= 1.0
                 )
             )
+            scientific_supported = (
+                self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
+                and self._doc_stage(candidate) == self._doc_stage(anchor)
+                and metrics["service_surface_score"] < 0.45
+                and metrics["dense_score"] >= 0.52
+                and (
+                    metrics["topic_cluster_match"] >= 1.0
+                    or metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.14
+                )
+            )
             return (
                 metrics["service_surface_score"] < 0.35
                 and metrics["dense_score"] >= 0.58
@@ -818,7 +1046,7 @@ class LogicOrchestrator:
                     or metrics["content_overlap_score"] >= 0.18
                     or metrics["family_bridge_score"] >= 0.42
                 )
-            ) or stage_supported
+            ) or stage_supported or scientific_supported
         if relation_type == "prerequisite":
             return metrics["specific_role_score"] >= 0.5 and (
                 metrics["role_listing_score"] >= 0.5
@@ -842,9 +1070,38 @@ class LogicOrchestrator:
                 )
             )
         if relation_type == "same_concept":
-            return metrics["dense_score"] >= 0.55 and (
-                metrics["overlap_score"] >= 0.3
-                or metrics["topic_cluster_match"] >= 1.0
+            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+            scientific_supported = (
+                self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
+                and self._doc_stage(candidate) == self._doc_stage(anchor)
+                and metrics["dense_score"] >= 0.54
+                and (
+                    metrics["topic_cluster_match"] >= 1.0
+                    or metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.2
+                )
+                and (
+                    metrics["title_overlap"] >= 1.0
+                    or metrics["mention_score"] >= 0.12
+                    or metrics["content_overlap_score"] >= 0.24
+                )
+                and not (
+                    methodology_penalty >= 0.55
+                    and metrics["title_overlap"] < 2.0
+                    and metrics["mention_score"] < 0.18
+                )
+            )
+            return scientific_supported or (
+                metrics["dense_score"] >= 0.55
+                and (
+                    metrics["overlap_score"] >= 0.3
+                    or metrics["topic_cluster_match"] >= 1.0
+                )
+                and not (
+                    methodology_penalty >= 0.42
+                    and metrics["title_overlap"] < 2.0
+                    and metrics["mention_score"] < 0.22
+                )
             )
         return True
 
@@ -857,6 +1114,14 @@ class LogicOrchestrator:
             return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.26, min_evidence_quality=0.28)
         if relation_type == "same_concept" and self._is_argumentative_pair(anchor, candidate):
             return RelationQualityConfig(enabled=True, min_confidence=0.82, min_support=0.3, min_evidence_quality=0.28)
+        if (
+            self._source_dataset(anchor) in {"scifact", "nfcorpus"}
+            and self._source_dataset(candidate) == self._source_dataset(anchor)
+        ):
+            if relation_type == "supporting_evidence":
+                return RelationQualityConfig(enabled=True, min_confidence=0.78, min_support=0.26, min_evidence_quality=0.28)
+            if relation_type == "same_concept":
+                return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.28, min_evidence_quality=0.26)
         if (
             relation_type == "supporting_evidence"
             and "judge" in set(tokenize(anchor.title))
@@ -896,7 +1161,10 @@ class LogicOrchestrator:
             return len(anchor.claims) >= 1 and len(anchor_terms) >= 8 and bool(self._topic_cluster(anchor))
         if source_dataset in {"scifact", "nfcorpus"}:
             return len(anchor.claims) >= 1 and (len(anchor.keywords) >= 3 or len(anchor.entities) >= 2 or len(anchor_terms) >= 8)
-        if topic in {"hnsw", "evaluation"}:
+        if topic == "evaluation":
+            evaluation_terms = {"ann", "recall", "mrr", "ndcg", "benchmark", "report", "reporting", "metrics"}
+            return len(anchor_terms & evaluation_terms) >= 2 or "reporting" in title_tokens
+        if topic == "hnsw":
             return False
         if "similarity" in title_tokens:
             return False
@@ -922,24 +1190,27 @@ class LogicOrchestrator:
                 + 0.18 * claim_score
                 + 0.16 * keyword_score
                 + 0.12 * summary_score
+                + 0.12 * self._dataset_edge_signal(anchor)
             )
         if source_dataset == "scifact":
             evidence_hint = 1.0 if hint_terms & {"claim", "evidence", "study"} else 0.0
             return (
-                0.28 * entity_score
-                + 0.24 * claim_score
-                + 0.18 * evidence_hint
-                + 0.16 * keyword_score
-                + 0.14 * min(len(content_terms) / 14.0, 1.0)
+                0.24 * entity_score
+                + 0.22 * claim_score
+                + 0.16 * evidence_hint
+                + 0.14 * keyword_score
+                + 0.12 * min(len(content_terms) / 14.0, 1.0)
+                + 0.12 * self._dataset_edge_signal(anchor)
             )
         if source_dataset == "nfcorpus":
             clinical_hint = 1.0 if hint_terms & {"clinical", "condition", "treatment"} else 0.0
             return (
-                0.24 * claim_score
-                + 0.22 * keyword_score
-                + 0.18 * entity_score
-                + 0.18 * clinical_hint
-                + 0.18 * summary_score
+                0.22 * claim_score
+                + 0.2 * keyword_score
+                + 0.16 * entity_score
+                + 0.16 * clinical_hint
+                + 0.14 * summary_score
+                + 0.12 * self._dataset_edge_signal(anchor)
             )
         return 1.0
 
@@ -955,23 +1226,90 @@ class LogicOrchestrator:
                 selected.update(brief.doc_id for brief in group)
                 continue
             if source_dataset == "arguana":
-                cap = max(8, min(len(group), len(group) // 15 + 6))
+                cap = max(10, min(len(group), len(group) // 12 + 6))
                 floor = 0.5
             elif source_dataset == "scifact":
-                cap = max(10, min(len(group), len(group) // 12 + 4))
+                cap = max(18, min(len(group), len(group) // 8 + 10))
                 floor = 0.48
             else:
-                cap = max(10, min(len(group), len(group) // 10 + 4))
-                floor = 0.46
+                cap = max(18, min(len(group), len(group) // 7 + 10))
+                floor = 0.47
             ranked = sorted(
-                ((self.discovery_anchor_priority(brief), brief.doc_id) for brief in group),
-                key=lambda item: (-item[0], item[1]),
+                ((self.discovery_anchor_priority(brief), brief) for brief in group),
+                key=lambda item: (-item[0], item[1].doc_id),
             )
-            kept = [doc_id for score, doc_id in ranked if score >= floor][:cap]
+            if source_dataset in {"scifact", "nfcorpus"}:
+                diverse = self._select_diverse_dataset_anchors(ranked, cap=cap, floor=floor)
+                hub_core = self._select_dataset_hub_anchors(group, cap=max(4, cap // 3))
+                kept = []
+                for doc_id in hub_core + diverse:
+                    if doc_id in kept:
+                        continue
+                    kept.append(doc_id)
+                    if len(kept) >= cap:
+                        break
+            else:
+                kept = [brief.doc_id for score, brief in ranked if score >= floor][:cap]
             if not kept:
-                kept = [doc_id for _, doc_id in ranked[: min(cap, max(6, len(group) // 6 or 1))]]
+                kept = [brief.doc_id for _, brief in ranked[: min(cap, max(6, len(group) // 6 or 1))]]
             selected.update(kept)
         return selected
+
+    def _select_dataset_hub_anchors(self, group: list[DocBrief], *, cap: int) -> list[str]:
+        if cap <= 0 or not group:
+            return []
+        doc_freq: Counter[str] = Counter()
+        term_map: dict[str, set[str]] = {}
+        for brief in group:
+            terms = self._content_terms(brief)
+            term_map[brief.doc_id] = terms
+            doc_freq.update(terms)
+        ranked: list[tuple[float, str]] = []
+        for brief in group:
+            terms = term_map[brief.doc_id]
+            if not terms:
+                continue
+            freq_score = sum(min(doc_freq[token], 6) for token in terms) / (6.0 * max(1, min(len(terms), 10)))
+            bridge_bonus = 0.18 * self._dataset_edge_signal(brief)
+            broadness_bonus = 0.08 * max(0.0, 0.5 - max(self._title_specificity_score(brief), 0.0))
+            ranked.append((min(freq_score + bridge_bonus + broadness_bonus, 1.0), brief.doc_id))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [doc_id for _, doc_id in ranked[:cap]]
+
+    def _select_diverse_dataset_anchors(self, ranked: list[tuple[float, DocBrief]], *, cap: int, floor: float) -> list[str]:
+        candidates = [(score, brief, self._embed_brief(brief)) for score, brief in ranked if score >= floor]
+        if not candidates:
+            return []
+        selected: list[tuple[float, DocBrief, object]] = []
+        selected_ids: list[str] = []
+        selected_clusters: set[str] = set()
+        while candidates and len(selected_ids) < cap:
+            best_index = 0
+            best_score = float("-inf")
+            for index, (priority, brief, vector) in enumerate(candidates):
+                novelty = 1.0
+                if selected:
+                    similarities = [
+                        max(cosine(vector, chosen_vec), 0.0)
+                        for _, _, chosen_vec in selected
+                        if vector is not None and chosen_vec is not None
+                    ]
+                    if similarities:
+                        novelty = 1.0 - max(similarities)
+                cluster_bonus = 0.08 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
+                specificity_bonus = 0.03 * max(self._title_specificity_score(brief), 0.0)
+                dataset_bonus = 0.08 * self._dataset_edge_signal(brief)
+                score = 0.66 * priority + 0.26 * novelty + cluster_bonus + specificity_bonus + dataset_bonus
+                if score > best_score:
+                    best_score = score
+                    best_index = index
+            chosen = candidates.pop(best_index)
+            selected.append(chosen)
+            selected_ids.append(chosen[1].doc_id)
+            cluster = self._topic_cluster(chosen[1])
+            if cluster:
+                selected_clusters.add(cluster)
+        return selected_ids
 
     def _local_relation_override(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result):
         anchor_text = self._brief_text(anchor)
@@ -1005,6 +1343,28 @@ class LogicOrchestrator:
                 confidence=max(0.9, float(getattr(result, "confidence", 0.0))),
                 reason="Candidate is the next explicit workflow role implied by the anchor's ordering cues.",
                 support_score=min(0.9, metrics["local_support"] + 0.16),
+            )
+        if (
+            self._doc_stage(anchor) == "eval_metrics"
+            and self._doc_stage(candidate) == "eval_report"
+            and metrics["service_surface_score"] < 0.45
+            and (
+                fit_scores["implementation_detail"] >= 0.46
+                or fit_scores["same_concept"] >= 0.56
+            )
+            and (
+                metrics["topic_alignment"] >= 1.0
+                or metrics["content_overlap_score"] >= 0.22
+                or metrics["mention_score"] >= 0.16
+            )
+        ):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "implementation_detail",
+                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                reason="The benchmark reporting document is the concrete reporting component that operationalizes the metric summary described by the anchor.",
+                support_score=min(0.9, metrics["local_support"] + 0.1),
             )
         if (
             metrics["service_surface_score"] < 0.55
@@ -1054,12 +1414,24 @@ class LogicOrchestrator:
         if (
             self._doc_stage(anchor) in {"ops_overview", "ops_service"}
             and self._doc_stage(candidate) == "ops_registry"
-            and metrics["service_surface_score"] < 0.55
             and fit_scores["implementation_detail"] >= 0.58
             and (
-                metrics["topic_alignment"] >= 1.0
-                or metrics["content_overlap_score"] >= 0.16
-                or metrics["mention_score"] >= 0.18
+                (
+                    metrics["service_surface_score"] < 0.55
+                    and (
+                        metrics["topic_alignment"] >= 1.0
+                        or metrics["content_overlap_score"] >= 0.16
+                        or metrics["mention_score"] >= 0.18
+                    )
+                )
+                or (
+                    metrics["family_bridge_score"] >= 0.9
+                    and (
+                        metrics["topic_alignment"] >= 1.0
+                        or metrics["content_overlap_score"] >= 0.2
+                        or metrics["mention_score"] >= 0.08
+                    )
+                )
             )
         ):
             return self._make_fallback_result(
@@ -1084,6 +1456,22 @@ class LogicOrchestrator:
                 "supporting_evidence",
                 confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
                 reason="Candidate explains or constrains a behavior that the anchor depends on.",
+                support_score=min(0.9, metrics["local_support"] + 0.1),
+            )
+        if (
+            self._doc_stage(anchor) == "logic_graph"
+            and self._doc_stage(candidate) == "retrieval_overview"
+            and fit_scores["supporting_evidence"] >= 0.6
+            and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+            and metrics["dense_score"] >= 0.7
+            and metrics["content_overlap_score"] >= 0.3
+        ):
+            return self._make_fallback_result(
+                anchor,
+                candidate,
+                "supporting_evidence",
+                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
+                reason="The logic overlay graph provides the durable graph layer that the retrieval overview relies on for one-hop logical expansion.",
                 support_score=min(0.9, metrics["local_support"] + 0.1),
             )
         if (
@@ -1119,6 +1507,86 @@ class LogicOrchestrator:
                 reason="The documents argue about the same topic from contrasting or alternative positions.",
                 support_score=min(0.9, metrics["local_support"] + 0.12),
             )
+        if (
+            self._source_dataset(anchor) in {"scifact", "nfcorpus"}
+            and self._source_dataset(candidate) == self._source_dataset(anchor)
+            and self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
+            and self._doc_stage(candidate) == self._doc_stage(anchor)
+            and metrics["dense_score"] >= 0.58
+            and (
+                metrics["topic_cluster_match"] >= 1.0
+                or metrics["topic_alignment"] >= 1.0
+                or metrics["content_overlap_score"] >= 0.18
+            )
+        ):
+            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+            if methodology_penalty >= 0.6 and fit_scores["supporting_evidence"] >= 0.55:
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "supporting_evidence",
+                    confidence=max(0.8, float(getattr(result, "confidence", 0.0)) - 0.04),
+                    reason="The candidate is better treated as supporting evidence because it is a methodological or measurement study within the same scientific topic family.",
+                    support_score=min(0.9, metrics["local_support"] + 0.12),
+                )
+            if fit_scores["same_concept"] >= max(0.62, fit_scores["supporting_evidence"] + 0.12):
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "same_concept",
+                    confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                    reason="The documents describe the same scientific or clinical finding family with highly aligned evidence and bridge terms.",
+                    support_score=min(0.9, metrics["local_support"] + 0.12),
+                )
+            if (
+                methodology_penalty >= 0.42
+                and fit_scores["supporting_evidence"] >= max(0.42, fit_scores["same_concept"] - 0.08)
+                and (
+                    metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.18
+                    or metrics["mention_score"] >= 0.16
+                )
+            ):
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "supporting_evidence",
+                    confidence=max(0.8, float(getattr(result, "confidence", 0.0)) - 0.04),
+                    reason="The candidate is a methodological or measurement study that supports the same scientific claim family without being the primary concept match.",
+                    support_score=min(0.9, metrics["local_support"] + 0.12),
+                )
+            if (
+                fit_scores["supporting_evidence"] >= 0.58
+                and fit_scores["supporting_evidence"] >= fit_scores["same_concept"] - 0.06
+                and metrics["topic_alignment"] >= 1.0
+                and metrics["content_overlap_score"] >= 0.22
+            ):
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "supporting_evidence",
+                    confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                    reason="The candidate supplies closely related scientific or clinical evidence that can strengthen retrieval for the anchor topic.",
+                    support_score=min(0.92, metrics["local_support"] + 0.14),
+                )
+            if fit_scores["supporting_evidence"] >= fit_scores["same_concept"] + 0.04 and fit_scores["supporting_evidence"] >= 0.48:
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "supporting_evidence",
+                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
+                    reason="The candidate provides closely aligned scientific or clinical evidence for the anchor's claim.",
+                    support_score=min(0.9, metrics["local_support"] + 0.12),
+                )
+            if fit_scores["same_concept"] >= 0.5:
+                return self._make_fallback_result(
+                    anchor,
+                    candidate,
+                    "same_concept",
+                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
+                    reason="The documents describe the same scientific or clinical finding family with highly aligned evidence.",
+                    support_score=min(0.88, metrics["local_support"] + 0.1),
+                )
         return None
 
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result) -> CandidateAssessment:
@@ -1138,11 +1606,30 @@ class LogicOrchestrator:
             detail_override = (
                 fallback.relation_type == "implementation_detail"
                 and metrics["dense_score"] >= 0.68
-                and metrics["service_surface_score"] < 0.55
+                and (
+                    (
+                        metrics["service_surface_score"] < 0.55
+                        and (
+                            metrics["topic_alignment"] >= 1.0
+                            or metrics["content_overlap_score"] >= 0.18
+                            or metrics["mention_score"] >= 0.18
+                        )
+                    )
+                    or (
+                        (self._doc_stage(anchor), self._doc_stage(candidate)) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
+                        and metrics["family_bridge_score"] >= 0.9
+                        and (
+                            metrics["topic_alignment"] >= 1.0
+                            or metrics["content_overlap_score"] >= 0.2
+                            or metrics["mention_score"] >= 0.08
+                        )
+                    )
+                )
                 and (
                     not result.accepted
                     or result.relation_type in {"same_concept", "comparison", "prerequisite", "supporting_evidence"}
                     or float(result.confidence) < 0.88
+                    or bool(getattr(result, "contradiction_flags", None))
                 )
             )
             if (
@@ -1165,7 +1652,14 @@ class LogicOrchestrator:
         if (
             self._is_live_provider()
             and final_result.relation_type in {"same_concept", "comparison"}
-            and not (final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate))
+            and not (
+                (final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate))
+                or (
+                    final_result.relation_type == "same_concept"
+                    and self._source_dataset(anchor) in {"scifact", "nfcorpus"}
+                    and self._source_dataset(candidate) == self._source_dataset(anchor)
+                )
+            )
         ):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
@@ -1175,7 +1669,15 @@ class LogicOrchestrator:
         blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * model_utility)
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
         threshold = self._effective_threshold(anchor, candidate, final_result.relation_type)
+        anchor_stage = self._doc_stage(anchor)
+        candidate_stage = self._doc_stage(candidate)
 
+        if (
+            final_result.relation_type == "implementation_detail"
+            and ({anchor_stage, candidate_stage} & {"eval_metrics", "eval_report"})
+            and (anchor_stage, candidate_stage) != ("eval_metrics", "eval_report")
+        ):
+            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if metrics["topic_drift"] >= 1.0 and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
             return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not threshold.enabled and not self._relation_cues(anchor, candidate, final_result):
@@ -1213,10 +1715,15 @@ class LogicOrchestrator:
         if final_result.relation_type == "implementation_detail":
             direction_score = self._implementation_direction_score(anchor, candidate, metrics)
             stage_driven_detail = (
-                self._doc_stage(anchor) in {"ops_overview", "ops_service"}
-                and self._doc_stage(candidate) == "ops_registry"
-                and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-            )
+                (
+                    anchor_stage in {"ops_overview", "ops_service"}
+                    and candidate_stage == "ops_registry"
+                )
+                or (
+                    anchor_stage == "eval_metrics"
+                    and candidate_stage == "eval_report"
+                )
+            ) and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
             if direction_score < 0.08 and not stage_driven_detail:
                 return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
             if self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) < -0.08:
@@ -1232,27 +1739,74 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "low_support", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if self._is_live_provider() and blended_utility < 0.24:
             if not (
-                final_result.relation_type == "supporting_evidence"
-                and "judge" in set(tokenize(anchor.title))
-                and self._doc_stage(candidate) == "ops_revalidation"
-                and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+                (
+                    final_result.relation_type == "supporting_evidence"
+                    and "judge" in set(tokenize(anchor.title))
+                    and self._doc_stage(candidate) == "ops_revalidation"
+                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+                )
+                or (
+                    final_result.relation_type == "implementation_detail"
+                    and (anchor_stage, candidate_stage) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
+                    and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+                )
+                or (
+                    final_result.relation_type == "supporting_evidence"
+                    and (anchor_stage, candidate_stage) == ("logic_graph", "retrieval_overview")
+                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+                )
             ):
                 return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if evidence_quality < threshold.min_evidence_quality:
             return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if getattr(final_result, "contradiction_flags", None):
-            return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+            if not (
+                (
+                    final_result.relation_type == "implementation_detail"
+                    and (anchor_stage, candidate_stage) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
+                    and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
+                )
+                or (
+                    final_result.relation_type == "supporting_evidence"
+                    and (anchor_stage, candidate_stage) == ("logic_graph", "retrieval_overview")
+                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
+                )
+            ):
+                return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
 
         score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
         score *= 1.0 + 0.16 * fit_scores.get(final_result.relation_type, rerank_score)
         score *= 0.85 + 0.4 * blended_utility
         if final_result.relation_type == "implementation_detail":
             score *= 1.0 + max(self._implementation_direction_score(anchor, candidate, metrics), 0.0)
+        if (
+            final_result.relation_type == "same_concept"
+            and self._source_dataset(anchor) in {"scifact", "nfcorpus"}
+            and self._source_dataset(candidate) == self._source_dataset(anchor)
+        ):
+            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+            score *= 1.0 + 0.18 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.6)
+            score *= max(0.72, 1.0 - 0.28 * methodology_penalty)
+        if final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
+            score *= 1.0 + 0.12 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.5)
+        if (
+            final_result.relation_type == "supporting_evidence"
+            and self._doc_stage(anchor) == "logic_graph"
+            and self._doc_stage(candidate) == "retrieval_overview"
+        ):
+            score *= 1.22
+        edge_confidence = final_result.confidence
+        if (
+            final_result.relation_type == "same_concept"
+            and self._source_dataset(anchor) in {"scifact", "nfcorpus"}
+            and self._source_dataset(candidate) == self._source_dataset(anchor)
+        ):
+            edge_confidence *= max(0.72, 1.0 - 0.22 * self._same_concept_methodology_penalty(anchor, candidate))
         edge = LogicEdge(
             src_doc_id=anchor.doc_id,
             dst_doc_id=candidate.doc_id,
             relation_type=final_result.relation_type,
-            confidence=final_result.confidence,
+            confidence=edge_confidence,
             evidence_spans=final_result.evidence_spans,
             discovery_path=["scout", "judge", "gate"],
             edge_card_text=f"[REL={final_result.relation_type}] {anchor.title} -> {candidate.title}: {final_result.rationale}",
@@ -1288,12 +1842,22 @@ class LogicOrchestrator:
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
+            same_concept_bonus = 0.0
+            if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
+                methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+                same_concept_bonus = 0.12 * fit_scores["same_concept"] * max(
+                    self._dataset_edge_signal(anchor),
+                    self._dataset_edge_signal(candidate),
+                    0.6,
+                )
+                same_concept_bonus *= max(0.55, 1.0 - 0.4 * methodology_penalty)
             score = (
                 metrics["local_support"]
                 + 0.42 * rerank_score
                 + 0.08 * fit_scores["implementation_detail"]
                 + 0.06 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
+                + same_concept_bonus
             )
             proposals.append(
                 (
@@ -1313,6 +1877,8 @@ class LogicOrchestrator:
         anchor_text = self._brief_text(anchor)
         if self._is_argumentative_doc(anchor):
             return max(self._edge_quality().max_judge_candidates_live, 8)
+        if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
+            return max(self._edge_quality().max_judge_candidates_live, 10)
         if any(word in anchor_text for word in LISTING_WORDS):
             return max(self._edge_quality().max_judge_candidates_live, 8)
         return max(self._edge_quality().max_judge_candidates_live, 6)
@@ -1328,6 +1894,15 @@ class LogicOrchestrator:
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
+            same_concept_bonus = 0.0
+            if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
+                methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+                same_concept_bonus = 0.12 * fit_scores["same_concept"] * max(
+                    self._dataset_edge_signal(anchor),
+                    self._dataset_edge_signal(candidate),
+                    0.6,
+                )
+                same_concept_bonus *= max(0.55, 1.0 - 0.4 * methodology_penalty)
             score = (
                 0.55 * proposal.score_hint
                 + metrics["local_support"]
@@ -1335,6 +1910,7 @@ class LogicOrchestrator:
                 + 0.06 * fit_scores["implementation_detail"]
                 + 0.04 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
+                + same_concept_bonus
             )
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
@@ -1368,6 +1944,7 @@ class LogicOrchestrator:
         return assessment.edge if assessment.accepted else None
 
     def judge_many_with_diagnostics(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[CandidateAssessment]:
+        candidate_map = {candidate.doc_id: candidate for candidate in candidates}
         if hasattr(self.relation_judge, "run_many_with_signals"):
             candidate_pairs = []
             for candidate in candidates:
@@ -1390,11 +1967,53 @@ class LogicOrchestrator:
             if len(prerequisite_group) >= 2:
                 cap = max(cap, min(4, max(3, len(prerequisite_group) + 1)))
         if self._is_live_provider() and self._doc_stage(anchor) == "agent_overview" and len(accepted) >= 2:
-            if accepted[0].score - accepted[1].score <= self._edge_quality().second_edge_margin:
+            second = accepted[1]
+            second_candidate = candidate_map.get(second.candidate_doc_id)
+            if (
+                accepted[0].score - second.score <= self._edge_quality().second_edge_margin
+                or (
+                    second.relation_type == "implementation_detail"
+                    and second.local_support >= 0.4
+                    and second_candidate is not None
+                    and self._doc_stage(second_candidate) == "agent_memory"
+                )
+            ):
                 cap = max(cap, 2)
         if self._is_live_provider() and self._doc_stage(anchor) == "argument_claim":
             comparison_group = [item for item in accepted if item.relation_type == "comparison" and item.local_support >= 0.34]
             if len(comparison_group) >= 2 and comparison_group[0].score - comparison_group[1].score <= self._edge_quality().second_edge_margin + 0.04:
+                cap = max(cap, min(3, len(comparison_group)))
+        if self._is_live_provider() and self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
+            evidence_group = [
+                item
+                for item in accepted
+                if item.relation_type in {"supporting_evidence", "same_concept"} and item.local_support >= 0.3
+            ]
+            same_concept_group = [
+                item
+                for item in evidence_group
+                if item.relation_type == "same_concept"
+                and candidate_map.get(item.candidate_doc_id) is not None
+                and self._same_concept_methodology_penalty(anchor, candidate_map[item.candidate_doc_id]) < 0.45
+            ]
+            support_group = [item for item in evidence_group if item.relation_type == "supporting_evidence"]
+            if same_concept_group:
+                cap = min(cap, 2 + min(1, len(support_group)))
+            if len(evidence_group) >= 2 and evidence_group[0].score - evidence_group[1].score <= self._edge_quality().second_edge_margin + 0.05:
+                cap = max(cap, min(3, len(evidence_group)))
+        if self._is_live_provider() and self._doc_stage(anchor) == "logic_graph":
+            support_group = [item for item in accepted if item.relation_type == "supporting_evidence" and item.local_support >= 0.28]
+            if len(support_group) >= 2:
+                cap = max(cap, 2)
+            detail_group = [item for item in accepted if item.relation_type == "implementation_detail" and item.local_support >= 0.38]
+            if detail_group and support_group and (
+                support_group[0].score >= detail_group[0].score - self._edge_quality().second_edge_margin - 0.12
+                or (
+                    support_group[0].evidence_quality >= 0.7
+                    and candidate_map.get(support_group[0].candidate_doc_id) is not None
+                    and self._doc_stage(candidate_map[support_group[0].candidate_doc_id]) == "retrieval_overview"
+                )
+            ):
                 cap = max(cap, 2)
 
         kept_ids = {item.candidate_doc_id for item in accepted[:cap]}

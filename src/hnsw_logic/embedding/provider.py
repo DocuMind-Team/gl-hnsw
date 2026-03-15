@@ -362,6 +362,7 @@ class OpenAICompatibleProvider(StubProvider):
         self._embeddings = None
         self._local_embedding_model = None
         self._local_embedding_tokenizer = None
+        self._brief_vector_cache: dict[str, np.ndarray] = {}
         self.require_remote = os.getenv("GL_HNSW_REQUIRE_REMOTE", "0") == "1"
         self.trace_path = self.root_dir / "data" / "workspace" / "remote_provider_traces.jsonl" if self.root_dir else None
         if config.embedding_model in {"bge-m3", "BAAI/bge-m3"}:
@@ -393,6 +394,21 @@ class OpenAICompatibleProvider(StubProvider):
         self._trace_remote(stage, "fallback", str(exc))
         if self.require_remote:
             raise RuntimeError(f"Remote provider call failed during {stage}: {exc}") from exc
+
+    def _is_content_filter_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "content_filter" in message or "moderation block" in message or "'code': '421'" in message
+
+    def _is_response_parse_error(self, exc: Exception) -> bool:
+        if isinstance(exc, json.JSONDecodeError):
+            return True
+        message = str(exc).lower()
+        return (
+            "jsondecodeerror" in message
+            or "expecting ',' delimiter" in message
+            or "unterminated string" in message
+            or "extra data" in message
+        )
 
     def _init_local_bge_m3(self) -> None:
         from huggingface_hub import snapshot_download
@@ -464,12 +480,40 @@ class OpenAICompatibleProvider(StubProvider):
     def _chunk(self, items: list, size: int) -> list[list]:
         return [items[i : i + size] for i in range(0, len(items), size)]
 
+    def _brief_vector_key(self, brief: DocBrief) -> str:
+        return f"{brief.doc_id}\n{brief.title}\n{brief.summary}"
+
+    def _brief_vector_text(self, brief: DocBrief) -> str:
+        return f"{brief.title}\n{brief.summary}"
+
+    def _brief_vectors(self, briefs: list[DocBrief]) -> np.ndarray:
+        if not briefs:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        vectors: list[np.ndarray | None] = [None] * len(briefs)
+        missing_indices: list[int] = []
+        missing_texts: list[str] = []
+        for index, brief in enumerate(briefs):
+            cached = self._brief_vector_cache.get(self._brief_vector_key(brief))
+            if cached is None:
+                missing_indices.append(index)
+                missing_texts.append(self._brief_vector_text(brief))
+            else:
+                vectors[index] = cached
+        if missing_texts:
+            encoded = self._embed_local_bge_m3(missing_texts) if self._local_embedding_model is not None else np.asarray(self._embeddings.embed_documents(missing_texts), dtype=np.float32)
+            for offset, vector in enumerate(encoded):
+                index = missing_indices[offset]
+                brief = briefs[index]
+                cached = np.asarray(vector, dtype=np.float32)
+                self._brief_vector_cache[self._brief_vector_key(brief)] = cached
+                vectors[index] = cached
+        return np.vstack([vector for vector in vectors if vector is not None]).astype(np.float32)
+
     def _candidate_shortlist(self, anchor: DocBrief, corpus: list[DocBrief], limit: int = 8) -> list[DocBrief]:
         if not corpus:
             return []
         anchor_terms = set(anchor.keywords + anchor.entities + anchor.relation_hints)
-        texts = [f"{anchor.title}\n{anchor.summary}"] + [f"{brief.title}\n{brief.summary}" for brief in corpus]
-        vectors = self.embed_texts(texts)
+        vectors = self._brief_vectors([anchor] + corpus)
         anchor_vec = vectors[0]
         ranked: list[tuple[float, DocBrief]] = []
         for idx, brief in enumerate(corpus, start=1):
@@ -598,6 +642,7 @@ class OpenAICompatibleProvider(StubProvider):
             metadata["source_dataset"] = dataset
         keywords: list[str] = []
         relation_hints: list[str] = []
+        context_text = " ".join([title, summary, *claims, doc.text[:1600]]).lower()
         cluster = self._topic_cluster(title, claims, doc)
         if cluster:
             metadata["topic_cluster"] = cluster
@@ -615,11 +660,26 @@ class OpenAICompatibleProvider(StubProvider):
             metadata["doc_kind"] = "evidence"
             relation_hints.extend(["claim", "evidence", "study"])
             keywords.extend(top_terms(" ".join([title, summary, *claims]), limit=6))
+            if any(term in context_text for term in {"risk factor", "risks", "burden", "dalys", "mortality", "deaths", "exposure"}):
+                relation_hints.extend(["population risk", "chronic disease burden"])
+                keywords.extend(["risk factors", "chronic disease"])
+            if any(term in context_text for term in {"nutrition", "diet", "dietary", "food", "fasting glucose", "body mass index", "bmi", "metabolic"}):
+                relation_hints.extend(["nutrition", "metabolic risk"])
+                keywords.extend(["nutrition", "metabolic risk"])
+            if any(term in context_text for term in {"global", "regional", "national", "population", "public health"}):
+                relation_hints.append("population health")
+                keywords.append("population health")
         elif dataset == "nfcorpus":
             metadata.setdefault("topic", "clinical_retrieval")
             metadata["doc_kind"] = "medical_passage"
             relation_hints.extend(["clinical", "condition", "treatment"])
             keywords.extend(top_terms(" ".join([title, summary, *claims]), limit=6))
+            if any(term in context_text for term in {"risk factor", "risks", "burden", "mortality", "outcome", "survival", "prognosis"}):
+                relation_hints.extend(["clinical risk", "disease burden"])
+                keywords.extend(["clinical risk", "disease burden"])
+            if any(term in context_text for term in {"nutrition", "diet", "dietary", "obesity", "metabolic", "glucose"}):
+                relation_hints.extend(["nutrition", "metabolic health"])
+                keywords.extend(["nutrition", "metabolic health"])
         return keywords, relation_hints, metadata
 
     def _postprocess_profile(self, doc: DocRecord, payload: dict | None) -> DocBrief:
@@ -631,18 +691,41 @@ class OpenAICompatibleProvider(StubProvider):
         if not summary:
             summary = " ".join(claims[:2])[:320]
         extra_keywords, extra_hints, metadata = self._profile_dataset_hints(doc, title, summary, claims)
-        keywords = self._merge_unique(
+        source_dataset = str(metadata.get("source_dataset", "")).lower()
+        keyword_groups = [
             [str(item) for item in payload.get("keywords", [])],
             top_terms(title, limit=4),
             top_terms(summary, limit=6),
             extra_keywords,
-            limit=10,
-        )
-        relation_hints = self._merge_unique(
+        ]
+        relation_groups = [
             [str(item) for item in payload.get("relation_hints", [])],
             extra_hints,
             top_terms(" ".join(claims), limit=4),
-            limit=8,
+        ]
+        keyword_limit = 10
+        relation_limit = 8
+        if source_dataset in {"scifact", "nfcorpus"}:
+            keyword_groups = [
+                extra_keywords,
+                [str(item) for item in payload.get("keywords", [])],
+                top_terms(title, limit=4),
+                top_terms(summary, limit=6),
+            ]
+            relation_groups = [
+                extra_hints,
+                [str(item) for item in payload.get("relation_hints", [])],
+                top_terms(" ".join(claims), limit=4),
+            ]
+            keyword_limit = 12
+            relation_limit = 10
+        keywords = self._merge_unique(
+            *keyword_groups,
+            limit=keyword_limit,
+        )
+        relation_hints = self._merge_unique(
+            *relation_groups,
+            limit=relation_limit,
         )
         entities = self._merge_unique(
             [str(item) for item in payload.get("entities", [])],
@@ -745,6 +828,9 @@ class OpenAICompatibleProvider(StubProvider):
             )
             return self._postprocess_profile(doc, payload)
         except Exception as exc:
+            if self._is_content_filter_error(exc):
+                self._trace_remote("profile_doc", "blocked_local", doc.doc_id)
+                return self._postprocess_profile(doc, None)
             self._handle_remote_failure("profile_doc", exc)
             return self._postprocess_profile(doc, None)
 
@@ -786,6 +872,18 @@ class OpenAICompatibleProvider(StubProvider):
                         continue
                     results[doc_id] = self._postprocess_profile(source, item)
             except Exception as exc:
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                    if len(batch) > 1:
+                        midpoint = max(1, len(batch) // 2)
+                        for partial in (batch[:midpoint], batch[midpoint:]):
+                            for brief in self.profile_docs(partial):
+                                results[brief.doc_id] = brief
+                        continue
+                    blocked = batch[0]
+                    status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
+                    self._trace_remote("profile_docs_batch", status, blocked.doc_id)
+                    results[blocked.doc_id] = self.profile_doc(blocked)
+                    continue
                 self._handle_remote_failure("profile_docs_batch", exc)
             for doc in batch:
                 if doc.doc_id in results:
@@ -924,6 +1022,9 @@ class OpenAICompatibleProvider(StubProvider):
             )
             return self._verdict_from_payload(payload)
         except Exception as exc:
+            if self._is_content_filter_error(exc):
+                self._trace_remote("judge_relation", "blocked_local", candidate.doc_id)
+                return super().judge_relation(anchor, candidate)
             self._handle_remote_failure("judge_relation", exc)
             return super().judge_relation(anchor, candidate)
 
@@ -1011,7 +1112,17 @@ class OpenAICompatibleProvider(StubProvider):
                         continue
                     verdicts[candidate_doc_id] = self._verdict_from_payload(item)
             except Exception as exc:
-                self._handle_remote_failure("judge_relations_batch", exc)
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc)) and len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    for partial in (batch[:midpoint], batch[midpoint:]):
+                        verdicts.update(self.judge_relations_with_signals(anchor, partial))
+                    continue
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                    blocked_ids = ",".join(candidate.doc_id for candidate, _ in batch)
+                    status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
+                    self._trace_remote("judge_relations_batch", status, blocked_ids)
+                else:
+                    self._handle_remote_failure("judge_relations_batch", exc)
             for candidate, signals in batch:
                 if candidate.doc_id in verdicts:
                     continue
@@ -1054,6 +1165,9 @@ class OpenAICompatibleProvider(StubProvider):
                 },
             }
         except Exception as exc:
+            if self._is_content_filter_error(exc):
+                self._trace_remote("curate_memory", "blocked_local", anchor.doc_id)
+                return super().curate_memory(anchor, accepted, rejected)
             self._handle_remote_failure("curate_memory", exc)
             return super().curate_memory(anchor, accepted, rejected)
 
