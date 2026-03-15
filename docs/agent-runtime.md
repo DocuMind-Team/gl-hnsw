@@ -1,39 +1,43 @@
-# Agent Runtime Guide
+# Agent 运行机制说明
 
-## 1. Scope
+## 1. 文档范围
 
-This document explains the real agent runtime of `gl-hnsw` as implemented today.
-It focuses on the offline indexing phase, because the project keeps agents out of the online query path by default.
+本文说明 `gl-hnsw` 当前真实落地的 agent 运行机制，重点覆盖离线索引建模阶段。
 
-The main goals of this document are:
+本文不再讨论抽象性的“智能体愿景”，而是基于当前代码实现，说明以下问题：
 
-- explain how the main orchestrator and subagents collaborate
-- explain how context is passed between phases
-- explain how memory is updated and persisted
-- explain the concrete loop structure used during offline indexing
-- explain how capabilities, tools, and skills are attached to agents
-- show the implementation with bilingual Mermaid diagrams
+- 主 agent 与各个 subagent 如何分工
+- 它们之间如何发生调用
+- 上下文如何在各阶段之间传递
+- 记忆如何更新、合并与持久化
+- 离线 agent loop 的具体实现逻辑是什么
+- 各个 agent 的能力来自哪里
+- skills 机制在系统里到底承担什么角色
+
+需要强调的一点是：本项目当前的 agent 核心作用域在**离线索引建模**阶段，而不是在线查询阶段。
 
 ---
 
-## 2. Design Positioning
+## 2. 系统定位
 
-The system is `agent-centric` in the offline indexing stage, not in online serving.
+`gl-hnsw` 采用的是一种“离线 agent-centric，在线本地执行”的架构。
 
-- Offline stage:
-  - agents profile documents
-  - agents scout candidate links
-  - agents judge relations
-  - agents review edge utility and risk
-  - agents curate memory after each anchor pass
-- Online stage:
-  - no agent call by default
-  - retrieval uses HNSW, sparse supplement, stored graph, and local scoring only
+具体来说：
 
-This split is intentional:
+- 离线阶段：
+  - agent 负责文档建档
+  - agent 负责候选关系发现
+  - agent 负责关系裁决
+  - agent 负责边质量复核
+  - agent 负责记忆整理
+- 在线阶段：
+  - 不再默认调用 agent
+  - 查询只使用已经构建好的 HNSW 索引、逻辑覆盖图和记忆层
 
-- offline agent execution can be slower but richer
-- online retrieval must remain deterministic, cheap, and observable
+这样设计的原因很明确：
+
+- 离线阶段允许更重的推理、更复杂的结构化判断
+- 在线阶段要求稳定、低延迟、易观测、易复现
 
 ```mermaid
 flowchart TD
@@ -53,11 +57,11 @@ flowchart TD
 
 ---
 
-## 3. Runtime Topology
+## 3. 运行时拓扑
 
-The actual runtime assembly is created in [bootstrap.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/bootstrap.py).
+系统的主要装配逻辑位于 [bootstrap.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/bootstrap.py)。
 
-The important objects are:
+从运行时视角看，关键对象包括：
 
 - `AgentFactory`
 - `LogicOrchestrator`
@@ -66,7 +70,7 @@ The important objects are:
 - `MemoryCuratorService`
 - `HybridRetrievalService`
 
-The runtime relationship is:
+它们之间的关系如下：
 
 ```mermaid
 flowchart TD
@@ -84,61 +88,118 @@ flowchart TD
     A --> M["HybridRetrievalService / 在线检索服务"]
 ```
 
-### Important implementation note
+### 3.1 一个必须说明清楚的事实
 
-The repository prepares a `deepagents` runtime through `AgentFactory.try_create_deep_agent()`, but the main production path does not depend on the deepagents loop for every step.
+仓库中确实提供了 `deepagents` 运行时接入，入口在 `AgentFactory.try_create_deep_agent()`。
 
-The dominant execution path is:
+但当前主执行链路并不是“所有动作都通过 deepagents 的开放式代理循环完成”。
 
-- `LogicOrchestrator`
-- typed subagent wrappers
-- provider methods such as:
-  - `profile_docs`
-  - `propose_candidates`
-  - `judge_relations_with_signals`
-  - `review_relations_with_signals`
-  - `curate_memory`
+当前真实主链路更接近：
 
-So the runtime is best described as:
+- 主编排器 `LogicOrchestrator`
+- 各个 typed subagent wrapper
+- provider 中的结构化能力函数
 
-- `deepagents-capable`
-- but currently implemented as an explicit orchestrator pipeline with typed agent roles
+例如：
+
+- `profile_docs`
+- `propose_candidates`
+- `judge_relations_with_signals`
+- `review_relations_with_signals`
+- `curate_memory`
+
+所以，当前系统最准确的描述是：
+
+- **兼容 deepagents**
+- **但核心生产路径仍然是显式编排的 agent pipeline**
 
 ---
 
-## 4. Agent Roles
+## 4. Agent 角色划分
 
-The configured subagents live in [agents.yaml](/Users/armstrong/gl-hnsw/configs/agents.yaml).
+当前 subagent 配置定义在 [agents.yaml](/Users/armstrong/gl-hnsw/configs/agents.yaml)。
 
-### 4.1 Main agent
+### 4.1 主 agent：LogicOrchestrator
 
-The main agent is `LogicOrchestrator`, implemented in [orchestrator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/orchestrator.py).
+主 agent 的核心实现位于 [orchestrator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/orchestrator.py)。
 
-Responsibilities:
+它不是一个简单的调度壳，而是整条离线 agent 流程的总控制器。
 
-- coordinate the offline indexing phases
-- compute local signals and heuristics
-- call subagents in a fixed sequence
-- rank anchors and candidates
-- convert judged results into final `LogicEdge` objects
-- decide whether discovery should be attempted for an anchor
+它负责：
 
-### 4.2 Subagents
+- 决定哪些 anchor 值得做 discovery
+- 对 anchor 做优先级排序
+- 调用 scout 获取候选
+- 为每个候选构造本地信号包
+- 调用 judge 和 reviewer
+- 计算 utility、重复惩罚、bridge gain 等本地信号
+- 把最终结果转成 `LogicEdge`
+- 控制是否允许 retry
 
-The system currently defines these subagents:
+### 4.2 各 subagent 的职责
 
-- `DocProfilerAgent`
-  - wraps `provider.profile_doc()` and `provider.profile_docs()`
-- `CorpusScoutAgent`
-  - wraps `provider.propose_candidates()`
-- `RelationJudgeAgent`
-  - wraps relation judgment with or without local signals
-- `EdgeReviewerAgent`
-  - wraps second-pass review with utility and risk signals
-- `MemoryCuratorAgent`
-  - wraps `provider.curate_memory()`
+#### DocProfilerAgent
 
-There is also a `QueryStrategyAgent` implementation, but it is not part of the default online serving path now.
+实现文件：
+[doc_profiler.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/doc_profiler.py)
+
+职责：
+
+- 把 `DocRecord` 压缩成 `DocBrief`
+- 形成后续所有 agent 阶段共享的语义上下文
+
+#### CorpusScoutAgent
+
+实现文件：
+[corpus_scout.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/corpus_scout.py)
+
+职责：
+
+- 为某个 anchor 提议候选文档
+- 输出 `CandidateProposal[]`
+
+#### RelationJudgeAgent
+
+实现文件：
+[relation_judge.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/relation_judge.py)
+
+职责：
+
+- 对 anchor-candidate 对进行关系裁决
+- 可以直接运行，也可以读取 `JudgeSignals`
+- 输出 `JudgeResult`
+
+#### EdgeReviewerAgent
+
+实现文件：
+[edge_reviewer.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/edge_reviewer.py)
+
+职责：
+
+- 对 judge 的结果做第二轮复核
+- 更强调 utility、风险、方向性与证据一致性
+
+#### MemoryCuratorAgent
+
+实现文件：
+[memory_curator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/memory_curator.py)
+
+职责：
+
+- 基于 accepted / rejected 结果生成 memory payload
+- 交给本地 `MemoryCuratorService` 继续合并入持久层
+
+#### QueryStrategyAgent
+
+实现文件：
+[query_strategy.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/query_strategy.py)
+
+当前状态：
+
+- 代码中存在
+- 但当前默认在线检索主路径**不接入**
+
+因此它不属于当前主生产链路的核心部分。
 
 ```mermaid
 flowchart LR
@@ -156,42 +217,64 @@ flowchart LR
 
 ---
 
-## 5. Context Model
+## 5. 上下文对象体系
 
-The main context objects are defined in [models.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/core/models.py).
+系统的主数据模型定义在 [models.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/core/models.py)。
 
-### 5.1 Primary payload types
+### 5.1 核心对象
 
 - `DocRecord`
-  - normalized full document
+  - 规范化后的完整文档
 - `DocBrief`
-  - condensed agent-facing representation
+  - 供 agent 使用的压缩语义表示
 - `CandidateProposal`
-  - scout output
+  - scout 产出的候选提议
 - `JudgeSignals`
-  - local grounded evidence bundle
+  - 本地计算出的 grounded evidence bundle
 - `JudgeResult`
-  - model-side verdict and utility signal
+  - 模型裁决结果
 - `LogicEdge`
-  - persisted graph edge
+  - 最终可落盘的逻辑边
 - `AnchorMemory`
-  - per-anchor memory
+  - 单个 anchor 的历史记忆
 - `GlobalSemanticMemory`
-  - corpus-level reusable memory
+  - 跨文档可复用的语义记忆
 
-### 5.2 Why two context layers exist
+### 5.2 为什么要分成两层上下文
 
-The system deliberately separates:
+当前系统明确把上下文拆成两类：
 
-- `semantic context`
-  - summary, claims, entities, relation hints
-- `grounded local signals`
-  - dense score, sparse score, mention score, direction score, risk flags, utility score
+#### 语义上下文
 
-This separation is what keeps the system agent-centric but not prompt-only.
+主要由 `DocBrief` 提供，包括：
 
-The agent does not operate from raw text intuition alone.
-It also receives structured local evidence computed by the orchestrator.
+- `title`
+- `summary`
+- `entities`
+- `keywords`
+- `claims`
+- `relation_hints`
+
+#### 本地 grounded signals
+
+主要由 orchestrator 计算，包括：
+
+- `dense_score`
+- `sparse_score`
+- `overlap_score`
+- `mention_score`
+- `direction_score`
+- `local_support`
+- `utility_score`
+- `risk_flags`
+- `relation_fit_scores`
+
+这套分层的意义是：
+
+- agent 不是完全靠自由推理在做判断
+- 而是基于明确的本地信号与压缩语义上下文做综合决策
+
+这也是当前系统“agent-centric 但不等于 prompt-only”的关键所在。
 
 ```mermaid
 flowchart TD
@@ -207,17 +290,17 @@ flowchart TD
 
 ---
 
-## 6. Offline Agent Loop
+## 6. 离线 Agent Loop 的总体结构
 
-The true offline loop is split between:
+离线 agent loop 的实现分散在以下几个文件中：
 
 - [pipeline.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/pipeline.py)
 - [discovery.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/discovery.py)
 - [orchestrator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/orchestrator.py)
 
-### 6.1 Pipeline stages
+### 6.1 BuildPipeline 的阶段划分
 
-`BuildPipeline` runs the offline path in this order:
+`BuildPipeline` 的标准离线流程包括：
 
 1. `build_embeddings`
 2. `build_hnsw`
@@ -225,20 +308,25 @@ The true offline loop is split between:
 4. `discover_edges`
 5. `revalidate_edges`
 
-Only stages `3` and `4` are agent-heavy.
+其中：
 
-### 6.2 Per-anchor discovery loop
+- 第 1、2 阶段偏索引基础设施
+- 第 3、4 阶段是 agent 参与最核心的部分
+- 第 5 阶段是图维护阶段
 
-For each selected anchor:
+### 6.2 每个 anchor 的 discovery loop
 
-1. load anchor `DocBrief`
-2. scout candidate documents
-3. compute local metrics and signal bundles
-4. judge candidate relations
-5. review judged candidates
-6. build final accepted edges
-7. write graph edges
-8. update anchor memory and semantic memory
+对于每一个被选中的 anchor，离线流程大致如下：
+
+1. 读取 anchor 的 `DocBrief`
+2. 调用 scout 找候选
+3. 为每个候选构造 `JudgeSignals`
+4. 调用 judge
+5. 调用 reviewer
+6. 生成 accepted `LogicEdge`
+7. 写入 graph store
+8. 生成 memory payload
+9. 合并进 anchor memory 与 semantic memory
 
 ```mermaid
 sequenceDiagram
@@ -269,17 +357,26 @@ sequenceDiagram
     DS->>MS: merge + persist memory
 ```
 
-### 6.3 Retry logic
+### 6.3 retry 是如何实现的
 
-There is a controlled retry path in [discovery.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/discovery.py):
+当前系统支持一次受控 retry，但它不是无限自循环。
 
-- only for live providers
-- only when no accepted edges were produced
-- only for anchors above a priority threshold
-- retry uses an expanded scout pass
+在 [discovery.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/discovery.py) 中，retry 只有在满足以下条件时才发生：
 
-This is not a free-running agent loop.
-It is a bounded second pass under orchestrator control.
+- provider 是 live provider
+- 第一轮没有任何 accepted edge
+- anchor 的 discovery priority 足够高
+
+此时系统会：
+
+- 以 expanded 模式再做一次 scout
+- 对新增候选再做一轮 judge + review
+
+这意味着当前 loop 是：
+
+- 有界的
+- 可控的
+- 非开放式自治循环
 
 ```mermaid
 flowchart TD
@@ -296,27 +393,28 @@ flowchart TD
 
 ---
 
-## 7. Main Agent to Subagent Call Semantics
+## 7. 主 agent 与 subagent 的调用语义
 
-### 7.1 The orchestrator is not passive
+### 7.1 主编排器不是单纯的路由器
 
-The orchestrator is not just a router.
-It does substantial pre- and post-processing:
+当前 `LogicOrchestrator` 的工作量远不止“把请求转发给 subagent”。
 
-- caching embeddings
-- deriving surrogate query terms
-- computing bridge information gain
-- computing duplicate penalties
-- assembling `JudgeSignals`
-- ranking discovery anchors
-- selecting which candidates are allowed into judge/reviewer
+它自己就负责大量本地控制逻辑，例如：
 
-This means:
+- embedding 缓存
+- surrogate query term 构造
+- bridge information gain 计算
+- duplicate penalty 计算
+- `JudgeSignals` 组装
+- discovery anchor 排序
+- candidate 的筛选、截断与重排
 
-- subagents are specialized decision-makers
-- the orchestrator is the global controller and evidence builder
+因此，当前系统中的职责关系是：
 
-### 7.2 Call graph
+- subagent：负责某一类局部判断
+- orchestrator：负责全局控制、证据构造与最终门控
+
+### 7.2 调用流的真实样子
 
 ```mermaid
 flowchart TD
@@ -337,68 +435,73 @@ flowchart TD
 
 ---
 
-## 8. Context Passing Rules
+## 8. 上下文传递机制
 
-The project does not pass one giant mutable conversation transcript.
-Instead, it passes structured context between explicit stages.
+当前系统不是把一个无限增长的 conversation transcript 传来传去。
 
-### 8.1 Profile stage context
+它采用的是**显式结构化上下文传递**：
 
-Input:
+- 每个阶段输入固定
+- 每个阶段输出固定
+- 中间结果通过 typed object 传给下一阶段
+
+### 8.1 Profile 阶段
+
+输入：
 
 - `DocRecord`
 
-Output:
+输出：
 
 - `DocBrief`
 
-### 8.2 Scout stage context
+### 8.2 Scout 阶段
 
-Input:
+输入：
 
 - anchor `DocBrief`
-- full corpus of `DocBrief`
+- corpus `DocBrief[]`
 
-Output:
+输出：
 
 - `CandidateProposal[]`
 
-### 8.3 Judge stage context
+### 8.3 Judge 阶段
 
-Input:
+输入：
 
 - anchor `DocBrief`
 - candidate `DocBrief`
 - `JudgeSignals`
 
-Output:
+输出：
 
 - `JudgeResult`
 
-### 8.4 Review stage context
+### 8.4 Review 阶段
 
-Input:
+输入：
 
 - anchor `DocBrief`
 - candidate `DocBrief`
 - `JudgeSignals`
-- initial `JudgeResult`
+- 初始 `JudgeResult`
 
-Output:
+输出：
 
-- reviewed `JudgeResult`
+- 复核后的 `JudgeResult`
 
-### 8.5 Curate stage context
+### 8.5 Curate 阶段
 
-Input:
+输入：
 
 - anchor `DocBrief`
 - accepted `LogicEdge[]`
-- rejected doc ids
+- rejected doc id 列表
 
-Output:
+输出：
 
-- provider payload for memory merge
+- provider 侧的 `memory payload`
 
 ```mermaid
 flowchart LR
@@ -414,45 +517,59 @@ flowchart LR
 
 ---
 
-## 9. Memory Management
+## 9. 记忆管理
 
-Memory is file-backed and explicitly merged, not agent-hidden.
+当前记忆系统是显式文件存储，不是隐藏在 agent 内部状态里的黑盒对话历史。
 
-The memory stores are:
+相关实现位于：
 
 - [anchor_memory.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/memory/anchor_memory.py)
 - [semantic_memory.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/memory/semantic_memory.py)
 - [graph_memory.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/memory/graph_memory.py)
 - [curator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/memory/curator.py)
 
-### 9.1 Anchor memory
+### 9.1 AnchorMemory
 
-Anchor memory stores per-anchor operational state:
+`AnchorMemory` 保存某个 anchor 的局部运行记忆，包括：
 
-- explored docs
-- rejected docs
-- accepted edge ids
-- active hypotheses
-- successful and failed search patterns
-- rejection reasons
-- candidate scores
-- accepted edge scores
+- `explored_docs`
+- `rejected_docs`
+- `accepted_edge_ids`
+- `active_hypotheses`
+- `successful_queries`
+- `failed_queries`
+- `rejection_reasons`
+- `top_candidate_scores`
+- `accepted_edge_scores`
 
-### 9.2 Global semantic memory
+它本质上是“这个 anchor 在离线 discovery 里已经发生过什么”的记录。
 
-Global semantic memory stores reusable corpus-level patterns:
+### 9.2 GlobalSemanticMemory
 
-- canonical entities
-- aliases
-- relation patterns
-- rejection patterns
+`GlobalSemanticMemory` 保存跨 anchor 可复用的全局模式，包括：
 
-### 9.3 Graph memory
+- `canonical_entities`
+- `aliases`
+- `relation_patterns`
+- `rejection_patterns`
 
-Graph memory stores graph-level stats:
+它更像系统层面的语义经验库。
 
-- accepted edge count
-- last revalidation time
+### 9.3 GraphMemory
+
+`GraphMemoryStore` 只保存图的系统级统计信息，例如：
+
+- `accepted_edges`
+- `last_revalidated_at`
+
+### 9.4 记忆更新链路
+
+`MemoryCuratorAgent` 先给出 provider payload，然后本地 `MemoryCuratorService.merge()` 再把结果合并进持久层。
+
+这意味着：
+
+- agent 负责提出记忆更新建议
+- 本地 merge 逻辑负责最终落盘
 
 ```mermaid
 flowchart TD
@@ -464,55 +581,58 @@ flowchart TD
     D --> G["GraphMemoryStore / 图统计记忆"]
 ```
 
-### 9.4 Why memory is split
+### 9.5 为什么要拆成三层记忆
 
-The split avoids mixing different timescales:
+因为这三类信息的生命周期与作用范围不同：
 
-- anchor memory:
-  - local, per-document, operational
-- semantic memory:
-  - corpus-level reusable abstraction
-- graph memory:
-  - system-level monitoring state
+- anchor memory：
+  - 单文档局部状态
+  - 强操作性
+- semantic memory：
+  - 跨文档复用模式
+  - 强抽象性
+- graph memory：
+  - 系统运行统计
+  - 强监控属性
 
-This is a practical replacement for letting an opaque agent conversation history accumulate forever.
+这种拆分是当前系统替代“无限 conversation history”的关键工程手段。
 
 ---
 
-## 10. Agent Loop Implementation Logic
+## 10. Agent Loop 的实现逻辑
 
-The agent loop is implemented as a bounded deterministic controller around model calls.
+当前离线 loop 是一个**受主编排器控制的有限状态循环**。
 
-### 10.1 Loop structure
+### 10.1 单个 anchor 的标准循环
 
-For each anchor:
+1. 选 anchor
+2. scout 候选
+3. 构造 signals
+4. judge
+5. review
+6. 产出高 utility 边
+7. 写图
+8. 更新记忆
+9. 必要时 retry 一次
 
-1. compute whether the anchor is eligible for discovery
-2. scout candidates
-3. build feature bundles
-4. judge candidates
-5. review candidates
-6. accept top utility edges
-7. write graph
-8. update memory
-9. optionally retry once
+### 10.2 为什么它仍然是 agent loop
 
-### 10.2 Why this is still an agent loop
+它仍然属于 agent loop，因为：
 
-It is an agent loop because:
+- 存在清晰的多角色分工
+- 每个角色处理的问题不同
+- 各角色由各自 skills 约束行为
+- provider 可在各阶段启用远端 reasoning
+- 上一阶段输出会成为下一阶段的输入上下文
 
-- specialized roles exist
-- different roles operate on different subproblems
-- role-specific skills guide their behavior
-- the provider may use remote reasoning for each role
-- outputs from one role become context for the next role
+### 10.3 为什么它不是开放式自治循环
 
-It is not an open-ended autonomous loop because:
+它又不是那种无限自驱动 agent 系统，因为：
 
-- maximum passes are bounded
-- graph writes happen through explicit gating
-- memory writes happen through explicit merge logic
-- the orchestrator owns final control
+- retry 次数有上限
+- 边写入必须过 judge + reviewer + orchestrator gate
+- memory 写入必须经过本地 merge
+- orchestrator 始终掌握最终控制权
 
 ```mermaid
 flowchart TD
@@ -531,19 +651,19 @@ flowchart TD
 
 ---
 
-## 11. Capability Management
+## 11. 能力管理：provider、tools、skills 三层
 
-Capabilities are distributed across three layers:
+当前系统里的 agent 能力并不是单一来源，而是三层叠加：
 
-- provider capabilities
-- tool capabilities
-- skill capabilities
+- provider 能力
+- tool 能力
+- skill 能力
 
-### 11.1 Provider capabilities
+### 11.1 Provider 能力
 
-The provider is the true execution backend for subagent reasoning.
+provider 是 agent 真正的执行后端。
 
-Examples:
+例如：
 
 - `profile_doc`
 - `propose_candidates`
@@ -551,18 +671,18 @@ Examples:
 - `review_relation_with_signals`
 - `curate_memory`
 
-So the provider owns:
+也就是说，provider 负责：
 
-- remote reasoning access
-- structured output generation
-- embedding calls
-- live reasoning toggles
+- 远端 reasoning 调用
+- 结构化输出解析
+- embedding 调用
+- live reasoning 开关控制
 
-### 11.2 Tool capabilities
+### 11.2 Tool 能力
 
-The tool registry is defined in [registry.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/tools/registry.py).
+tools registry 定义在 [registry.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/tools/registry.py)。
 
-Available tools:
+当前可注册工具包括：
 
 - `search_summaries`
 - `lookup_entities`
@@ -573,13 +693,16 @@ Available tools:
 - `load_anchor_memory`
 - `update_global_memory`
 
-These are the environment-facing abilities available to a deepagent runtime.
+这些工具的定位是：
 
-### 11.3 Skill capabilities
+- 面向 deepagent runtime 的环境接口
+- 而不是替代 orchestrator 的主流程
 
-Skills are stored under [agents/skills](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/skills).
+### 11.3 Skill 能力
 
-Configured skill mapping:
+skills 存放于 [agents/skills](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/skills)。
+
+当前配置映射为：
 
 - `doc_profiler`
   - `doc_briefing`
@@ -615,42 +738,43 @@ flowchart TD
 
 ---
 
-## 12. Skills Mechanism
+## 12. Skills 机制的真实角色
 
-The `skills` mechanism is prompt-level capability shaping, not executable business logic.
+当前系统中，skills 的本质是**行为指导提示**，而不是可执行业务逻辑。
 
-### 12.1 What skills do
+### 12.1 skills 在做什么
 
-Skills tell each role:
+skills 主要约束每个角色：
 
-- what output shape to prefer
-- what evidence to prioritize
-- when to abstain
-- what kind of mistakes to avoid
+- 优先输出什么结构
+- 更看重哪些证据
+- 哪些情况应当 abstain
+- 应该避免哪类错误
 
-Examples:
+例如：
 
 - `edge_utility`
-  - prefer retrieval-useful edges over topical similarity
+  - 强调检索价值优先，而不是仅有语义相关
 - `signal_fusion`
-  - treat local signals as grounded evidence
+  - 强调本地信号是 grounded evidence，不是可忽略的 hint
 - `relation_typing`
-  - constrain canonical relation space
+  - 把 canonical relation 限制在固定集合中
 
-### 12.2 What skills do not do
+### 12.2 skills 不在做什么
 
-Skills do not:
+skills 不直接负责：
 
-- persist data directly
-- replace local scoring code
-- bypass graph write gates
-- override the orchestrator
+- 持久化写入
+- 本地打分代码
+- graph write gate
+- memory merge
+- orchestrator 的最终控制
 
-### 12.3 Effective execution model
+### 12.3 当前系统里的实际执行模式
 
-The effective execution model is:
+当前真实模式可以概括为：
 
-`local code computes signals -> skill tells the role how to read them -> provider generates structured output -> orchestrator decides`
+`本地代码先算 signals -> skill 告诉 agent 如何理解这些 signals -> provider 产出结构化结果 -> orchestrator 决定是否接受`
 
 ```mermaid
 flowchart LR
@@ -664,21 +788,21 @@ flowchart LR
 
 ---
 
-## 13. DeepAgents Integration
+## 13. DeepAgents 集成方式
 
-`AgentFactory.try_create_deep_agent()` builds a deepagents runtime only when:
+`AgentFactory.try_create_deep_agent()` 会在以下条件都满足时创建 deepagent：
 
 - `runtime_mode == "deepagents"`
-- provider is `OpenAICompatibleProvider`
-- API key exists
-- deepagents and langchain bindings are importable
+- provider 是 `OpenAICompatibleProvider`
+- API key 存在
+- deepagents / langchain 相关依赖可导入
 
-When enabled, the deepagent is created with:
+创建后的 deepagent 具备：
 
-- model: `ChatOpenAI`
-- skills root: `src/hnsw_logic/agents/skills`
-- tools from the registry
-- subagent specs from config
+- `ChatOpenAI` 模型
+- skills root
+- tools
+- subagent specs
 - `FilesystemBackend`
 
 ```mermaid
@@ -696,29 +820,29 @@ flowchart TD
     E --> I["Subagent Specs / 子代理规格"]
 ```
 
-### Important nuance
+### 13.1 需要正确理解的一点
 
-The project is not using the deepagents object as the only execution engine today.
-It is better to think of it as:
+当前系统并不是“所有主流程都完全交给 deepagents runtime 执行”。
 
-- an integration layer
-- a future richer runtime path
-- a capability shell around the same subagent roles
+更准确的说法是：
 
-The explicit typed orchestrator remains the authoritative control path.
+- deepagents 是一个可接入的统一运行时壳层
+- 当前主链路仍是 typed orchestrator pipeline
+- 两者并不冲突
+- 但当前仓库的主生产路径仍然以前者兼容、以后者为主
 
 ---
 
-## 14. Failure Handling and Guard Rails
+## 14. 风险控制与 guard rails
 
-The system contains several explicit guard rails:
+当前系统为了避免 agent 无约束扩散，内置了多层 guard rails：
 
-- bounded retry only
-- graph write happens after judge and review
-- duplicate-edge suppression
-- mirror-edge generation only for selected relation types
-- anchor eligibility filtering before discovery
-- memory merge through deterministic code, not free-form agent state
+- bounded retry
+- judge + reviewer 双层判断
+- duplicate edge suppression
+- mirror edge 只对有限关系开放
+- anchor eligibility filtering
+- memory merge 走确定性代码
 
 ```mermaid
 flowchart TD
@@ -734,9 +858,9 @@ flowchart TD
 
 ---
 
-## 15. Practical Reading of the System
+## 15. 建议的阅读顺序
 
-If you want to understand the system in execution order, read it like this:
+如果要按代码执行顺序理解整套 agent 机制，推荐按这个顺序阅读：
 
 1. [bootstrap.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/bootstrap.py)
 2. [pipeline.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/services/pipeline.py)
@@ -746,23 +870,29 @@ If you want to understand the system in execution order, read it like this:
 6. [curator.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/memory/curator.py)
 7. [registry.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/tools/registry.py)
 
-This order mirrors the real implementation dependencies.
+这个顺序和真实实现依赖关系是基本一致的。
 
 ---
 
-## 16. Summary
+## 16. 总结
 
-The agent runtime of `gl-hnsw` is best understood as:
+当前 `gl-hnsw` 的 agent 运行机制可以概括为：
 
-- offline-first
-- orchestrator-controlled
-- multi-role
-- structured-context-driven
-- memory-explicit
-- deepagents-compatible
-- but not dependent on open-ended autonomous agent loops
+- 离线优先
+- 主编排器控制
+- 多 subagent 分工
+- 显式结构化上下文传递
+- 显式记忆管理
+- deepagents 兼容
+- 但不依赖无限自治循环
 
-That is the core reason the system can remain both:
+也正因为这样，它既能保持：
 
 - `agent-centric`
-- and still operationally stable enough to build a retrieval index.
+
+又能保持：
+
+- 可控
+- 可观测
+- 可持久化
+- 可作为真实检索索引构建系统运行

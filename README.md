@@ -20,7 +20,7 @@ then serves queries from the built index and graph without invoking agents onlin
 ## Documentation
 
 - [Architecture Guide](./docs/architecture.md)
-- [Agent Runtime Guide](./docs/agent-runtime.md)
+- [Agent 运行机制说明](./docs/agent-runtime.md)
 - [Benchmark Report](./docs/benchmark-report.md)
 - [Release Notes v0.1](./docs/release-v0.1.md)
 
