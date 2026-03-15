@@ -1786,3 +1786,47 @@ def test_parse_json_tolerates_fenced_json():
     payload = provider._parse_json("```json\n{\"accepted\": true, \"confidence\": 0.9}\n```")
     assert payload["accepted"] is True
     assert payload["confidence"] == 0.9
+
+
+def test_generic_discovery_uses_content_signals_without_dataset_shortcuts():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    scientific = _brief(
+        "sci-1",
+        "Dietary study on metabolic disease risk",
+        "This study reports evidence that dietary exposure changes disease risk in a population cohort.",
+        ["study", "dietary", "disease", "risk", "population"],
+        ["metabolic", "health"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "custom"},
+    )
+    argument = _brief(
+        "arg-1",
+        "Opposing claims in policy debate",
+        "The claim contrasts one policy position with an opposing alternative in the same debate.",
+        ["policy", "debate", "claim", "opposing", "alternative"],
+        ["speech"],
+        ["comparison", "contrast"],
+        {"source_dataset": "custom", "topic_cluster": "speech", "stance": "pro"},
+    )
+    generic = _brief(
+        "gen-1",
+        "Random utility script",
+        "A short helper function with no retrieval or evidence structure.",
+        ["helper", "script"],
+        [],
+        [],
+        {"source_dataset": "custom"},
+    )
+
+    assert orchestrator._doc_stage(scientific) == "scientific_evidence"
+    assert orchestrator._doc_stage(argument) == "argument_claim"
+    assert orchestrator.should_attempt_discovery(scientific) is True
+    assert orchestrator.should_attempt_discovery(argument) is True
+    assert orchestrator.discovery_anchor_priority(scientific) > orchestrator.discovery_anchor_priority(generic)
