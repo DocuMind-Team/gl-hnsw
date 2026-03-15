@@ -213,6 +213,43 @@ class LogicOrchestrator:
         self._embedding_cache[cache_key] = gain
         return gain
 
+    def _near_duplicate_penalty(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float] | None = None) -> float:
+        cache_key = f"duplicate::{anchor.doc_id}::{candidate.doc_id}"
+        cached = self._embedding_cache.get(cache_key)
+        if cached is not None:
+            return float(cached)
+        title_a = self._normalized_tokens({token for token in tokenize(anchor.title) if len(token) > 2})
+        title_b = self._normalized_tokens({token for token in tokenize(candidate.title) if len(token) > 2})
+        title_overlap = len(title_a & title_b) / max(1, len(title_a | title_b))
+        exact_title_match = 1.0 if " ".join(sorted(title_a)) == " ".join(sorted(title_b)) and title_a else 0.0
+        if metrics is None:
+            metrics = self._candidate_metrics(anchor, candidate)
+        bridge_gain = self._bridge_information_gain(anchor, candidate)
+        penalty = 0.0
+        if title_overlap >= 0.72:
+            penalty += 0.22
+        if exact_title_match >= 1.0:
+            penalty += 0.18
+        if metrics["content_overlap_score"] >= 0.9 and bridge_gain < 0.52:
+            penalty += 0.16
+        if metrics["mention_score"] >= 0.45 and metrics["novel_term_ratio"] >= 0.9 and bridge_gain < 0.48:
+            penalty += 0.08
+        penalty = max(0.0, min(penalty, 0.55))
+        self._embedding_cache[cache_key] = penalty
+        return penalty
+
+    def _is_effective_duplicate(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float] | None = None) -> bool:
+        title_a = self._normalized_tokens({token for token in tokenize(anchor.title) if len(token) > 2})
+        title_b = self._normalized_tokens({token for token in tokenize(candidate.title) if len(token) > 2})
+        if not title_a or not title_b:
+            return False
+        exact_title_match = " ".join(sorted(title_a)) == " ".join(sorted(title_b))
+        if not exact_title_match:
+            return False
+        if metrics is None:
+            metrics = self._candidate_metrics(anchor, candidate)
+        return metrics["content_overlap_score"] >= 0.85 and metrics["dense_score"] >= 0.7
+
     def _source_dataset(self, brief: DocBrief) -> str:
         return str(brief.metadata.get("source_dataset", "")).lower()
 
@@ -601,6 +638,7 @@ class LogicOrchestrator:
         stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
         methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
         bridge_gain = self._bridge_information_gain(anchor, candidate)
+        duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
         score = (
             0.28 * metrics["dense_score"]
             + 0.22 * metrics["local_support"]
@@ -636,6 +674,8 @@ class LogicOrchestrator:
             score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
         if relation_type == "supporting_evidence" and methodology_penalty > 0.0:
             score += 0.06 * methodology_penalty
+        if relation_type in {"supporting_evidence", "same_concept", "comparison"}:
+            score -= 0.28 * duplicate_penalty
         return max(0.0, min(score, 1.0))
 
     def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
@@ -664,6 +704,8 @@ class LogicOrchestrator:
             risk_flags.append("weak_family_bridge")
         if relation_type in {"same_concept", "supporting_evidence"} and self._bridge_information_gain(anchor, candidate) < 0.34:
             risk_flags.append("low_bridge_gain")
+        if self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.34:
+            risk_flags.append("near_duplicate")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -2177,6 +2219,17 @@ class LogicOrchestrator:
             and self._bridge_information_gain(anchor, candidate) < 0.52
         ):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if (
+            final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
+            and self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.38
+            and self._bridge_information_gain(anchor, candidate) < 0.62
+        ):
+            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if (
+            final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
+            and self._is_effective_duplicate(anchor, candidate, metrics)
+        ):
+            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._passes_structural_gate(anchor, candidate, metrics, final_result):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "implementation_detail":
@@ -2306,6 +2359,7 @@ class LogicOrchestrator:
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
             bridge_gain = self._bridge_information_gain(anchor, candidate)
+            duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2323,6 +2377,7 @@ class LogicOrchestrator:
                 + 0.06 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
                 + same_concept_bonus
+                - 0.22 * duplicate_penalty
             )
             proposals.append(
                 (
@@ -2360,6 +2415,7 @@ class LogicOrchestrator:
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
             bridge_gain = self._bridge_information_gain(anchor, candidate)
+            duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2378,6 +2434,7 @@ class LogicOrchestrator:
                 + 0.04 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
                 + same_concept_bonus
+                - 0.22 * duplicate_penalty
             )
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
