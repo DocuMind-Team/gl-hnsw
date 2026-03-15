@@ -162,6 +162,7 @@ class HybridRetrievalService:
         if getattr(strategy, "sparse_gate", 1.0) <= 0.0 and not getattr(strategy, "allow_sparse_only", True):
             return []
         query_tokens = {token for token in tokenize(query) if len(token) > 2}
+        query_specificity = self.scorer.query_specificity(query)
         brief_rows = list(briefs.values())
         if self._sparse_doc_count != len(brief_rows):
             self._sparse.build(brief_rows, self._records_by_id)
@@ -199,6 +200,7 @@ class HybridRetrievalService:
                 continue
             query_alignment = self.scorer.query_alignment(query, brief)
             structure_alignment = self.scorer.structure_alignment(query, brief)
+            title_claim_alignment = self.scorer.title_claim_alignment(query, brief)
             if query_alignment <= 0.0 and structure_alignment <= 0.0 and sparse_score < 0.55 and score < 0.7:
                 continue
             dense_rank = dense_rank_map.get(doc_id)
@@ -250,6 +252,9 @@ class HybridRetrievalService:
                 strong_structure = structure_alignment >= 0.2
                 strong_semantic = query_alignment >= 0.28 and score >= 0.35
                 strong_raw = raw_coverage >= self.sparse_only_min_raw_coverage and score >= 0.4
+                precision_guard = title_claim_alignment >= (0.14 + 0.18 * query_specificity)
+                if query_specificity >= 0.7 and not precision_guard and score < 0.72:
+                    continue
                 if (not getattr(strategy, "allow_sparse_only", True)) or (
                     agreement_gate < self.sparse_only_min_agreement and not (strong_structure or strong_semantic or strong_raw)
                 ):
@@ -323,6 +328,7 @@ class HybridRetrievalService:
     def _apply_graph_neighborhood_bonus(self, query: str, query_emb, ranked: list[dict], briefs: dict[str, object]) -> list[dict]:
         if not ranked:
             return ranked
+        query_specificity = self.scorer.query_specificity(query)
         ranked_ids = {row["doc_id"] for row in ranked}
         for row in ranked:
             if row["source_kind"] != "geometric" or row["logical_score"] > 0.0:
@@ -342,16 +348,27 @@ class HybridRetrievalService:
                 target_brief = briefs.get(edge.dst_doc_id)
                 if target_brief is None:
                     continue
+                edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
                 target_rel = self.scorer.score_target(query, query_emb, target_brief)
                 if target_rel < (0.42 if same_concept_bridge else 0.35):
                     continue
                 target_alignment = self.scorer.query_alignment(query, target_brief)
                 if target_alignment < (0.3 if same_concept_bridge else 0.24):
                     continue
+                if same_concept_bridge and edge_alignment < (0.14 + 0.1 * query_specificity):
+                    continue
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
                 utility_multiplier = 0.5 + 0.5 * edge_utility
                 base_bonus = 0.16 if not same_concept_bridge else 0.12
-                bonus = base_bonus * edge.confidence * utility_multiplier * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
+                bonus = (
+                    base_bonus
+                    * edge.confidence
+                    * utility_multiplier
+                    * target_rel
+                    * relation_multiplier
+                    * min(1.0, 0.55 + source_alignment)
+                    * (0.4 + 0.6 * edge_alignment)
+                )
                 if edge.dst_doc_id in ranked_ids:
                     bonus *= 1.15
                 best_bonus = max(best_bonus, bonus)
@@ -394,6 +411,7 @@ class HybridRetrievalService:
 
     def _graph_budget(self, query: str, query_emb, seed_rows: list[tuple[str, float, str]], briefs: dict[str, object], strategy) -> tuple[int, int]:
         graph_gate = max(0.0, getattr(strategy, "graph_gate", 0.0))
+        query_specificity = self.scorer.query_specificity(query)
         base_max_seeds = max(1, math.ceil(self.jump_policy.max_seeds * graph_gate))
         base_max_expansions = max(0, math.ceil(self.jump_policy.max_expansions_per_seed * graph_gate))
         if (
@@ -429,6 +447,7 @@ class HybridRetrievalService:
                     continue
                 target_rel_score = self.scorer.score_target(query, query_emb, target_brief)
                 target_alignment = max(self.scorer.query_alignment(query, target_brief), self.scorer.structure_alignment(query, target_brief))
+                edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
                 edge_utility = max(0.0, min(1.0, getattr(edge, "utility_score", edge.confidence)))
                 edge_promise = (
@@ -436,9 +455,9 @@ class HybridRetrievalService:
                     + 0.26 * edge.confidence
                     + 0.24 * target_rel_score
                     + 0.16 * target_alignment
-                ) * relation_multiplier
+                ) * relation_multiplier * (0.35 + 0.65 * edge_alignment)
                 if edge.relation_type == "same_concept":
-                    edge_promise *= 0.97
+                    edge_promise *= 0.9 + 0.08 * max(0.0, 1.0 - query_specificity)
                 best_edge_promise = max(best_edge_promise, edge_promise)
                 if edge_promise >= self.adaptive_graph_min_promise:
                     edge_hits += 1
@@ -534,7 +553,12 @@ class HybridRetrievalService:
                     continue
                 edge_emb = self.scorer.edge_embedding(edge)
                 target_rel_score = self.scorer.score_target(query, query_emb, brief)
+                edge_query_alignment = self.scorer.edge_query_alignment(query, edge, brief)
                 if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score):
+                    if edge.relation_type == "same_concept":
+                        threshold = 0.12 + 0.12 * self.scorer.query_specificity(query)
+                        if edge_query_alignment < threshold:
+                            continue
                     expanded.append(
                         ExpandedCandidate(
                             doc_id=edge.dst_doc_id,
@@ -543,6 +567,7 @@ class HybridRetrievalService:
                             seed_score=seed_score,
                             edge_match=float(query_emb.dot(edge_emb)),
                             target_rel_score=target_rel_score,
+                            edge_query_alignment=edge_query_alignment,
                         )
                     )
         ranked = self.scorer.rank(query, query_emb, seeds, expanded, briefs, top_k)

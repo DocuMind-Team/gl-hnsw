@@ -19,6 +19,7 @@ class ExpandedCandidate:
     seed_score: float
     edge_match: float
     target_rel_score: float
+    edge_query_alignment: float
 
 
 class RetrievalScorer:
@@ -65,6 +66,18 @@ class RetrievalScorer:
     def _query_tokens(self, query: str) -> set[str]:
         return {token for token in tokenize(query) if len(token) > 2}
 
+    def query_specificity(self, query: str) -> float:
+        query_tokens = list(self._query_tokens(query))
+        if not query_tokens:
+            return 0.0
+        short_query = min(1.0, 3.0 / len(query_tokens))
+        content_rich = min(sum(1 for token in query_tokens if len(token) >= 5) / len(query_tokens), 1.0)
+        alpha_numeric = min(
+            sum(1 for token in query_tokens if any(char.isdigit() for char in token)) / len(query_tokens),
+            1.0,
+        )
+        return min(1.0, 0.55 * short_query + 0.35 * content_rich + 0.1 * alpha_numeric)
+
     def encode_query(self, query: str) -> np.ndarray:
         return self.provider.embed_texts([query])[0]
 
@@ -106,6 +119,21 @@ class RetrievalScorer:
         if not overlap:
             return 0.0
         return min(len(overlap) / max(1, min(len(query_tokens), 3)), 1.0)
+
+    def title_claim_alignment(self, query: str, brief: DocBrief) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        views = self._brief_views(brief)
+        title_tokens = {token for token in tokenize(brief.title) if len(token) > 2}
+        claim_tokens = {token for token in tokenize(views["claims"]) if len(token) > 2}
+        title_overlap = len(query_tokens & title_tokens)
+        claim_overlap = len(query_tokens & claim_tokens)
+        score = (
+            0.62 * min(title_overlap / max(1, min(len(query_tokens), 2)), 1.0)
+            + 0.38 * min(claim_overlap / max(1, min(len(query_tokens), 3)), 1.0)
+        )
+        return min(score, 1.0)
 
     def seed_score(self, query: str, query_emb: np.ndarray, brief: DocBrief) -> float:
         title_emb = self._view_embedding(brief, "title")
@@ -167,6 +195,29 @@ class RetrievalScorer:
             self._edge_embedding_cache[edge.edge_card_text] = edge_emb
         return edge_emb
 
+    def edge_query_alignment(self, query: str, edge: LogicEdge, target_brief: DocBrief) -> float:
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        edge_tokens = {token for token in tokenize(edge.edge_card_text) if len(token) > 2}
+        evidence_tokens = {
+            token
+            for span in edge.evidence_spans
+            for token in tokenize(span)
+            if len(token) > 2
+        }
+        title_claim = self.title_claim_alignment(query, target_brief)
+        structural = self.structure_alignment(query, target_brief)
+        edge_overlap = len(query_tokens & edge_tokens)
+        evidence_overlap = len(query_tokens & evidence_tokens)
+        score = (
+            0.28 * min(edge_overlap / max(1, min(len(query_tokens), 2)), 1.0)
+            + 0.22 * min(evidence_overlap / max(1, min(len(query_tokens), 2)), 1.0)
+            + 0.34 * title_claim
+            + 0.16 * structural
+        )
+        return min(score, 1.0)
+
     def rank(
         self,
         query: str,
@@ -194,7 +245,16 @@ class RetrievalScorer:
             relation_multiplier = self.relation_query_multiplier(query, target_brief, candidate.edge)
             edge_utility = max(0.0, min(getattr(candidate.edge, "utility_score", candidate.edge.confidence), 1.0))
             utility_multiplier = 0.5 + 0.5 * edge_utility
-            logic_score = candidate.seed_score * candidate.edge.confidence * utility_multiplier * candidate.edge_match * candidate.target_rel_score * relation_multiplier
+            edge_alignment = max(candidate.edge_query_alignment, self.query_alignment(query, target_brief))
+            logic_score = (
+                candidate.seed_score
+                * candidate.edge.confidence
+                * utility_multiplier
+                * candidate.edge_match
+                * candidate.target_rel_score
+                * relation_multiplier
+                * (0.3 + 0.7 * edge_alignment)
+            )
             row = merged.setdefault(
                 candidate.doc_id,
                 {
