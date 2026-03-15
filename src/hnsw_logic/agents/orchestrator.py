@@ -400,6 +400,24 @@ class LogicOrchestrator:
             return 0.0
         return min(len(shared) / 2.0, 1.0)
 
+    def _specific_title_bridge_potential(self, anchor: DocBrief, corpus: list[DocBrief]) -> float:
+        anchor_terms = self._specific_title_terms(anchor)
+        if not anchor_terms:
+            return 0.0
+        scores: list[float] = []
+        for candidate in corpus:
+            if candidate.doc_id == anchor.doc_id:
+                continue
+            shared = anchor_terms & self._specific_title_terms(candidate)
+            if not shared:
+                continue
+            scores.append(min(len(shared) / 2.0, 1.0))
+        if not scores:
+            return 0.0
+        scores.sort(reverse=True)
+        head = scores[:2]
+        return min(sum(head) / len(head), 1.0)
+
     def _detail_density(self, brief: DocBrief) -> float:
         content_terms = self._content_terms(brief)
         cue_hits = len(content_terms & DETAIL_CUES)
@@ -1734,11 +1752,19 @@ class LogicOrchestrator:
                 ordered.extend(brief.doc_id for brief in group[: min(len(group), 6)])
                 continue
             centrality, neighborhoods = self._dense_anchor_neighborhoods(group)
+            specific_bridge_potential = {
+                brief.doc_id: self._specific_title_bridge_potential(brief, group)
+                for brief in group
+            }
             cap_base = max(6, min(len(group), len(group) // 8 + 4))
             cap = max(6, min(len(group), int(round(cap_base * (0.9 + 0.42 * profile["graph_potential"])))))
             floor = max(0.34, min(0.54, 0.54 - 0.16 * profile["graph_potential"] + 0.04 * profile["argument_ratio"]))
             priority_map = {
-                brief.doc_id: 0.72 * self.discovery_anchor_priority(brief) + 0.28 * centrality.get(brief.doc_id, 0.0)
+                brief.doc_id: (
+                    0.64 * self.discovery_anchor_priority(brief)
+                    + 0.24 * centrality.get(brief.doc_id, 0.0)
+                    + 0.12 * specific_bridge_potential.get(brief.doc_id, 0.0)
+                )
                 for brief in group
             }
             eligible = [brief for brief in group if priority_map.get(brief.doc_id, 0.0) >= floor]
@@ -1758,7 +1784,8 @@ class LogicOrchestrator:
                         coverage_gain += max(0.0, weight - coverage.get(neighbor_id, 0.0))
                     cluster_bonus = 0.06 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
                     specificity_bonus = 0.04 * max(self._title_specificity_score(brief), 0.0)
-                    score = 0.58 * base_score + 0.34 * coverage_gain + cluster_bonus + specificity_bonus
+                    bridge_bonus = 0.08 * specific_bridge_potential.get(brief.doc_id, 0.0)
+                    score = 0.54 * base_score + 0.3 * coverage_gain + cluster_bonus + specificity_bonus + bridge_bonus
                     if score > best_score:
                         best_score = score
                         best_id = brief.doc_id
