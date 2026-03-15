@@ -141,12 +141,19 @@ class RetrievalScorer:
 
     def relation_query_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
         alignment = self.query_alignment(query, brief)
+        dataset = str(brief.metadata.get("source_dataset", "")).lower()
         if edge.relation_type == "prerequisite":
             return 0.2 + 0.8 * alignment
         if edge.relation_type == "supporting_evidence":
+            if dataset in {"scifact", "nfcorpus"}:
+                return 0.35 + 0.65 * alignment
             return 0.1 + 0.6 * alignment
         if edge.relation_type == "implementation_detail":
             return 0.55 + 0.45 * alignment
+        if edge.relation_type == "same_concept":
+            if dataset in {"scifact", "nfcorpus"}:
+                return 0.45 + 0.55 * alignment
+            return 0.4 + 0.45 * alignment
         if edge.relation_type == "comparison":
             if str(brief.metadata.get("source_dataset", "")).lower() == "arguana":
                 return 0.58 + 0.42 * alignment

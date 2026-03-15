@@ -237,6 +237,10 @@ def evaluate_beir_dataset(
     else:
         build_stub_briefs(app)
 
+    briefs = list(app.brief_store.all())
+    if briefs:
+        app.retrieval.scorer.preload_views(briefs, ("title", "summary", "claims", "relation", "full"))
+
     baseline_rows = []
     supplemental_rows = []
     for item in beir.queries:

@@ -198,6 +198,56 @@ def test_search_keeps_dense_result_score_when_sparse_raw_text_agrees(tmp_path: P
     assert by_id["doc-b"].final_score == 0.61
 
 
+def test_search_preserves_dense_score_for_external_scientific_dataset(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief(
+            "doc-a",
+            "Neural Stem Cells",
+            "Neural stem cells respond to receptor signaling.",
+            claims=["Adult neural stem cells respond to CD95 signaling."],
+            keywords=["stem", "cells", "signaling"],
+            relation_hints=["claim", "evidence", "study"],
+            metadata={"topic": "scientific_claims", "source_dataset": "scifact"},
+        ),
+        _brief(
+            "doc-b",
+            "Chromosome Segregation",
+            "Stem cells do not segregate chromosomes asymmetrically.",
+            claims=["Hematopoietic stem cells do not segregate chromosomes asymmetrically."],
+            keywords=["stem", "cells", "chromosomes", "segregate"],
+            relation_hints=["claim", "evidence", "study"],
+            metadata={"topic": "scientific_claims", "source_dataset": "scifact"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-a", score=0.72, rank=1),
+                Neighbor(doc_id="doc-b", score=0.70, rank=2),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Neural Stem Cells", text="Adult neural stem cells respond to receptor signaling.", metadata={"source_dataset": "scifact"}),
+                DocRecord(doc_id="doc-b", title="Chromosome Segregation", text="Hematopoietic stem cells do not segregate chromosomes asymmetrically.", metadata={"source_dataset": "scifact"}),
+            ]
+        ),
+    )
+
+    response = service.search("Do stem cells segregate chromosomes asymmetrically?", top_k=2, use_memory_bias=False)
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert by_id["doc-b"].source_kind == "geometric"
+    assert by_id["doc-b"].final_score == 0.70
+
+
 def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
