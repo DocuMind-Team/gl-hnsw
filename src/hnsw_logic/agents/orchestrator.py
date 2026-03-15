@@ -131,6 +131,88 @@ class LogicOrchestrator:
     def _brief_text(self, brief: DocBrief) -> str:
         return " ".join([brief.title, brief.summary, *brief.claims]).lower()
 
+    def _embed_text_cached(self, text: str):
+        key = f"text::{text}"
+        cached = self._embedding_cache.get(key)
+        if cached is not None:
+            return cached
+        provider = self._provider()
+        if provider is None:
+            return None
+        vector = provider.embed_texts([text])[0]
+        self._embedding_cache[key] = vector
+        return vector
+
+    def _surrogate_query_terms(self, brief: DocBrief) -> list[str]:
+        prioritized = [
+            *tokenize(brief.title),
+            *tokenize(" ".join(brief.entities)),
+            *tokenize(" ".join(brief.keywords)),
+            *tokenize(" ".join(brief.relation_hints)),
+            *tokenize(" ".join(brief.claims[:2])),
+        ]
+        terms: list[str] = []
+        seen: set[str] = set()
+        for token in prioritized:
+            if len(token) <= 3 or token in CONTENT_STOPWORDS:
+                continue
+            normalized = self._normalize_token(token)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            terms.append(token)
+            if len(terms) >= 10:
+                break
+        return terms
+
+    def _bridge_information_gain(self, anchor: DocBrief, candidate: DocBrief) -> float:
+        cache_key = f"bridge::{anchor.doc_id}::{candidate.doc_id}"
+        cached = self._embedding_cache.get(cache_key)
+        if cached is not None:
+            return float(cached)
+
+        anchor_terms = set(self._surrogate_query_terms(anchor))
+        candidate_terms = set(self._surrogate_query_terms(candidate))
+        normalized_anchor_terms = self._normalized_tokens(anchor_terms)
+        normalized_candidate_terms = self._normalized_tokens(candidate_terms)
+        shared_terms = normalized_anchor_terms & normalized_candidate_terms
+        novel_terms = normalized_candidate_terms - normalized_anchor_terms
+        shared_ratio = min(len(shared_terms) / max(1, min(len(normalized_anchor_terms), len(normalized_candidate_terms), 5)), 1.0)
+        novel_ratio = min(len(novel_terms) / max(1, min(len(normalized_candidate_terms), 5)), 1.0)
+        balanced_novelty = max(0.0, 1.0 - abs(novel_ratio - 0.35) / 0.45)
+
+        anchor_vec = self._embed_brief(anchor)
+        candidate_vec = self._embed_brief(candidate)
+        query_texts = [anchor.title]
+        surrogate_terms = self._surrogate_query_terms(anchor)
+        if surrogate_terms:
+            query_texts.append(" ".join(surrogate_terms[:8]))
+        alignments: list[tuple[float, float]] = []
+        for query_text in query_texts:
+            query_vec = self._embed_text_cached(query_text)
+            if query_vec is None or anchor_vec is None or candidate_vec is None:
+                continue
+            alignments.append((max(cosine(query_vec, anchor_vec), 0.0), max(cosine(query_vec, candidate_vec), 0.0)))
+        if alignments:
+            anchor_alignment = sum(item[0] for item in alignments) / len(alignments)
+            candidate_alignment = sum(item[1] for item in alignments) / len(alignments)
+        else:
+            anchor_alignment = 0.55 * shared_ratio + 0.25 * max(self._title_specificity_score(anchor), 0.0)
+            candidate_alignment = 0.55 * shared_ratio + 0.25 * max(self._title_specificity_score(candidate), 0.0)
+        bridge_coverage = min(anchor_alignment, candidate_alignment)
+        bridge_stability = max(0.0, 1.0 - max(anchor_alignment - candidate_alignment, 0.0))
+        specificity_gain = min(max(self._title_specificity_score(candidate), 0.0) / 1.2, 1.0)
+        gain = (
+            0.38 * bridge_coverage
+            + 0.24 * shared_ratio
+            + 0.2 * balanced_novelty
+            + 0.1 * bridge_stability
+            + 0.08 * specificity_gain
+        )
+        gain = max(0.0, min(gain, 1.0))
+        self._embedding_cache[cache_key] = gain
+        return gain
+
     def _source_dataset(self, brief: DocBrief) -> str:
         return str(brief.metadata.get("source_dataset", "")).lower()
 
@@ -518,6 +600,7 @@ class LogicOrchestrator:
     def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
         stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
         methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+        bridge_gain = self._bridge_information_gain(anchor, candidate)
         score = (
             0.28 * metrics["dense_score"]
             + 0.22 * metrics["local_support"]
@@ -526,6 +609,7 @@ class LogicOrchestrator:
             + 0.08 * metrics["forward_reference_score"]
             + 0.06 * metrics["content_overlap_score"]
             + 0.08 * metrics["topic_alignment"]
+            + 0.12 * bridge_gain
             + max(self._relation_stage_bonus(anchor, candidate, relation_type, metrics), 0.0) * 0.1
         )
         if relation_type == "implementation_detail" and stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}:
@@ -546,6 +630,7 @@ class LogicOrchestrator:
             score -= 0.3 * methodology_penalty
             score += 0.16 * metrics["novelty_bridge_score"]
             score += 0.1 * metrics["shared_dominant_family"]
+            score += 0.16 * bridge_gain
             score -= 0.1 * max(0.0, 0.42 - metrics["family_bridge_score"])
             score -= 0.14 * max(0.0, 0.14 - metrics["novel_term_ratio"])
             score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
@@ -577,6 +662,8 @@ class LogicOrchestrator:
             or (metrics["shared_dominant_family"] < 1.0 and metrics["entity_overlap"] < 1.0)
         ):
             risk_flags.append("weak_family_bridge")
+        if relation_type in {"same_concept", "supporting_evidence"} and self._bridge_information_gain(anchor, candidate) < 0.34:
+            risk_flags.append("low_bridge_gain")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -2084,6 +2171,12 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if (
+            final_result.relation_type == "same_concept"
+            and self._supports_same_concept_pair(anchor, candidate)
+            and self._bridge_information_gain(anchor, candidate) < 0.52
+        ):
+            return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._passes_structural_gate(anchor, candidate, metrics, final_result):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.relation_type == "implementation_detail":
@@ -2148,15 +2241,18 @@ class LogicOrchestrator:
             ):
                 return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
 
+        bridge_gain = self._bridge_information_gain(anchor, candidate)
         score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
         score *= 1.0 + 0.16 * fit_scores.get(final_result.relation_type, rerank_score)
         score *= 0.85 + 0.4 * blended_utility
+        score *= 0.9 + 0.25 * bridge_gain
         if final_result.relation_type == "implementation_detail":
             score *= 1.0 + max(self._implementation_direction_score(anchor, candidate, metrics), 0.0)
         if final_result.relation_type == "same_concept" and self._supports_same_concept_pair(anchor, candidate):
             methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
             score *= 1.0 + 0.18 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.6)
             score *= max(0.72, 1.0 - 0.28 * methodology_penalty)
+            score *= 0.92 + 0.22 * bridge_gain
         if final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
             score *= 1.0 + 0.12 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.5)
         if (
@@ -2209,6 +2305,7 @@ class LogicOrchestrator:
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
+            bridge_gain = self._bridge_information_gain(anchor, candidate)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2221,6 +2318,7 @@ class LogicOrchestrator:
             score = (
                 metrics["local_support"]
                 + 0.42 * rerank_score
+                + 0.16 * bridge_gain
                 + 0.08 * fit_scores["implementation_detail"]
                 + 0.06 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
@@ -2261,6 +2359,7 @@ class LogicOrchestrator:
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
             if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
                 continue
+            bridge_gain = self._bridge_information_gain(anchor, candidate)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2274,6 +2373,7 @@ class LogicOrchestrator:
                 0.55 * proposal.score_hint
                 + metrics["local_support"]
                 + 0.34 * rerank_score
+                + 0.16 * bridge_gain
                 + 0.06 * fit_scores["implementation_detail"]
                 + 0.04 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
