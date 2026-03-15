@@ -75,6 +75,14 @@ CLINICAL_BRIDGE_TERMS = {
     "clinical", "condition", "treatment", "therapy", "diagnosis", "symptom", "patient", "patients",
     "disease", "risk", "metabolic", "nutrition", "outcome", "outcomes",
 }
+GENERIC_TITLE_BRIDGE_TOKENS = {
+    "analysis", "approach", "benefit", "benefits", "cancer", "cell", "cells", "child", "children",
+    "clinical", "development", "disease", "diseases", "effect", "effects", "exposure", "fatty",
+    "health", "human", "humans", "induced", "infant", "infants", "interaction", "maintenance",
+    "multiple", "nutrition", "outcome", "outcomes", "patient", "patients", "protein", "regulates",
+    "regulation", "response", "responses", "review", "risk", "risks", "service", "signaling",
+    "study", "system", "systems", "treatment", "treatments", "visual",
+}
 
 
 @dataclass(slots=True)
@@ -378,6 +386,20 @@ class LogicOrchestrator:
         score -= 0.3 * len(tokens & LOW_SPECIFICITY_TITLE_TERMS)
         return max(-0.6, min(score, 1.2))
 
+    def _specific_title_terms(self, brief: DocBrief) -> set[str]:
+        tokens = {self._normalize_token(token) for token in tokenize(brief.title) if len(token) > 3}
+        return {
+            token
+            for token in tokens
+            if len(token) >= 7 and token not in GENERIC_TITLE_BRIDGE_TOKENS
+        }
+
+    def _specific_title_bridge_score(self, anchor: DocBrief, candidate: DocBrief) -> float:
+        shared = self._specific_title_terms(anchor) & self._specific_title_terms(candidate)
+        if not shared:
+            return 0.0
+        return min(len(shared) / 2.0, 1.0)
+
     def _detail_density(self, brief: DocBrief) -> float:
         content_terms = self._content_terms(brief)
         cue_hits = len(content_terms & DETAIL_CUES)
@@ -639,6 +661,7 @@ class LogicOrchestrator:
         methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
         bridge_gain = self._bridge_information_gain(anchor, candidate)
         duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
+        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
         score = (
             0.28 * metrics["dense_score"]
             + 0.22 * metrics["local_support"]
@@ -648,6 +671,7 @@ class LogicOrchestrator:
             + 0.06 * metrics["content_overlap_score"]
             + 0.08 * metrics["topic_alignment"]
             + 0.12 * bridge_gain
+            + 0.08 * specific_title_bridge
             + max(self._relation_stage_bonus(anchor, candidate, relation_type, metrics), 0.0) * 0.1
         )
         if relation_type == "implementation_detail" and stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}:
@@ -669,6 +693,7 @@ class LogicOrchestrator:
             score += 0.16 * metrics["novelty_bridge_score"]
             score += 0.1 * metrics["shared_dominant_family"]
             score += 0.16 * bridge_gain
+            score += 0.16 * specific_title_bridge
             score -= 0.1 * max(0.0, 0.42 - metrics["family_bridge_score"])
             score -= 0.14 * max(0.0, 0.14 - metrics["novel_term_ratio"])
             score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
@@ -704,6 +729,8 @@ class LogicOrchestrator:
             risk_flags.append("weak_family_bridge")
         if relation_type in {"same_concept", "supporting_evidence"} and self._bridge_information_gain(anchor, candidate) < 0.34:
             risk_flags.append("low_bridge_gain")
+        if relation_type == "same_concept" and self._specific_title_bridge_score(anchor, candidate) < 0.2 and metrics["title_overlap"] < 2.0:
+            risk_flags.append("low_specific_title_bridge")
         if self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.34:
             risk_flags.append("near_duplicate")
         return JudgeSignals(
@@ -1031,11 +1058,13 @@ class LogicOrchestrator:
             selected_terms.append(self._normalized_tokens(self._content_terms(chosen_candidate)) if chosen_candidate is not None else set())
         return selected
 
-    def _dense_neighbor_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
+    def _dense_neighbor_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False) -> list[tuple[float, CandidateProposal]]:
         anchor_vec = self._embed_brief(anchor)
         if anchor_vec is None:
             return []
         proposals: list[tuple[float, CandidateProposal]] = []
+        dense_floor = 0.52 if expanded else 0.56
+        cap = 14 if expanded else 10
         for candidate in corpus:
             if candidate.doc_id == anchor.doc_id:
                 continue
@@ -1043,7 +1072,7 @@ class LogicOrchestrator:
             if candidate_vec is None:
                 continue
             dense_score = max(cosine(anchor_vec, candidate_vec), 0.0)
-            if dense_score < 0.56:
+            if dense_score < dense_floor:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
@@ -1073,7 +1102,7 @@ class LogicOrchestrator:
                 )
             )
         proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
-        return proposals[:10]
+        return proposals[:cap]
 
     def _mention_score(self, anchor: DocBrief, candidate: DocBrief) -> float:
         anchor_text = self._brief_text(anchor)
@@ -1331,6 +1360,7 @@ class LogicOrchestrator:
             )
         if relation_type == "same_concept":
             methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
             scientific_supported = (
                 self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
                 and self._doc_stage(candidate) == self._doc_stage(anchor)
@@ -1348,11 +1378,13 @@ class LogicOrchestrator:
                     metrics["shared_dominant_family"] >= 1.0
                     or metrics["title_overlap"] >= 2.0
                     or metrics["entity_overlap"] >= 1.0
+                    or specific_title_bridge >= 0.5
                 )
                 and (
                     metrics["title_overlap"] >= 1.0
                     or metrics["mention_score"] >= 0.12
                     or metrics["content_overlap_score"] >= 0.24
+                    or specific_title_bridge >= 0.5
                 )
                 and not (
                     methodology_penalty >= 0.55
@@ -1365,10 +1397,12 @@ class LogicOrchestrator:
                 and (
                     metrics["family_bridge_score"] >= 0.45
                     or (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0)
+                    or specific_title_bridge >= 0.5
                 )
                 and (
                     metrics["overlap_score"] >= 0.3
                     or metrics["topic_cluster_match"] >= 1.0
+                    or specific_title_bridge >= 0.5
                 )
                 and not (
                     methodology_penalty >= 0.42
@@ -2349,7 +2383,7 @@ class LogicOrchestrator:
             return self.doc_profiler.run_many(docs)
         return [self.profile(doc) for doc in docs]
 
-    def _local_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
+    def _local_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False) -> list[tuple[float, CandidateProposal]]:
         proposals: list[tuple[float, CandidateProposal]] = []
         for candidate in corpus:
             if candidate.doc_id == anchor.doc_id:
@@ -2360,6 +2394,7 @@ class LogicOrchestrator:
                 continue
             bridge_gain = self._bridge_information_gain(anchor, candidate)
             duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
+            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2373,6 +2408,7 @@ class LogicOrchestrator:
                 metrics["local_support"]
                 + 0.42 * rerank_score
                 + 0.16 * bridge_gain
+                + 0.14 * specific_title_bridge
                 + 0.08 * fit_scores["implementation_detail"]
                 + 0.06 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
@@ -2391,19 +2427,23 @@ class LogicOrchestrator:
                 )
             )
         proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
-        return proposals[:8]
+        return proposals[: (12 if expanded else 8)]
 
-    def _live_candidate_limit(self, anchor: DocBrief) -> int:
+    def _live_candidate_limit(self, anchor: DocBrief, *, expanded: bool = False) -> int:
         anchor_text = self._brief_text(anchor)
         if self._is_argumentative_doc(anchor):
-            return max(self._edge_quality().max_judge_candidates_live, 8)
+            limit = max(self._edge_quality().max_judge_candidates_live, 8)
+            return limit + 3 if expanded else limit
         if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
-            return max(self._edge_quality().max_judge_candidates_live, 10)
+            limit = max(self._edge_quality().max_judge_candidates_live, 10)
+            return limit + 4 if expanded else limit
         if any(word in anchor_text for word in LISTING_WORDS):
-            return max(self._edge_quality().max_judge_candidates_live, 8)
-        return max(self._edge_quality().max_judge_candidates_live, 6)
+            limit = max(self._edge_quality().max_judge_candidates_live, 8)
+            return limit + 2 if expanded else limit
+        limit = max(self._edge_quality().max_judge_candidates_live, 6)
+        return limit + 2 if expanded else limit
 
-    def scout(self, anchor: DocBrief, corpus: list[DocBrief]):
+    def scout(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False):
         brief_map = {brief.doc_id: brief for brief in corpus}
         merged: dict[str, tuple[float, CandidateProposal]] = {}
         for proposal in self.corpus_scout.run(anchor, corpus):
@@ -2416,6 +2456,7 @@ class LogicOrchestrator:
                 continue
             bridge_gain = self._bridge_information_gain(anchor, candidate)
             duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
+            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
             same_concept_bonus = 0.0
             if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
                 methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
@@ -2430,6 +2471,7 @@ class LogicOrchestrator:
                 + metrics["local_support"]
                 + 0.34 * rerank_score
                 + 0.16 * bridge_gain
+                + 0.14 * specific_title_bridge
                 + 0.06 * fit_scores["implementation_detail"]
                 + 0.04 * fit_scores["supporting_evidence"]
                 + 0.08 * fit_scores.get("comparison", 0.0)
@@ -2440,12 +2482,12 @@ class LogicOrchestrator:
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, CandidateProposal(doc_id=proposal.doc_id, reason=proposal.reason, query=proposal.query, score_hint=min(score, 0.99)))
 
-        for score, proposal in self._local_candidate_proposals(anchor, corpus):
+        for score, proposal in self._local_candidate_proposals(anchor, corpus, expanded=expanded):
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
 
-        for score, proposal in self._dense_neighbor_candidate_proposals(anchor, corpus):
+        for score, proposal in self._dense_neighbor_candidate_proposals(anchor, corpus, expanded=expanded):
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
@@ -2455,7 +2497,7 @@ class LogicOrchestrator:
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
 
-        limit = self._live_candidate_limit(anchor) if self._is_live_provider() else 6
+        limit = self._live_candidate_limit(anchor, expanded=expanded) if self._is_live_provider() else (8 if expanded else 6)
         scored: list[tuple[float, str, CandidateProposal]] = []
         for score, proposal in merged.values():
             candidate = brief_map.get(proposal.doc_id)

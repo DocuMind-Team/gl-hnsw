@@ -82,6 +82,16 @@ class LogicDiscoveryService:
         proposals = self.orchestrator.scout(anchor, briefs)
         candidate_docs = [brief_map[proposal.doc_id] for proposal in proposals if proposal.doc_id in brief_map]
         assessments = self.orchestrator.judge_many_with_diagnostics(anchor, candidate_docs)
+        if (
+            self.orchestrator._is_live_provider()
+            and not any(item.accepted for item in assessments)
+            and self.orchestrator.discovery_anchor_priority(anchor) >= 0.42
+        ):
+            retry_proposals = self.orchestrator.scout(anchor, briefs, expanded=True)
+            seen_ids = {item.candidate_doc_id for item in assessments}
+            retry_docs = [brief_map[proposal.doc_id] for proposal in retry_proposals if proposal.doc_id in brief_map and proposal.doc_id not in seen_ids]
+            if retry_docs:
+                assessments.extend(self.orchestrator.judge_many_with_diagnostics(anchor, retry_docs))
         accepted = [item.edge for item in assessments if item.accepted and item.edge is not None]
         accepted = self._augment_with_mirror_edges(accepted)
         accepted_ids = {edge.dst_doc_id for edge in accepted}
