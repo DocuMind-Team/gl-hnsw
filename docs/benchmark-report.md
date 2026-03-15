@@ -38,13 +38,13 @@
 
 ```mermaid
 flowchart TD
-    A["Corpus Slice"] --> B["build_embeddings"]
-    B --> C["build_hnsw"]
-    C --> D["profile_docs (offline agent)"]
-    D --> E["discover_edges (offline agent)"]
-    E --> F["search_baseline"]
-    E --> G["search (graph-aware supplemental)"]
-    F --> H["Recall@5 / MRR@10 / NDCG@10"]
+    A["语料切片 / Corpus Slice"] --> B["构建向量 / build_embeddings"]
+    B --> C["构建 HNSW / build_hnsw"]
+    C --> D["文档建档（离线 agent） / profile_docs (offline agent)"]
+    D --> E["发现逻辑边（离线 agent） / discover_edges (offline agent)"]
+    E --> F["纯 HNSW 检索 / search_baseline"]
+    E --> G["图增强检索 / search (graph-aware supplemental)"]
+    F --> H["评测指标 / Recall@5 · MRR@10 · NDCG@10"]
     G --> H
 ```
 

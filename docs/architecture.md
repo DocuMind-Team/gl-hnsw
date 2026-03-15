@@ -50,26 +50,26 @@
 
 ```mermaid
 flowchart TD
-    A["Raw Corpus"] --> B["Document Loader + Preprocessor"]
-    B --> C["Processed Docs JSONL"]
-    C --> D["Embedding Encoder"]
-    D --> E["HNSW Builder"]
-    E --> F["Dense HNSW Index"]
+    A["原始语料 / Raw Corpus"] --> B["文档加载与预处理 / Document Loader + Preprocessor"]
+    B --> C["标准化文档集 / Processed Docs JSONL"]
+    C --> D["向量编码器 / Embedding Encoder"]
+    D --> E["HNSW 构建器 / HNSW Builder"]
+    E --> F["稠密 HNSW 索引 / Dense HNSW Index"]
 
-    C --> G["Offline Agent-Centric Indexing"]
-    G --> H["DocBrief Store"]
-    G --> I["Logic Overlay Graph"]
-    G --> J["Anchor Memory / Semantic Memory / Graph Memory"]
+    C --> G["离线 agent 索引建模 / Offline Agent-Centric Indexing"]
+    G --> H["文档简档存储 / DocBrief Store"]
+    G --> I["逻辑覆盖图 / Logic Overlay Graph"]
+    G --> J["锚点/语义/图记忆 / Anchor Memory · Semantic Memory · Graph Memory"]
 
-    Q["Query"] --> K["Query Embedding"]
-    K --> L["HNSW Search"]
+    Q["查询 / Query"] --> K["查询编码 / Query Embedding"]
+    K --> L["HNSW 检索 / HNSW Search"]
     F --> L
-    L --> M["Dense Seeds"]
-    I --> N["One-Hop Graph Expansion"]
+    L --> M["稠密种子集 / Dense Seeds"]
+    I --> N["一跳图扩展 / One-Hop Graph Expansion"]
     H --> N
     M --> N
-    N --> O["Fusion + Rerank"]
-    O --> P["Final Top-k"]
+    N --> O["融合与重排 / Fusion + Rerank"]
+    O --> P["最终 Top-k / Final Top-k"]
 ```
 
 ## 2.2 运行时装配
@@ -212,38 +212,38 @@ flowchart TD
 
 ```mermaid
 sequenceDiagram
-    participant P as BuildPipeline
-    participant D as LogicDiscoveryService
-    participant O as LogicOrchestrator
-    participant Prof as DocProfiler
-    participant Scout as CorpusScout
-    participant Judge as RelationJudge
-    participant Review as EdgeReviewer
-    participant Cur as MemoryCurator
-    participant G as GraphStore
-    participant M as Memory Stores
+    participant P as 构建流水线 / BuildPipeline
+    participant D as 发现服务 / LogicDiscoveryService
+    participant O as 编排器 / LogicOrchestrator
+    participant Prof as 建档代理 / DocProfiler
+    participant Scout as 侦察代理 / CorpusScout
+    participant Judge as 裁决代理 / RelationJudge
+    participant Review as 复核代理 / EdgeReviewer
+    participant Cur as 记忆整理代理 / MemoryCurator
+    participant G as 图存储 / GraphStore
+    participant M as 记忆存储 / Memory Stores
 
-    P->>D: ensure_briefs(docs)
-    D->>O: profile_many(missing_docs)
-    O->>Prof: profile_docs_batch / profile_doc
+    P->>D: 确保简档存在 / ensure_briefs(docs)
+    D->>O: 批量建档 / profile_many(missing_docs)
+    O->>Prof: 文档建档批处理 / profile_docs_batch · profile_doc
     Prof-->>O: DocBrief[]
-    O-->>D: briefs
+    O-->>D: 返回简档 / briefs
 
-    P->>D: discover_for_anchor(anchor_id)
-    D->>O: scout(anchor, briefs)
-    O->>Scout: propose candidates
+    P->>D: 锚点发现 / discover_for_anchor(anchor_id)
+    D->>O: 侦察候选 / scout(anchor, briefs)
+    O->>Scout: 提议候选 / propose candidates
     Scout-->>O: CandidateProposal[]
 
-    D->>O: judge_many_with_diagnostics(anchor, candidates)
-    O->>Judge: judge_relations_batch
+    D->>O: 批量裁决 / judge_many_with_diagnostics(anchor, candidates)
+    O->>Judge: 批量 judge / judge_relations_batch
     Judge-->>O: JudgeResult[]
-    O->>Review: review_relations_batch
-    Review-->>O: reviewed results
+    O->>Review: 批量复核 / review_relations_batch
+    Review-->>O: 复核结果 / reviewed results
 
-    D->>G: add_edges(accepted)
-    D->>Cur: curate(anchor, accepted, rejected)
-    Cur-->>D: memory payload
-    D->>M: write anchor / semantic / graph memory
+    D->>G: 写入已接纳边 / add_edges(accepted)
+    D->>Cur: 整理记忆 / curate(anchor, accepted, rejected)
+    Cur-->>D: 记忆更新载荷 / memory payload
+    D->>M: 写入锚点/语义/图记忆 / write anchor · semantic · graph memory
 ```
 
 ---
@@ -308,13 +308,13 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A["data/processed/docs.jsonl"] --> B["DocRecord"]
-    C["data/memories/doc_briefs/*.json"] --> D["DocBrief"]
-    E["data/graph/accepted_edges.jsonl"] --> F["LogicEdge"]
-    G["data/memories/anchor_memory/*.json"] --> H["AnchorMemory"]
-    I["data/memories/entity_memory/entities.json"] --> J["GlobalSemanticMemory"]
-    K["data/memories/relation_memory/*.json"] --> J
-    L["data/memories/graph_memory/edge_stats.json"] --> M["Graph Stats"]
+    A["data/processed/docs.jsonl / 处理后文档"] --> B["DocRecord / 文档记录"]
+    C["data/memories/doc_briefs/*.json / 文档简档"] --> D["DocBrief / 文档简档对象"]
+    E["data/graph/accepted_edges.jsonl / 逻辑边"] --> F["LogicEdge / 逻辑边对象"]
+    G["data/memories/anchor_memory/*.json / 锚点记忆"] --> H["AnchorMemory / 锚点记忆对象"]
+    I["data/memories/entity_memory/entities.json / 实体记忆"] --> J["GlobalSemanticMemory / 全局语义记忆"]
+    K["data/memories/relation_memory/*.json / 关系记忆"] --> J
+    L["data/memories/graph_memory/edge_stats.json / 图统计"] --> M["Graph Stats / 图统计对象"]
 ```
 
 ---
@@ -437,23 +437,23 @@ reviewer 不是简单重复判别，而是第二层共识机制：
 
 ```mermaid
 sequenceDiagram
-    participant Q as Query
-    participant R as HybridRetrievalService
-    participant H as HNSW
-    participant S as SparseRetriever
-    participant G as GraphStore
-    participant C as RetrievalScorer
+    participant Q as 查询 / Query
+    participant R as 检索服务 / HybridRetrievalService
+    participant H as HNSW / HNSW
+    participant S as 稀疏检索器 / SparseRetriever
+    participant G as 图存储 / GraphStore
+    participant C as 打分器 / RetrievalScorer
 
-    Q->>R: search(query)
-    R->>C: encode_query(query)
-    R->>H: search_baseline dense top-k
-    R->>S: sparse search
-    R->>R: build seed rows
-    R->>R: compute graph budget
-    R->>G: fetch out edges for selected seeds
-    R->>C: score target / edge alignment / relation multiplier
-    R->>C: rank geometric + logical candidates
-    R-->>Q: SearchResponse
+    Q->>R: 执行检索 / search(query)
+    R->>C: 编码查询 / encode_query(query)
+    R->>H: 稠密 baseline 检索 / search_baseline dense top-k
+    R->>S: 稀疏检索 / sparse search
+    R->>R: 构建种子 / build seed rows
+    R->>R: 计算图预算 / compute graph budget
+    R->>G: 读取种子出边 / fetch out edges for selected seeds
+    R->>C: 目标打分与边对齐 / score target · edge alignment · relation multiplier
+    R->>C: 融合排序 / rank geometric + logical candidates
+    R-->>Q: 搜索响应 / SearchResponse
 ```
 
 ## 9.3 baseline 与 supplemental 的区别
