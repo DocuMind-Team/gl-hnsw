@@ -1,6 +1,12 @@
 initial_top_k: 50
 seed_top_b: 5
 max_expansions_per_seed: 2
+adaptive_graph_budget_enabled: true
+adaptive_graph_lookahead_k: 15
+adaptive_graph_seed_cap: 15
+adaptive_graph_expansion_cap: 3
+adaptive_graph_min_promise: 0.42
+adaptive_graph_seed_margin: 0.18
 jump_policy:
   tau_conf: 0.6
   tau_edge: 0.2

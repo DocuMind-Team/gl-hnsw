@@ -38,6 +38,12 @@ class HybridRetrievalService:
         self.supplemental_seed_top_k = jump_policy.config.supplemental_seed_top_k
         self.supplemental_seed_min_score = jump_policy.config.supplemental_seed_min_score
         self.supplemental_seed_weight = jump_policy.config.supplemental_seed_weight
+        self.adaptive_graph_budget_enabled = jump_policy.config.adaptive_graph_budget_enabled
+        self.adaptive_graph_lookahead_k = jump_policy.config.adaptive_graph_lookahead_k
+        self.adaptive_graph_seed_cap = jump_policy.config.adaptive_graph_seed_cap
+        self.adaptive_graph_expansion_cap = jump_policy.config.adaptive_graph_expansion_cap
+        self.adaptive_graph_min_promise = jump_policy.config.adaptive_graph_min_promise
+        self.adaptive_graph_seed_margin = jump_policy.config.adaptive_graph_seed_margin
         self.sparse_top_k = jump_policy.config.sparse_top_k
         self.sparse_seed_weight = jump_policy.config.sparse_seed_weight
         self.sparse_min_score = jump_policy.config.sparse_min_score
@@ -329,20 +335,23 @@ class HybridRetrievalService:
                 continue
             best_bonus = 0.0
             for edge in self.graph_store.get_out_edges(row["doc_id"])[: self.jump_policy.max_expansions_per_seed]:
-                if edge.relation_type == "same_concept":
+                edge_utility = max(0.0, min(getattr(edge, "utility_score", edge.confidence), 1.0))
+                same_concept_bridge = edge.relation_type == "same_concept"
+                if same_concept_bridge and edge_utility < 0.62:
                     continue
                 target_brief = briefs.get(edge.dst_doc_id)
                 if target_brief is None:
                     continue
                 target_rel = self.scorer.score_target(query, query_emb, target_brief)
-                if target_rel < 0.35:
+                if target_rel < (0.42 if same_concept_bridge else 0.35):
                     continue
                 target_alignment = self.scorer.query_alignment(query, target_brief)
-                if target_alignment < 0.24:
+                if target_alignment < (0.3 if same_concept_bridge else 0.24):
                     continue
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
-                utility_multiplier = 0.5 + 0.5 * getattr(edge, "utility_score", edge.confidence)
-                bonus = 0.16 * edge.confidence * utility_multiplier * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
+                utility_multiplier = 0.5 + 0.5 * edge_utility
+                base_bonus = 0.16 if not same_concept_bridge else 0.12
+                bonus = base_bonus * edge.confidence * utility_multiplier * target_rel * relation_multiplier * min(1.0, 0.55 + source_alignment)
                 if edge.dst_doc_id in ranked_ids:
                     bonus *= 1.15
                 best_bonus = max(best_bonus, bonus)
@@ -382,6 +391,70 @@ class HybridRetrievalService:
             scorer=self.scorer,
             raw_tokens_by_id=self._record_tokens_by_id,
         )
+
+    def _graph_budget(self, query: str, query_emb, seed_rows: list[tuple[str, float, str]], briefs: dict[str, object], strategy) -> tuple[int, int]:
+        graph_gate = max(0.0, getattr(strategy, "graph_gate", 0.0))
+        base_max_seeds = max(1, math.ceil(self.jump_policy.max_seeds * graph_gate))
+        base_max_expansions = max(0, math.ceil(self.jump_policy.max_expansions_per_seed * graph_gate))
+        if (
+            not self.adaptive_graph_budget_enabled
+            or graph_gate <= 0.0
+            or not seed_rows
+            or not self.graph_store.all_edges()
+        ):
+            return base_max_seeds, base_max_expansions
+
+        lookahead = min(len(seed_rows), max(base_max_seeds, self.adaptive_graph_lookahead_k))
+        if lookahead <= base_max_seeds:
+            return base_max_seeds, base_max_expansions
+
+        base_cutoff = seed_rows[min(base_max_seeds, len(seed_rows)) - 1][1]
+        highest_promising_index = -1
+        recommended_expansions = base_max_expansions
+
+        for index, (doc_id, seed_score, _) in enumerate(seed_rows[:lookahead]):
+            if index < base_max_seeds:
+                continue
+            if seed_score + self.adaptive_graph_seed_margin < base_cutoff:
+                continue
+            brief = briefs.get(doc_id)
+            if brief is None:
+                continue
+            source_alignment = max(self.scorer.query_alignment(query, brief), self.scorer.structure_alignment(query, brief))
+            best_edge_promise = 0.0
+            edge_hits = 0
+            for edge in self.graph_store.get_out_edges(doc_id)[: max(self.adaptive_graph_expansion_cap, base_max_expansions)]:
+                target_brief = briefs.get(edge.dst_doc_id)
+                if target_brief is None:
+                    continue
+                target_rel_score = self.scorer.score_target(query, query_emb, target_brief)
+                target_alignment = max(self.scorer.query_alignment(query, target_brief), self.scorer.structure_alignment(query, target_brief))
+                relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
+                edge_utility = max(0.0, min(1.0, getattr(edge, "utility_score", edge.confidence)))
+                edge_promise = (
+                    0.34 * edge_utility
+                    + 0.26 * edge.confidence
+                    + 0.24 * target_rel_score
+                    + 0.16 * target_alignment
+                ) * relation_multiplier
+                if edge.relation_type == "same_concept":
+                    edge_promise *= 0.97
+                best_edge_promise = max(best_edge_promise, edge_promise)
+                if edge_promise >= self.adaptive_graph_min_promise:
+                    edge_hits += 1
+            combined_promise = 0.58 * best_edge_promise + 0.24 * source_alignment + 0.18 * min(1.0, seed_score / max(base_cutoff, 1e-6))
+            if combined_promise < self.adaptive_graph_min_promise:
+                continue
+            highest_promising_index = max(highest_promising_index, index)
+            recommended_expansions = max(
+                recommended_expansions,
+                min(self.adaptive_graph_expansion_cap, max(base_max_expansions, edge_hits)),
+            )
+
+        if highest_promising_index < 0:
+            return base_max_seeds, base_max_expansions
+        effective_max_seeds = min(self.adaptive_graph_seed_cap, highest_promising_index + 1)
+        return effective_max_seeds, recommended_expansions
 
     def _seed_rows(self, query: str, query_emb, briefs: dict[str, object], dense_rows=None) -> list[tuple[str, float, str]]:
         dense_rows = dense_rows or self._seed_rows_dense(query_emb)
@@ -453,11 +526,7 @@ class HybridRetrievalService:
         seeds = {doc_id: (score, source_kind) for doc_id, score, source_kind in seed_rows}
         expanded: list[ExpandedCandidate] = []
 
-        effective_max_seeds = max(1, math.ceil(self.jump_policy.max_seeds * max(0.0, getattr(strategy, "graph_gate", 0.0))))
-        effective_max_expansions = max(
-            0,
-            math.ceil(self.jump_policy.max_expansions_per_seed * max(0.0, getattr(strategy, "graph_gate", 0.0))),
-        )
+        effective_max_seeds, effective_max_expansions = self._graph_budget(query, query_emb, seed_rows, briefs, strategy)
         for doc_id, seed_score, source_kind in seed_rows[:effective_max_seeds]:
             for edge in self.graph_store.get_out_edges(doc_id)[:effective_max_expansions]:
                 brief = briefs.get(edge.dst_doc_id)

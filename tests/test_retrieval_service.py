@@ -505,6 +505,68 @@ def test_graph_neighborhood_bonus_requires_target_query_alignment(tmp_path: Path
     assert response.hits[0].doc_id == "doc-14"
 
 
+def test_graph_neighborhood_bonus_allows_high_utility_same_concept_bridge(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    graph_store = GraphStore(tmp_path / "accepted_edges.jsonl")
+    graph_store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="doc-a",
+                dst_doc_id="doc-b",
+                relation_type="same_concept",
+                confidence=0.88,
+                evidence_spans=[],
+                discovery_path=["test"],
+                edge_card_text="[REL=same_concept] Hybrid Retrieval -> Candidate Fusion",
+                created_at="2026-03-10T00:00:00Z",
+                last_validated_at="2026-03-10T00:00:00Z",
+                utility_score=0.86,
+            )
+        ]
+    )
+    graph_store.reload()
+    briefs = [
+        _brief(
+            "doc-a",
+            "Hybrid Retrieval",
+            "Hybrid retrieval combines candidate fusion and logical paths.",
+            claims=["Hybrid retrieval combines candidate fusion and logic scores."],
+            keywords=["hybrid", "retrieval", "fusion"],
+            relation_hints=["fusion", "logic"],
+            metadata={"topic": "retrieval"},
+        ),
+        _brief(
+            "doc-b",
+            "Candidate Fusion",
+            "Candidate fusion merges geometric and logical evidence.",
+            claims=["Candidate fusion merges geometric and logical evidence."],
+            keywords=["candidate", "fusion", "evidence"],
+            relation_hints=["fusion", "evidence"],
+            metadata={"topic": "retrieval"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher([Neighbor(doc_id="doc-a", score=0.68, rank=1)]),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=graph_store,
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Hybrid Retrieval", text="Hybrid retrieval combines candidate fusion and logical paths."),
+                DocRecord(doc_id="doc-b", title="Candidate Fusion", text="Candidate fusion merges geometric and logical evidence."),
+            ]
+        ),
+    )
+
+    response = service.search("How does hybrid retrieval use candidate fusion?", top_k=2, use_memory_bias=False)
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert by_id["doc-a"].final_score > 0.68
+
+
 def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
@@ -575,3 +637,85 @@ def test_search_refreshes_corpus_cache_after_initial_missing_processed_docs(tmp_
     service.search("Which protein evidence supports the study claim?", top_k=2, use_memory_bias=False)
 
     assert service._dataset_hint == "scifact"
+
+
+def test_search_uses_graph_budget_for_late_high_utility_seed(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief("doc-1", "Dense Seed One", "Overview of unrelated components.", metadata={"topic": "general"}),
+        _brief("doc-2", "Dense Seed Two", "Overview of unrelated components.", metadata={"topic": "general"}),
+        _brief("doc-3", "Dense Seed Three", "Overview of unrelated components.", metadata={"topic": "general"}),
+        _brief("doc-4", "Dense Seed Four", "Overview of unrelated components.", metadata={"topic": "general"}),
+        _brief("doc-5", "Dense Seed Five", "Overview of unrelated components.", metadata={"topic": "general"}),
+        _brief(
+            "doc-6",
+            "Hybrid Retrieval",
+            "Hybrid retrieval relies on candidate fusion scoring to rank documents.",
+            claims=["Hybrid retrieval uses candidate fusion scoring and logic overlay."],
+            keywords=["hybrid", "retrieval", "fusion"],
+            relation_hints=["fusion", "retrieval"],
+            metadata={"topic": "retrieval"},
+        ),
+        _brief(
+            "doc-target",
+            "Candidate Fusion",
+            "Candidate fusion scoring merges geometric and logical evidence for ranking.",
+            claims=["Candidate fusion scoring merges geometric and logical evidence."],
+            keywords=["candidate", "fusion", "scoring"],
+            relation_hints=["fusion", "scoring"],
+            metadata={"topic": "retrieval"},
+        ),
+    ]
+    graph_store = GraphStore(tmp_path / "accepted_edges.jsonl")
+    graph_store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="doc-6",
+                dst_doc_id="doc-target",
+                relation_type="implementation_detail",
+                confidence=0.94,
+                evidence_spans=["candidate fusion scoring"],
+                discovery_path=["judge", "reviewer"],
+                edge_card_text="Hybrid retrieval uses candidate fusion scoring to merge geometric and logical evidence.",
+                created_at="2026-03-15T00:00:00Z",
+                last_validated_at="2026-03-15T00:00:00Z",
+                utility_score=0.92,
+            )
+        ]
+    )
+    graph_store.reload()
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-1", score=0.82, rank=1),
+                Neighbor(doc_id="doc-2", score=0.80, rank=2),
+                Neighbor(doc_id="doc-3", score=0.78, rank=3),
+                Neighbor(doc_id="doc-4", score=0.76, rank=4),
+                Neighbor(doc_id="doc-5", score=0.74, rank=5),
+                Neighbor(doc_id="doc-6", score=0.73, rank=6),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=graph_store,
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-1", title="Dense Seed One", text="Overview of unrelated components."),
+                DocRecord(doc_id="doc-2", title="Dense Seed Two", text="Overview of unrelated components."),
+                DocRecord(doc_id="doc-3", title="Dense Seed Three", text="Overview of unrelated components."),
+                DocRecord(doc_id="doc-4", title="Dense Seed Four", text="Overview of unrelated components."),
+                DocRecord(doc_id="doc-5", title="Dense Seed Five", text="Overview of unrelated components."),
+                DocRecord(doc_id="doc-6", title="Hybrid Retrieval", text="Hybrid retrieval relies on candidate fusion scoring to rank documents."),
+                DocRecord(doc_id="doc-target", title="Candidate Fusion", text="Candidate fusion scoring merges geometric and logical evidence for ranking."),
+            ]
+        ),
+    )
+
+    response = service.search("How does hybrid retrieval use candidate fusion scoring?", top_k=8, use_memory_bias=False)
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert "doc-target" in by_id
+    assert by_id["doc-target"].source_kind in {"logic", "hybrid"}

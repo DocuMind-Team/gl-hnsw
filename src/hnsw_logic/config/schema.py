@@ -102,6 +102,12 @@ class RetrievalConfig(BaseModel):
     initial_top_k: int = 50
     seed_top_b: int = 5
     max_expansions_per_seed: int = 2
+    adaptive_graph_budget_enabled: bool = True
+    adaptive_graph_lookahead_k: int = 15
+    adaptive_graph_seed_cap: int = 15
+    adaptive_graph_expansion_cap: int = 3
+    adaptive_graph_min_promise: float = 0.42
+    adaptive_graph_seed_margin: float = 0.18
     supplemental_seed_top_k: int = 6
     supplemental_seed_min_score: float = 0.3
     supplemental_seed_weight: float = 0.92

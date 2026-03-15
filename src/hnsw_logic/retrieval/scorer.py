@@ -186,11 +186,14 @@ class RetrievalScorer:
                 "source_kind": source_kind,
                 "via_edge": None,
                 "summary": briefs[doc_id].summary,
+                "edge_relation": None,
+                "edge_utility": 0.0,
             }
         for candidate in expanded:
             target_brief = briefs[candidate.doc_id]
             relation_multiplier = self.relation_query_multiplier(query, target_brief, candidate.edge)
-            utility_multiplier = 0.5 + 0.5 * getattr(candidate.edge, "utility_score", candidate.edge.confidence)
+            edge_utility = max(0.0, min(getattr(candidate.edge, "utility_score", candidate.edge.confidence), 1.0))
+            utility_multiplier = 0.5 + 0.5 * edge_utility
             logic_score = candidate.seed_score * candidate.edge.confidence * utility_multiplier * candidate.edge_match * candidate.target_rel_score * relation_multiplier
             row = merged.setdefault(
                 candidate.doc_id,
@@ -202,21 +205,31 @@ class RetrievalScorer:
                     "source_kind": "logic",
                     "via_edge": f"{candidate.source_doc_id}->{candidate.doc_id}",
                     "summary": target_brief.summary,
+                    "edge_relation": None,
+                    "edge_utility": 0.0,
                 },
             )
             if logic_score > row["logical_score"]:
                 row["logical_score"] = logic_score
                 row["via_edge"] = f"{candidate.source_doc_id}->{candidate.doc_id}"
+                row["edge_relation"] = candidate.edge.relation_type
+                row["edge_utility"] = edge_utility
                 if row["source_kind"] == "geometric":
                     row["source_kind"] = "hybrid"
 
         ranked = []
         for row in merged.values():
             logic_weight = self.beta
+            edge_utility = max(0.0, min(float(row.get("edge_utility", 0.0)), 1.0))
+            relation_type = row.get("edge_relation")
             if row["source_kind"] == "logic":
-                logic_weight *= 0.2
+                logic_weight *= 0.18 + 0.26 * edge_utility
             elif row["source_kind"] == "hybrid":
-                logic_weight *= 0.35
+                logic_weight *= 0.32 + 0.32 * edge_utility
+            if relation_type == "same_concept":
+                logic_weight *= 1.15
+            elif relation_type == "comparison":
+                logic_weight *= 0.92
             row["final_score"] = self.alpha * row["geometric_score"] + logic_weight * row["logical_score"]
             ranked.append(row)
         ranked.sort(key=lambda item: (-item["final_score"], item["doc_id"]))
