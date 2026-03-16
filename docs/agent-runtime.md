@@ -90,28 +90,21 @@ flowchart TD
 
 ### 3.1 一个必须说明清楚的事实
 
-仓库中确实提供了 `deepagents` 运行时接入，入口在 `AgentFactory.try_create_deep_agent()`。
+仓库中确实提供了 `deepagents` 运行时接入，入口仍然在 `AgentFactory.try_create_deep_agent()`。
 
-但当前主执行链路并不是“所有动作都通过 deepagents 的开放式代理循环完成”。
+但当前版本已经不再只是“兼容 deepagents”。离线索引主链已经切换为：
 
-当前真实主链路更接近：
-
-- 主编排器 `LogicOrchestrator`
-- 各个 typed subagent wrapper
-- provider 中的结构化能力函数
-
-例如：
-
-- `profile_docs`
-- `propose_candidates`
-- `judge_relations_with_signals`
-- `review_relations_with_signals`
-- `curate_memory`
+- `BuildPipeline.discover_edges()`
+- `OfflineIndexingSupervisor`
+- `DeepAgents supervisor`
+- 各个 stage subagent
+- 最后回到 `LogicOrchestrator` 做 deterministic gate
 
 所以，当前系统最准确的描述是：
 
-- **兼容 deepagents**
-- **但核心生产路径仍然是显式编排的 agent pipeline**
+- **离线主链由 DeepAgents runtime 驱动**
+- **本地 orchestrator 负责最终 signal/gate/fallback**
+- **在线查询仍然不接入 agent**
 
 ---
 
@@ -700,23 +693,31 @@ tools registry 定义在 [registry.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/a
 
 ### 11.3 Skill 能力
 
-skills 存放于 [agents/skills](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/skills)。
+canonical runtime skills 存放于 [.deepagents/skills](/Users/armstrong/gl-hnsw/.deepagents/skills)。
 
 当前配置映射为：
 
+- `index_planner`
+  - `anchor-planning`
+  - `corpus-adaptation`
 - `doc_profiler`
-  - `doc_briefing`
-  - `entity_canonicalization`
+  - `doc-briefing`
+  - `entity-canonicalization`
 - `corpus_scout`
-  - `corpus_navigation`
+  - `candidate-expansion`
+  - `evidence-bundling`
 - `relation_judge`
-  - `evidence_linking`
-  - `relation_typing`
+  - `relation-judging`
+  - `signal-fusion`
+- `counterevidence_checker`
+  - `counterevidence-check`
+  - `graph-hygiene`
 - `edge_reviewer`
-  - `edge_utility`
-  - `signal_fusion`
+  - `edge-utility-review`
+  - `graph-hygiene`
 - `memory_curator`
-  - `memory_update`
+  - `memory-summarization`
+  - `memory-update`
 
 ```mermaid
 flowchart TD
@@ -724,16 +725,16 @@ flowchart TD
     A --> C["Tools / 工具能力"]
     A --> D["Skills / 技能能力"]
 
-    B --> B1["profile / scout / judge / review / curate"]
-    C --> C1["search_summaries"]
-    C --> C2["lookup_entities"]
-    C --> C3["read_doc_full"]
-    C --> C4["commit_logic_edge"]
-    D --> D1["doc_briefing"]
-    D --> D2["corpus_navigation"]
-    D --> D3["relation_typing"]
-    D --> D4["signal_fusion"]
-    D --> D5["memory_update"]
+    B --> B1["plan / profile / scout / judge / check / review / curate"]
+    C --> C1["execute_* stage tools / 阶段执行工具"]
+    C --> C2["read_* bundle tools / bundle 读取工具"]
+    C --> C3["search_summaries / 摘要搜索"]
+    C --> C4["lookup_entities / 实体检索"]
+    D --> D1["anchor-planning"]
+    D --> D2["candidate-expansion"]
+    D --> D3["relation-judging"]
+    D --> D4["counterevidence-check"]
+    D --> D5["memory-update"]
 ```
 
 ---
@@ -774,16 +775,17 @@ skills 不直接负责：
 
 当前真实模式可以概括为：
 
-`本地代码先算 signals -> skill 告诉 agent 如何理解这些 signals -> provider 产出结构化结果 -> orchestrator 决定是否接受`
+`deepagents supervisor 委派 subagent -> stage tool 产出 bundle -> provider/skills 生成结构化判断 -> orchestrator 做 deterministic gate -> discovery service 落图与记忆合并`
 
 ```mermaid
 flowchart LR
-    A["本地规则 / Local Code"] --> B["JudgeSignals / 信号包"]
-    C["Skill Prompt / 技能提示"] --> D["Provider Reasoning / 模型推理"]
-    B --> D
-    D --> E["Structured Output / 结构化输出"]
-    E --> F["Orchestrator Gate / 编排器门控"]
-    F --> G["Persisted Edge or Memory / 持久化结果"]
+    A["DeepAgents Supervisor / 主代理"] --> B["Subagent Task Delegation / 子代理委派"]
+    B --> C["Stage Tools + Bundle Files / 阶段工具与文件产物"]
+    D["Skills + References / 技能与参考资料"] --> E["Provider Reasoning / 模型推理"]
+    C --> E
+    E --> F["Structured Bundles / 结构化 bundle"]
+    F --> G["Orchestrator Gate / 编排器门控"]
+    G --> H["Persisted Edge or Memory / 持久化结果"]
 ```
 
 ---
@@ -800,8 +802,10 @@ flowchart LR
 创建后的 deepagent 具备：
 
 - `ChatOpenAI` 模型
-- skills root
-- tools
+- canonical skills root
+- project memory files
+- task delegation subagents
+- stage-specific tools
 - subagent specs
 - `FilesystemBackend`
 
@@ -822,14 +826,14 @@ flowchart TD
 
 ### 13.1 需要正确理解的一点
 
-当前系统并不是“所有主流程都完全交给 deepagents runtime 执行”。
+当前系统并不是“在线和离线都完全交给 deepagents runtime 执行”。
 
 更准确的说法是：
 
-- deepagents 是一个可接入的统一运行时壳层
-- 当前主链路仍是 typed orchestrator pipeline
-- 两者并不冲突
-- 但当前仓库的主生产路径仍然以前者兼容、以后者为主
+- **离线索引建模** 由 deepagents supervisor 主导
+- **在线查询执行** 仍然是纯本地链路
+- deepagents 负责 planning、task delegation、filesystem context、skills/memory 调度
+- 本地 orchestrator 负责 deterministic gate 与 fallback
 
 ---
 

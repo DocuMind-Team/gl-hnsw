@@ -42,6 +42,12 @@
 
 **HNSW 负责高效近邻检索，agent 负责离线索引建模，查询阶段只消费已经建好的索引与图。**
 
+当前版本中，离线索引主链已经切换为 **DeepAgents supervisor 驱动**：
+
+- supervisor 负责 planning、task delegation、filesystem context、skills/memory 调度
+- `LogicOrchestrator` 退居为本地 signal/gate/fallback 层
+- 在线查询阶段仍然保持“无 agent”
+
 ---
 
 # 2. 总体架构
@@ -139,17 +145,20 @@ flowchart TD
 
 - [src/hnsw_logic/agents/factory.py](../src/hnsw_logic/agents/factory.py)
 - [src/hnsw_logic/agents/orchestrator.py](../src/hnsw_logic/agents/orchestrator.py)
+- [src/hnsw_logic/services/offline_supervisor.py](../src/hnsw_logic/services/offline_supervisor.py)
 - [src/hnsw_logic/services/discovery.py](../src/hnsw_logic/services/discovery.py)
 - [src/hnsw_logic/services/pipeline.py](../src/hnsw_logic/services/pipeline.py)
 
 职责：
 
+- 生成 indexing plan
 - 生成 `DocBrief`
 - 选择 discovery anchor
-- 发现候选 pair
-- 做 judge / reviewer 共识裁决
+- 发现候选 pair 并写入 workspace bundle
+- 做 judge / checker / reviewer 共识裁决
 - 写入逻辑边
 - 更新锚点与全局记忆
+- 受控更新 `.deepagents/AGENTS.md` 与 `references/`
 
 ## 3.4 查询执行层
 
@@ -176,74 +185,89 @@ flowchart TD
 
 当前 agent 体系由 `AgentFactory` 装配，包含以下子代理：
 
+- `IndexPlannerAgent`
 - `DocProfilerAgent`
 - `CorpusScoutAgent`
 - `RelationJudgeAgent`
+- `CounterevidenceCheckerAgent`
 - `EdgeReviewerAgent`
 - `MemoryCuratorAgent`
 
-当前默认运行方式并不是让 deepagents 直接接管全流程，而是：
+当前默认运行方式已经切换为：
 
-- provider 负责 live 调用远端模型
-- orchestrator 负责工作流编排
-- deepagent backend 作为可选能力存在
+- `BuildPipeline.discover_edges()` 调用 `OfflineIndexingSupervisor`
+- supervisor 使用 DeepAgents runtime 作为主控制流
+- subagent 通过 `task` delegation 在隔离上下文中执行各阶段
+- provider 负责远端模型调用
+- `LogicOrchestrator` 负责本地 signal 构造、utility/gate 计算与最终 fallback
 
 ## 4.2 skills 结构
 
-当前 skills 目录位于：
+当前 canonical skills 目录位于：
 
-- `src/hnsw_logic/agents/skills/`
+- `.deepagents/skills/`
 
 关键 skills 包括：
 
-- `doc_briefing`
-- `entity_canonicalization`
-- `corpus_navigation`
-- `evidence_linking`
-- `relation_typing`
-- `edge_review`
-- `edge_utility`
-- `signal_fusion`
-- `memory_update`
+- `anchor-planning`
+- `doc-briefing`
+- `candidate-expansion`
+- `evidence-bundling`
+- `relation-judging`
+- `counterevidence-check`
+- `edge-utility-review`
+- `graph-hygiene`
+- `memory-summarization`
+- `memory-update`
 
-这些 skills 不直接作为在线查询逻辑执行器，而是为离线子代理提供规范化工作流与输出约束。
+这些 skills 采用 DeepAgents 官方风格的按需加载目录结构：
+
+- `SKILL.md`
+- `references/`
+- `scripts/`
+- `assets/`（按需）
+
+它们不直接作为在线查询逻辑执行器，而是为离线子代理提供规范化工作流、参考资料和局部脚本能力。
 
 ## 4.3 离线流程图
 
 ```mermaid
 sequenceDiagram
     participant P as 构建流水线 / BuildPipeline
-    participant D as 发现服务 / LogicDiscoveryService
-    participant O as 编排器 / LogicOrchestrator
+    participant S as 离线主管 / Offline Supervisor
+    participant DA as DeepAgents 主代理 / DeepAgents Supervisor
+    participant Plan as 规划代理 / IndexPlanner
     participant Prof as 建档代理 / DocProfiler
     participant Scout as 侦察代理 / CorpusScout
     participant Judge as 裁决代理 / RelationJudge
+    participant Check as 反证检查 / Counterevidence Checker
     participant Review as 复核代理 / EdgeReviewer
     participant Cur as 记忆整理代理 / MemoryCurator
-    participant G as 图存储 / GraphStore
-    participant M as 记忆存储 / Memory Stores
+    participant O as 本地信号与门控 / LogicOrchestrator
+    participant D as 发现服务 / LogicDiscoveryService
 
-    P->>D: 确保简档存在 / ensure_briefs(docs)
-    D->>O: 批量建档 / profile_many(missing_docs)
-    O->>Prof: 文档建档批处理 / profile_docs_batch · profile_doc
-    Prof-->>O: DocBrief[]
-    O-->>D: 返回简档 / briefs
-
-    P->>D: 锚点发现 / discover_for_anchor(anchor_id)
-    D->>O: 侦察候选 / scout(anchor, briefs)
-    O->>Scout: 提议候选 / propose candidates
-    Scout-->>O: CandidateProposal[]
-
-    D->>O: 批量裁决 / judge_many_with_diagnostics(anchor, candidates)
-    O->>Judge: 批量 judge / judge_relations_batch
-    Judge-->>O: JudgeResult[]
-    O->>Review: 批量复核 / review_relations_batch
-    Review-->>O: 复核结果 / reviewed results
-
-    D->>G: 写入已接纳边 / add_edges(accepted)
-    D->>Cur: 整理记忆 / curate(anchor, accepted, rejected)
-    Cur-->>D: 记忆更新载荷 / memory payload
-    D->>M: 写入锚点/语义/图记忆 / write anchor · semantic · graph memory
+    P->>S: discover_edges()
+    S->>DA: 启动 indexing plan / start indexing plan
+    DA->>Plan: task(index planning)
+    Plan-->>DA: indexing_plan.json
+    loop 每个 anchor / for each anchor
+        S->>DA: 启动 anchor workflow / start anchor workflow
+        DA->>Prof: task(doc profiling)
+        Prof-->>DA: anchor_dossier.json
+        DA->>Scout: task(candidate expansion)
+        Scout-->>DA: candidate_bundle.json
+        DA->>Judge: task(relation judging)
+        Judge-->>DA: judgment_bundle.json
+        DA->>Check: task(counterevidence check)
+        Check-->>DA: counterevidence_bundle.json
+        DA->>Review: task(edge utility review)
+        Review-->>DA: review_bundle.json
+        DA->>Cur: task(memory summarization)
+        Cur-->>DA: memory_bundle.json
+        S->>O: 读取 bundle 并做 deterministic gate / apply deterministic gate
+        O-->>D: CandidateAssessment[]
+        D-->>S: accepted edges + memory merge
+    end
 ```
 
 ---
