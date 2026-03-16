@@ -15,6 +15,7 @@ def test_root(tmp_path: Path) -> Path:
     shutil.copytree(repo_root / "configs", tmp_path / "configs")
     shutil.copytree(repo_root / "data" / "raw", tmp_path / "data" / "raw")
     shutil.copytree(repo_root / "data" / "demo", tmp_path / "data" / "demo")
+    shutil.copytree(repo_root / ".deepagents", tmp_path / ".deepagents")
     return tmp_path
 
 
