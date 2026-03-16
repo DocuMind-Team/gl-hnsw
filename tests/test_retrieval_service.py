@@ -198,7 +198,7 @@ def test_search_keeps_dense_result_score_when_sparse_raw_text_agrees(tmp_path: P
     assert by_id["doc-b"].final_score == 0.61
 
 
-def test_search_preserves_dense_score_for_external_scientific_dataset(tmp_path: Path):
+def test_search_boosts_top_sparse_agreement_for_external_scientific_dataset(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
     briefs = [
@@ -225,7 +225,7 @@ def test_search_preserves_dense_score_for_external_scientific_dataset(tmp_path: 
         searcher=FakeSearcher(
             [
                 Neighbor(doc_id="doc-a", score=0.72, rank=1),
-                Neighbor(doc_id="doc-b", score=0.70, rank=2),
+                Neighbor(doc_id="doc-b", score=0.10, rank=2),
             ]
         ),
         brief_store=FakeBriefStore(briefs),
@@ -241,11 +241,14 @@ def test_search_preserves_dense_score_for_external_scientific_dataset(tmp_path: 
         ),
     )
 
+    baseline = service.search_baseline("Do stem cells segregate chromosomes asymmetrically?", top_k=2)
     response = service.search("Do stem cells segregate chromosomes asymmetrically?", top_k=2, use_memory_bias=False)
     by_id = {hit.doc_id: hit for hit in response.hits}
+    baseline_by_id = {hit.doc_id: hit for hit in baseline.hits}
 
+    assert baseline.hits[0].doc_id == "doc-a"
     assert by_id["doc-b"].source_kind == "geometric"
-    assert by_id["doc-b"].final_score == 0.70
+    assert by_id["doc-b"].final_score > baseline_by_id["doc-b"].final_score
 
 
 def test_search_rejects_sparse_only_candidate_when_dense_sparse_disagree(tmp_path: Path):

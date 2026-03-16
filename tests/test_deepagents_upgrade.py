@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-
+from hnsw_logic.agents.orchestrator import CandidateAssessment
 from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
+from hnsw_logic.core.models import LogicEdge
+from hnsw_logic.embedding.provider import JudgeResult
 
 
 def test_settings_enable_deepagents_runtime(test_root: Path):
@@ -89,3 +91,97 @@ def test_offline_supervisor_local_workflow_writes_bundles(app_container):
     assert (workspace / "judgments" / f"{anchor_doc_id}.json").exists()
     assert (workspace / "reviews" / f"{anchor_doc_id}.json").exists()
     assert (workspace / "memory" / f"{anchor_doc_id}.json").exists()
+
+
+def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container, monkeypatch):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+    accepted = CandidateAssessment(
+        candidate_doc_id=candidate.doc_id,
+        accepted=True,
+        reject_reason="",
+        score=0.91,
+        local_support=0.81,
+        evidence_quality=0.9,
+        relation_type="same_concept",
+        confidence=0.88,
+        edge=LogicEdge(
+            src_doc_id=anchor.doc_id,
+            dst_doc_id=candidate.doc_id,
+            relation_type="same_concept",
+            confidence=0.88,
+            evidence_spans=[anchor.summary, candidate.summary],
+            discovery_path=["judge", "review", "gate"],
+            edge_card_text=f"{anchor.title} -> {candidate.title}",
+            created_at="2026-03-16T00:00:00Z",
+            last_validated_at="2026-03-16T00:00:00Z",
+            utility_score=0.92,
+        ),
+    )
+
+    monkeypatch.setattr(
+        type(app_container.offline_supervisor.orchestrator),
+        "_assessment_for",
+        lambda self, *_args, **_kwargs: accepted,
+    )
+
+    verdicts = {
+        candidate.doc_id: JudgeResult(
+            accepted=False,
+            relation_type="comparison",
+            confidence=0.72,
+            evidence_spans=[],
+            rationale="review says comparison",
+            support_score=0.0,
+            contradiction_flags=[],
+            decision_reason="soft risk rejection",
+            utility_score=0.0,
+            uncertainty=0.6,
+            canonical_relation="none",
+            semantic_relation_label="none",
+        )
+    }
+    reviews = dict(verdicts)
+    bundle_lookup = {
+        "reviews": {
+            candidate.doc_id: {
+                "keep": False,
+                "reviewed_utility_score": 0.0,
+                "reviewed_confidence": 0.72,
+                "risk_flags": [
+                    "excess_novelty",
+                    "weak_family_bridge",
+                    "topic-only overlap",
+                    "low retrieval utility",
+                    "weak direction",
+                ],
+            }
+        },
+        "checks": {
+            candidate.doc_id: {
+                "keep": False,
+                "risk_penalty": 0.2,
+                "risk_flags": [
+                    "excess_novelty",
+                    "weak_family_bridge",
+                    "topic-only overlap",
+                    "low retrieval utility",
+                    "weak direction",
+                ],
+            }
+        },
+    }
+
+    assessments = app_container.offline_supervisor._apply_review_consensus(
+        anchor,
+        [candidate],
+        verdicts,
+        reviews,
+        bundle_lookup,
+    )
+
+    assert assessments
+    assert assessments[0].accepted is True

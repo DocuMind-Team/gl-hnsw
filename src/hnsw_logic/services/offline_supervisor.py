@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import os
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,15 @@ class OfflineIndexingSupervisor:
         self.agents_config = agents_config
         self.self_update_manager = self_update_manager
         self.agents_memory_path = agents_memory_path
+        self.supervisor_task_delegation_enabled = os.getenv("GL_HNSW_ENABLE_DEEPAGENT_SUPERVISOR", "0") == "1"
+        self.anchor_task_delegation_enabled = (
+            self.supervisor_task_delegation_enabled
+            and os.getenv("GL_HNSW_ENABLE_ANCHOR_TASK_DELEGATION", "0") == "1"
+        )
+
+    @staticmethod
+    def _normalize_risk_flag(flag: str) -> str:
+        return str(flag).strip().lower().replace("-", "_").replace(" ", "_")
 
     def _stage_path(self, stage: str, doc_id: str, suffix: str = ".json") -> Path:
         return self.workspace_root / "indexing" / stage / f"{doc_id}{suffix}"
@@ -51,7 +60,7 @@ class OfflineIndexingSupervisor:
         return tool(**kwargs)
 
     def _build_plan(self) -> dict:
-        if self.deepagent is not None and self.agents_config.planner_enabled:
+        if self.deepagent is not None and self.agents_config.planner_enabled and self.supervisor_task_delegation_enabled:
             try:
                 self._invoke_main_agent(
                     "Create the offline indexing plan. Use the task tool to delegate to the index_planner subagent. "
@@ -138,7 +147,40 @@ class OfflineIndexingSupervisor:
         for assessment in assessments:
             review_row = review_rows.get(assessment.candidate_doc_id, {})
             check_row = check_rows.get(assessment.candidate_doc_id, {})
-            keep = bool(review_row.get("keep", True)) and bool(check_row.get("keep", True))
+            review_keep = bool(review_row.get("keep", True))
+            check_keep = bool(check_row.get("keep", True))
+            reviewed_utility = float(review_row.get("reviewed_utility_score", 0.0) or 0.0)
+            risk_penalty = float(check_row.get("risk_penalty", 0.0) or 0.0)
+            risk_flags = {
+                self._normalize_risk_flag(str(flag))
+                for flag in [*review_row.get("risk_flags", []), *check_row.get("risk_flags", [])]
+                if str(flag)
+            }
+            soft_bridge_risks = {"excess_novelty", "weak_family_bridge", "topic_only_overlap", "low_retrieval_utility", "weak_direction"}
+            same_concept_soft_keep = (
+                assessment.edge is not None
+                and assessment.edge.relation_type == "same_concept"
+                and assessment.edge.utility_score >= 0.78
+                and assessment.local_support >= 0.68
+                and assessment.evidence_quality >= 0.84
+                and risk_penalty <= 0.22
+                and risk_flags.issubset(soft_bridge_risks)
+            )
+            rescue_keep = (
+                assessment.accepted
+                and assessment.edge is not None
+                and not ({"service_surface", "foundational_support"} & risk_flags)
+                and (
+                    (
+                        reviewed_utility >= 0.74
+                        and risk_penalty <= 0.18
+                    )
+                    or (
+                        same_concept_soft_keep
+                    )
+                )
+            )
+            keep = (review_keep and check_keep) or rescue_keep
             if not keep:
                 adjusted.append(
                     CandidateAssessment(
@@ -158,10 +200,16 @@ class OfflineIndexingSupervisor:
             reviewed_confidence = review_row.get("reviewed_confidence")
             if assessment.edge is not None:
                 if reviewed_utility is not None:
-                    next_assessment.edge.utility_score = max(0.0, min(1.0, float(reviewed_utility)))
+                    reviewed_utility_value = max(0.0, min(1.0, float(reviewed_utility)))
+                    if rescue_keep and not (review_keep and check_keep) and reviewed_utility_value < max(0.35, next_assessment.edge.utility_score * 0.6):
+                        reviewed_utility_value = next_assessment.edge.utility_score
+                    next_assessment.edge.utility_score = reviewed_utility_value
                     next_assessment.score *= 0.85 + 0.35 * next_assessment.edge.utility_score
                 if reviewed_confidence is not None:
                     next_assessment.edge.confidence = max(next_assessment.edge.confidence, float(reviewed_confidence))
+                if rescue_keep and not (review_keep and check_keep):
+                    next_assessment.score *= 0.94
+                    next_assessment.edge.utility_score = max(0.0, min(1.0, next_assessment.edge.utility_score * 0.97))
             adjusted.append(next_assessment)
         return self.orchestrator._apply_assessment_cap(anchor, adjusted, {candidate.doc_id: candidate for candidate in candidates})
 
@@ -184,7 +232,7 @@ class OfflineIndexingSupervisor:
     def discover_for_anchor(self, anchor_doc_id: str, briefs: list[DocBrief]) -> list:
         brief_map = {brief.doc_id: brief for brief in briefs}
         anchor = brief_map[anchor_doc_id]
-        if self.deepagent is not None:
+        if self.deepagent is not None and self.anchor_task_delegation_enabled:
             self._run_anchor_workflow_with_deepagents(anchor_doc_id)
         else:
             self._run_anchor_workflow_local(anchor_doc_id)

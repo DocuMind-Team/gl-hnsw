@@ -66,6 +66,19 @@ class RetrievalScorer:
     def _query_tokens(self, query: str) -> set[str]:
         return {token for token in tokenize(query) if len(token) > 2}
 
+    def _specific_query_tokens(self, query: str) -> set[str]:
+        query_tokens = self._query_tokens(query)
+        specific = {
+            token
+            for token in query_tokens
+            if len(token) >= 7 or any(char.isdigit() for char in token)
+        }
+        if specific:
+            return specific
+        if len(query_tokens) <= 3:
+            return {token for token in query_tokens if len(token) >= 5}
+        return set()
+
     def query_specificity(self, query: str) -> float:
         query_tokens = list(self._query_tokens(query))
         if not query_tokens:
@@ -233,6 +246,34 @@ class RetrievalScorer:
             + 0.22 * min(evidence_overlap / max(1, min(len(query_tokens), 2)), 1.0)
             + 0.34 * title_claim
             + 0.16 * structural
+        )
+        return min(score, 1.0)
+
+    def specific_query_overlap(self, query: str, brief: DocBrief, edge: LogicEdge | None = None) -> float:
+        specific_tokens = self._specific_query_tokens(query)
+        if not specific_tokens:
+            return 0.0
+        views = self._brief_views(brief)
+        brief_tokens = {
+            token
+            for token in tokenize(" ".join([brief.title, brief.summary, views["claims"], views["relation"], views["structure"]]))
+            if len(token) > 2
+        }
+        edge_tokens: set[str] = set()
+        if edge is not None:
+            edge_tokens = {
+                token
+                for token in tokenize(edge.edge_card_text + " " + " ".join(edge.evidence_spans))
+                if len(token) > 2
+            }
+        overlap = specific_tokens & (brief_tokens | edge_tokens)
+        if not overlap:
+            return 0.0
+        title_tokens = {token for token in tokenize(brief.title) if len(token) > 2}
+        title_overlap = specific_tokens & title_tokens
+        score = (
+            0.7 * min(len(overlap) / max(1, len(specific_tokens)), 1.0)
+            + 0.3 * min(len(title_overlap) / max(1, len(specific_tokens)), 1.0)
         )
         return min(score, 1.0)
 

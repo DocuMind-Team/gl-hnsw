@@ -59,33 +59,53 @@ def build_deepagent_toolsets(
         return stage_dir(stage) / f"{doc_id}{suffix}"
 
     def read_graph_stats() -> dict:
+        """Read persisted graph statistics for offline indexing planning."""
         return graph_memory_store.read()
 
     def read_semantic_memory() -> dict:
+        """Read summarized semantic memory state used by offline agents."""
         return to_jsonable(semantic_memory_store.read())
 
     def read_failure_patterns() -> dict:
+        """Read accumulated rejection and failure patterns from semantic memory."""
         memory = semantic_memory_store.read()
         return {"rejection_patterns": memory.rejection_patterns}
 
     def read_anchor_dossier(doc_id: str) -> dict | None:
+        """Read a previously materialized anchor dossier from the workspace."""
         return read_json(stage_path("dossiers", doc_id))
 
     def read_candidate_bundle(doc_id: str) -> dict | None:
+        """Read a candidate bundle for a specific anchor from the workspace."""
         return read_json(stage_path("candidates", doc_id))
 
     def read_judgment_bundle(doc_id: str) -> dict | None:
+        """Read a judgment bundle for a specific anchor from the workspace."""
         return read_json(stage_path("judgments", doc_id))
 
     def read_counterevidence_bundle(doc_id: str) -> dict | None:
+        """Read a counterevidence bundle for a specific anchor from the workspace."""
         return read_json(stage_path("checks", doc_id))
 
     def read_review_bundle(doc_id: str) -> dict | None:
+        """Read a review bundle for a specific anchor from the workspace."""
         return read_json(stage_path("reviews", doc_id))
 
     def execute_index_planning(output_path: str = "/data/workspace/indexing/plans/indexing_plan.json") -> dict:
+        """Generate the offline indexing plan and persist it to the workspace."""
         briefs = brief_store.all()
         ordered = orchestrator.rank_discovery_anchors(briefs)
+        anchor_limit = min(
+            len(ordered),
+            max(
+                4,
+                min(
+                    getattr(orchestrator.retrieval_config, "adaptive_graph_seed_cap", 15),
+                    int(max(len(briefs), 1) * 0.3),
+                ),
+            ),
+        )
+        ordered = ordered[:anchor_limit]
         graph_profile = orchestrator._corpus_graph_profile(briefs) if briefs else {"graph_potential": 0.0}
         batches: list[AnchorPlan] = []
         batch_size = max(1, min(getattr(orchestrator.retrieval_config, "adaptive_graph_seed_cap", 15), 12))
@@ -126,6 +146,7 @@ def build_deepagent_toolsets(
         return {"plan_path": str(destination), "anchors": len(plan.anchors)}
 
     def execute_doc_profiling(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        """Build or refresh the dossier for a single anchor document."""
         brief = brief_store.read(anchor_doc_id)
         if brief is None:
             doc = doc_map()[anchor_doc_id]
@@ -147,6 +168,7 @@ def build_deepagent_toolsets(
         return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id}
 
     def execute_candidate_expansion(anchor_doc_id: str, output_path: str | None = None, expanded: bool = False) -> dict:
+        """Create a candidate bundle for an anchor using scout and local signals."""
         briefs = brief_store.all()
         lookup = {brief.doc_id: brief for brief in briefs}
         anchor = lookup[anchor_doc_id]
@@ -175,6 +197,7 @@ def build_deepagent_toolsets(
         return {"candidate_bundle_path": str(destination), "candidate_count": len(items)}
 
     def execute_relation_judging(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        """Create a judgment bundle for all candidates attached to an anchor."""
         anchor = brief_map()[anchor_doc_id]
         bundle_payload = read_candidate_bundle(anchor_doc_id) or {}
         items = bundle_payload.get("candidates", [])
@@ -200,10 +223,25 @@ def build_deepagent_toolsets(
         return {"judgment_bundle_path": str(destination), "judgment_count": len(bundle.judgments)}
 
     def execute_counterevidence_check(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        """Create a counterevidence bundle that checks tentative edges for risk and duplication."""
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
-        candidate_lookup = {item["candidate_doc_id"]: item for item in candidate_payload.get("candidates", [])}
+        from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
+
+        prepared: list[tuple[Any, JudgeSignals, JudgeResult]] = []
+        for item in judgment_payload.get("judgments", []):
+            candidate = brief_map().get(item["candidate_doc_id"])
+            if candidate is None:
+                continue
+            signals_obj = JudgeSignals(**item.get("signals", {}))
+            verdict_obj = (
+                orchestrator.relation_judge.provider._verdict_from_payload(item.get("verdict", {}))
+                if hasattr(orchestrator.relation_judge.provider, "_verdict_from_payload")
+                else JudgeResult(**item.get("verdict", {}))
+            )
+            prepared.append((candidate, signals_obj, verdict_obj))
+        provider_payloads = provider.check_counterevidence_many(anchor, prepared)
         checks: list[CounterevidenceBundleItem] = []
         for item in judgment_payload.get("judgments", []):
             candidate = brief_map().get(item["candidate_doc_id"])
@@ -214,20 +252,7 @@ def build_deepagent_toolsets(
             metrics = orchestrator._candidate_metrics(anchor, candidate)
             duplicate_penalty = orchestrator._near_duplicate_penalty(anchor, candidate, metrics)
             bridge_gain = orchestrator._bridge_information_gain(anchor, candidate)
-            provider_payload = provider.check_counterevidence(
-                anchor,
-                candidate,
-                orchestrator._signal_bundle(
-                    anchor,
-                    candidate,
-                    metrics,
-                    dict(signals.get("relation_fit_scores", {})),
-                    str(verdict.get("canonical_relation", verdict.get("relation_type", "comparison"))),
-                ),
-                orchestrator.relation_judge.provider._verdict_from_payload(verdict)
-                if hasattr(orchestrator.relation_judge.provider, "_verdict_from_payload")
-                else orchestrator.relation_judge.run(anchor, candidate),
-            )
+            provider_payload = provider_payloads.get(candidate.doc_id, {})
             risk_flags = sorted(set(signals.get("risk_flags", [])) | set(verdict.get("contradiction_flags", [])) | set(provider_payload.get("risk_flags", [])))
             counterevidence: list[str] = [str(item) for item in provider_payload.get("counterevidence", [])]
             risk_penalty = float(provider_payload.get("risk_penalty", 0.0))
@@ -256,6 +281,7 @@ def build_deepagent_toolsets(
         return {"counterevidence_bundle_path": str(destination), "check_count": len(checks)}
 
     def execute_edge_review(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        """Create a review bundle with reviewed utility scores and keep/drop decisions."""
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
@@ -299,6 +325,7 @@ def build_deepagent_toolsets(
         return {"review_bundle_path": str(destination), "review_count": len(review_rows)}
 
     def execute_memory_summarization(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        """Summarize accepted and rejected outcomes into a memory learning bundle."""
         review_payload = read_review_bundle(anchor_doc_id) or {}
         kept = [item for item in review_payload.get("reviews", []) if item.get("keep")]
         dropped = [item for item in review_payload.get("reviews", []) if not item.get("keep")]

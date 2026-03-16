@@ -184,6 +184,70 @@ def test_profile_docs_malformed_batch_retries_single_remote_calls():
     assert sum(1 for stage, _ in calls if stage == "profile_doc") == 2
 
 
+def test_profile_docs_output_limit_batch_splits_then_succeeds():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = True
+    provider.trace_path = None
+
+    calls: list[tuple[str, int]] = []
+
+    def fake_invoke_json(system_prompt, user_prompt, **kwargs):
+        stage = kwargs.get("stage", "")
+        if stage != "profile_docs_batch":
+            raise AssertionError(f"unexpected stage {stage}")
+        payload = json.loads(user_prompt)
+        batch_size = len(payload["documents"])
+        calls.append((stage, batch_size))
+        if batch_size > 1:
+            raise RuntimeError("router_output_limitation: output token rate limit exceeded")
+        doc = payload["documents"][0]
+        return [
+            {
+                "doc_id": doc["doc_id"],
+                "summary": f"summary for {doc['doc_id']}",
+                "entities": [],
+                "keywords": [doc["doc_id"]],
+                "claims": [f"claim {doc['doc_id']}"],
+                "relation_hints": ["hint"],
+            }
+        ]
+
+    provider._invoke_json = fake_invoke_json
+
+    docs = [
+        DocRecord(doc_id="a", title="Alpha", text="Alpha text.", metadata={"source_dataset": "scifact"}),
+        DocRecord(doc_id="b", title="Beta", text="Beta text.", metadata={"source_dataset": "scifact"}),
+    ]
+
+    briefs = provider.profile_docs(docs)
+
+    assert [brief.doc_id for brief in briefs] == ["a", "b"]
+    assert calls[0] == ("profile_docs_batch", 2)
+    assert calls[1:] == [("profile_docs_batch", 1), ("profile_docs_batch", 1)]
+
+
+def test_profile_doc_empty_response_falls_back_to_local_profile():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = True
+    provider.trace_path = None
+    provider._invoke_json = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("empty response body"))
+
+    doc = DocRecord(
+        doc_id="empty",
+        title="Hematopoietic stem cells",
+        text="Hematopoietic stem cells do not segregate chromosomes asymmetrically.",
+        metadata={"source_dataset": "scifact"},
+    )
+
+    brief = provider.profile_doc(doc)
+
+    assert brief.doc_id == "empty"
+    assert brief.summary
+    assert brief.metadata["source_dataset"] == "scifact"
+
+
 def test_judge_relations_malformed_batch_retries_single_remote_calls():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))

@@ -141,6 +141,7 @@ def prepare_beir_work_root(repo_root: Path, work_root: Path, corpus: list[DocRec
     if work_root.exists():
         shutil.rmtree(work_root)
     shutil.copytree(repo_root / "configs", work_root / "configs")
+    shutil.copytree(repo_root / ".deepagents", work_root / ".deepagents")
     (work_root / "data" / "raw").mkdir(parents=True, exist_ok=True)
     (work_root / "data" / "demo").mkdir(parents=True, exist_ok=True)
     append_jsonl(work_root / "data" / "raw" / "beir.jsonl", corpus)

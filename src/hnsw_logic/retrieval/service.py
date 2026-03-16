@@ -60,6 +60,66 @@ class HybridRetrievalService:
         self._dataset_hint = ""
         self._refresh_corpus_cache()
 
+    def _query_tokens(self, query: str) -> set[str]:
+        return {token for token in tokenize(query) if len(token) > 2}
+
+    def _raw_query_coverage(self, query_tokens: set[str], doc_id: str) -> float:
+        if not query_tokens:
+            return 0.0
+        raw_tokens = self._record_tokens_by_id.get(doc_id, set())
+        return min(len(query_tokens & raw_tokens) / max(1, min(len(query_tokens), 6)), 1.0)
+
+    def _effective_query_specificity(self, query: str, briefs: dict[str, object], sparse_hits) -> float:
+        base = self.scorer.query_specificity(query)
+        if not sparse_hits:
+            return base
+        top_hit = sparse_hits[0]
+        top_brief = briefs.get(top_hit.doc_id)
+        if top_brief is None:
+            return base
+        query_tokens = self._query_tokens(query)
+        raw_coverage = self._raw_query_coverage(query_tokens, top_hit.doc_id)
+        title_claim = self.scorer.title_claim_alignment(query, top_brief)
+        query_alignment = self.scorer.query_alignment(query, top_brief)
+        top_gap = max(0.0, top_hit.score - (sparse_hits[1].score if len(sparse_hits) > 1 else 0.0))
+        agreement_signal = (
+            0.34 * title_claim
+            + 0.26 * query_alignment
+            + 0.22 * raw_coverage
+            + 0.18 * min(top_gap / 0.45, 1.0)
+        )
+        if (
+            top_hit.score >= 0.7
+            and query_alignment >= 0.5
+            and raw_coverage >= 0.5
+            and (title_claim >= 0.35 or raw_coverage >= 0.85)
+        ):
+            return max(base, min(1.0, 0.5 + 0.4 * agreement_signal))
+        return base
+
+    def _strong_sparse_match(
+        self,
+        query: str,
+        brief,
+        *,
+        doc_id: str,
+        sparse_score: float,
+        sparse_rank: int,
+    ) -> bool:
+        if sparse_rank > 2 or sparse_score < 0.72:
+            return False
+        query_tokens = self._query_tokens(query)
+        raw_coverage = self._raw_query_coverage(query_tokens, doc_id)
+        title_claim = self.scorer.title_claim_alignment(query, brief)
+        query_alignment = self.scorer.query_alignment(query, brief)
+        title_alignment = self.scorer.title_alignment(query, brief)
+        return (
+            title_claim >= 0.35
+            and query_alignment >= 0.5
+            and raw_coverage >= 0.65
+            and (title_alignment > 0.0 or sparse_score >= 0.9 or title_claim >= 0.6)
+        )
+
     def _refresh_corpus_cache(self) -> None:
         if self.corpus_store is None:
             return
@@ -171,6 +231,7 @@ class HybridRetrievalService:
         dense_score_map = {doc_id: score for doc_id, score, _ in dense_rows}
         dense_protected = {doc_id for doc_id, _, _ in dense_rows[: self.novelty_dense_top_k]}
         sparse_score_map = {hit.doc_id: hit.score for hit in sparse_hits}
+        sparse_rank_map = {hit.doc_id: rank for rank, hit in enumerate(sparse_hits, start=1)}
         dense_head = {doc_id for doc_id, _, _ in dense_rows[: self.sparse_agreement_top_k]}
         sparse_head = {hit.doc_id for hit in sparse_hits[: self.sparse_agreement_top_k]}
         agreement_ratio = len(dense_head & sparse_head) / max(1, len(sparse_head))
@@ -185,6 +246,7 @@ class HybridRetrievalService:
         supplemental_limit = self.supplemental_seed_top_k
         if self._dataset_hint in {"scifact", "nfcorpus"}:
             supplemental_limit = max(supplemental_limit, 10)
+        query_specificity = self._effective_query_specificity(query, briefs, sparse_hits)
         candidate_ids = [hit.doc_id for hit in sparse_hits if hit.score >= self.sparse_min_score]
         if not candidate_ids:
             return []
@@ -206,12 +268,7 @@ class HybridRetrievalService:
                 continue
             dense_rank = dense_rank_map.get(doc_id)
             dense_score = dense_score_map.get(doc_id, 0.0)
-            raw_tokens = self._record_tokens_by_id.get(doc_id, set())
-            raw_coverage = (
-                min(len(query_tokens & raw_tokens) / max(1, min(len(query_tokens), 6)), 1.0)
-                if query_tokens
-                else 0.0
-            )
+            raw_coverage = self._raw_query_coverage(query_tokens, doc_id)
             rrf = (0.0 if dense_rank is None else 1.0 / (60.0 + dense_rank)) + 1.0 / (60.0 + sparse_rank)
             rrf_score = min(rrf / max_rrf, 1.0)
             novelty_bonus = 0.08 * novelty_bias if doc_id not in dense_protected else 0.0
@@ -239,12 +296,22 @@ class HybridRetrievalService:
             if dense_rank is not None:
                 if self._dataset_hint in {"scifact", "nfcorpus"}:
                     claim_signal = max(score, query_alignment, structure_alignment)
+                    strong_sparse_match = self._strong_sparse_match(
+                        query,
+                        brief,
+                        doc_id=doc_id,
+                        sparse_score=sparse_score,
+                        sparse_rank=sparse_rank,
+                    )
                     dense_boost_cap = 0.045 if self._dataset_hint == "scifact" else 0.025
+                    if strong_sparse_match:
+                        dense_boost_cap = max(dense_boost_cap, 0.085 if sparse_rank == 1 else 0.065)
                     boost = min(
                         dense_boost_cap,
                         0.08 * max(claim_signal - dense_score, 0.0)
                         + 0.025 * max(query_alignment - 0.2, 0.0)
-                        + 0.015 * max(structure_alignment - 0.1, 0.0),
+                        + 0.015 * max(structure_alignment - 0.1, 0.0)
+                        + (0.05 if strong_sparse_match and sparse_rank == 1 else 0.0)
                     )
                     blended = min(dense_score + max(boost, 0.0) + semantic_hint_bonus, 0.99)
                 else:
@@ -357,6 +424,7 @@ class HybridRetrievalService:
                 if target_brief is None:
                     continue
                 edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
+                specific_overlap = self.scorer.specific_query_overlap(query, target_brief, edge)
                 target_rel = self.scorer.score_target(query, query_emb, target_brief)
                 if target_rel < (0.42 if same_concept_bridge else 0.35):
                     continue
@@ -364,6 +432,8 @@ class HybridRetrievalService:
                 if target_alignment < (0.3 if same_concept_bridge else 0.24):
                     continue
                 if same_concept_bridge and edge_alignment < (0.14 + 0.1 * query_specificity):
+                    continue
+                if same_concept_bridge and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
                     continue
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
                 utility_multiplier = 0.5 + 0.5 * edge_utility
@@ -375,7 +445,7 @@ class HybridRetrievalService:
                     * target_rel
                     * relation_multiplier
                     * min(1.0, 0.55 + source_alignment)
-                    * (0.4 + 0.6 * edge_alignment)
+                    * (0.35 + 0.45 * edge_alignment + 0.2 * specific_overlap)
                 )
                 if edge.dst_doc_id in ranked_ids:
                     bonus *= 1.15
@@ -447,6 +517,7 @@ class HybridRetrievalService:
             if brief is None:
                 continue
             source_alignment = max(self.scorer.query_alignment(query, brief), self.scorer.structure_alignment(query, brief))
+            source_specific_overlap = self.scorer.specific_query_overlap(query, brief)
             best_edge_promise = 0.0
             edge_hits = 0
             for edge in self.graph_store.get_out_edges(doc_id)[: max(self.adaptive_graph_expansion_cap, base_max_expansions)]:
@@ -456,14 +527,20 @@ class HybridRetrievalService:
                 target_rel_score = self.scorer.score_target(query, query_emb, target_brief)
                 target_alignment = max(self.scorer.query_alignment(query, target_brief), self.scorer.structure_alignment(query, target_brief))
                 edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
+                specific_overlap = self.scorer.specific_query_overlap(query, target_brief, edge)
                 relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
                 edge_utility = max(0.0, min(1.0, getattr(edge, "utility_score", edge.confidence)))
+                if edge.relation_type == "same_concept" and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
+                    continue
+                if edge.relation_type == "same_concept" and specific_overlap <= source_specific_overlap + 0.05:
+                    continue
                 edge_promise = (
                     0.34 * edge_utility
                     + 0.26 * edge.confidence
                     + 0.24 * target_rel_score
-                    + 0.16 * target_alignment
-                ) * relation_multiplier * (0.35 + 0.65 * edge_alignment)
+                    + 0.1 * target_alignment
+                    + 0.06 * specific_overlap
+                ) * relation_multiplier * (0.3 + 0.5 * edge_alignment + 0.2 * specific_overlap)
                 if edge.relation_type == "same_concept":
                     edge_promise *= 0.9 + 0.08 * max(0.0, 1.0 - query_specificity)
                 best_edge_promise = max(best_edge_promise, edge_promise)
@@ -504,12 +581,21 @@ class HybridRetrievalService:
                     brief = briefs.get(doc_id)
                     if brief is None or score <= current_score:
                         continue
-                    query_specificity = self.scorer.query_specificity(query)
+                    sparse_rank = next((rank for rank, hit in enumerate(sparse_hits, start=1) if hit.doc_id == doc_id), len(sparse_hits) + 1)
+                    query_specificity = self._effective_query_specificity(query, briefs, sparse_hits)
                     title_alignment = self.scorer.title_alignment(query, brief)
                     query_alignment = self.scorer.query_alignment(query, brief)
                     dense_boost_cap = 0.0
                     if query_specificity >= 0.7 and (title_alignment > 0.0 or query_alignment >= 0.5):
                         dense_boost_cap = 0.05
+                    if self._strong_sparse_match(
+                        query,
+                        brief,
+                        doc_id=doc_id,
+                        sparse_score=score,
+                        sparse_rank=sparse_rank,
+                    ):
+                        dense_boost_cap = max(dense_boost_cap, 0.085 if sparse_rank == 1 else 0.065)
                     if dense_boost_cap > 0.0:
                         merged[doc_id] = (min(score, current_score + dense_boost_cap), "geometric")
                 continue
@@ -548,6 +634,7 @@ class HybridRetrievalService:
         self._refresh_corpus_cache()
         query_emb = self.scorer.encode_query(query)
         briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
+        baseline_response = None
         dense_rows = self._seed_rows_dense(query_emb)
         seed_rows, strategy = self._seed_rows(query, query_emb, briefs, dense_rows=dense_rows)
         if getattr(strategy, "sparse_gate", 1.0) <= 0.0 and not getattr(strategy, "allow_sparse_only", True) and getattr(strategy, "graph_gate", 0.0) <= 0.0:
@@ -562,6 +649,8 @@ class HybridRetrievalService:
 
         effective_max_seeds, effective_max_expansions = self._graph_budget(query, query_emb, seed_rows, briefs, strategy)
         for doc_id, seed_score, source_kind in seed_rows[:effective_max_seeds]:
+            source_brief = briefs.get(doc_id)
+            source_specific_overlap = self.scorer.specific_query_overlap(query, source_brief) if source_brief is not None else 0.0
             for edge in self.graph_store.get_out_edges(doc_id)[:effective_max_expansions]:
                 brief = briefs.get(edge.dst_doc_id)
                 if brief is None:
@@ -569,10 +658,15 @@ class HybridRetrievalService:
                 edge_emb = self.scorer.edge_embedding(edge)
                 target_rel_score = self.scorer.score_target(query, query_emb, brief)
                 edge_query_alignment = self.scorer.edge_query_alignment(query, edge, brief)
+                specific_overlap = self.scorer.specific_query_overlap(query, brief, edge)
                 if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score):
                     if edge.relation_type == "same_concept":
                         threshold = 0.12 + 0.12 * self.scorer.query_specificity(query)
                         if edge_query_alignment < threshold:
+                            continue
+                        if self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
+                            continue
+                        if specific_overlap <= source_specific_overlap + 0.05:
                             continue
                     expanded.append(
                         ExpandedCandidate(
@@ -588,6 +682,25 @@ class HybridRetrievalService:
         ranked = self.scorer.rank(query, query_emb, seeds, expanded, briefs, top_k)
         ranked = self._apply_graph_neighborhood_bonus(query, query_emb, ranked, briefs)
         ranked = self._retain_dense_top_hits(ranked, briefs, dense_rows, top_k)
+        if (
+            all(row["source_kind"] == "geometric" and row.get("via_edge") is None for row in ranked[:top_k])
+            and not any(row["final_score"] > row["geometric_score"] + 1e-6 for row in ranked[:top_k])
+        ):
+            baseline_response = self.search_baseline(query, top_k=top_k)
+            baseline_rows = [(hit.doc_id, hit.final_score) for hit in baseline_response.hits[:top_k]]
+            ranked_rows = [(row["doc_id"], row["geometric_score"]) for row in ranked[:top_k]]
+            if (
+                len(ranked_rows) == len(baseline_rows)
+                and all(
+                    ranked_doc_id == baseline_doc_id and abs(ranked_score - baseline_score) <= 1e-6
+                    for (ranked_doc_id, ranked_score), (baseline_doc_id, baseline_score) in zip(ranked_rows, baseline_rows, strict=False)
+                )
+            ):
+                if not use_memory_bias:
+                    return baseline_response
+                rows = self._response_to_rows(baseline_response)
+                ranked = self._apply_memory_bias(query, rows)
+                return self._hits_from_ranked(query, ranked, top_k)
         if use_memory_bias:
             ranked = self._apply_memory_bias(query, ranked)
         return self._hits_from_ranked(query, ranked, top_k)

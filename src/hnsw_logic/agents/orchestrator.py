@@ -323,6 +323,31 @@ class LogicOrchestrator:
     def _supports_same_concept_pair(self, anchor: DocBrief, candidate: DocBrief) -> bool:
         return self._is_evidence_like_doc(anchor) and self._doc_stage(candidate) == self._doc_stage(anchor)
 
+    def _high_utility_same_concept_bridge(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        metrics: dict[str, float],
+        *,
+        blended_support: float,
+        blended_utility: float,
+    ) -> bool:
+        if not self._supports_same_concept_pair(anchor, candidate):
+            return False
+        if metrics["topic_drift"] >= 1.0:
+            return False
+        return (
+            metrics["dense_score"] >= 0.75
+            and blended_support >= 0.7
+            and blended_utility >= 0.72
+            and metrics["topic_alignment"] >= 1.0
+            and (
+                metrics["title_overlap"] >= 2.0
+                or metrics["mention_score"] >= 0.32
+                or self._specific_title_bridge_score(anchor, candidate) >= 0.45
+            )
+        )
+
     def _same_concept_methodology_penalty(self, anchor: DocBrief, candidate: DocBrief) -> float:
         anchor_stage = self._doc_stage(anchor)
         if anchor_stage not in {"scientific_evidence", "clinical_passage"} or self._doc_stage(candidate) != anchor_stage:
@@ -1032,6 +1057,7 @@ class LogicOrchestrator:
 
     def _select_diverse_assessments(
         self,
+        anchor: DocBrief,
         accepted: list[CandidateAssessment],
         candidate_map: dict[str, DocBrief],
         limit: int,
@@ -1039,16 +1065,24 @@ class LogicOrchestrator:
         if len(accepted) <= limit:
             return accepted
         remaining = list(accepted)
+        specific_term_frequency: Counter[str] = Counter()
+        for item in accepted:
+            candidate = candidate_map.get(item.candidate_doc_id)
+            if candidate is None:
+                continue
+            specific_term_frequency.update(self._specific_title_terms(candidate))
         selected: list[CandidateAssessment] = []
         selected_relations: Counter[str] = Counter()
         selected_stages: Counter[str] = Counter()
         selected_terms: list[set[str]] = []
+        selected_specific_terms: list[set[str]] = []
         while remaining and len(selected) < limit:
             best_index = 0
             best_score = float("-inf")
             for index, item in enumerate(remaining):
                 candidate = candidate_map.get(item.candidate_doc_id)
                 candidate_terms = self._normalized_tokens(self._content_terms(candidate)) if candidate is not None else set()
+                candidate_specific_terms = self._specific_title_terms(candidate) if candidate is not None else set()
                 novelty = 1.0
                 if selected_terms and candidate_terms:
                     similarities = [
@@ -1056,13 +1090,42 @@ class LogicOrchestrator:
                         for chosen_terms in selected_terms
                     ]
                     novelty = 1.0 - max(similarities, default=0.0)
+                specific_novelty = 1.0
+                if selected_specific_terms and candidate_specific_terms:
+                    specific_similarities = [
+                        len(candidate_specific_terms & chosen_terms) / max(1, len(candidate_specific_terms | chosen_terms))
+                        for chosen_terms in selected_specific_terms
+                    ]
+                    specific_novelty = 1.0 - max(specific_similarities, default=0.0)
                 utility_bonus = 0.08 * max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0))
                 relation_bonus = 0.06 if selected_relations[item.relation_type] == 0 else max(0.0, 0.03 - 0.015 * selected_relations[item.relation_type])
                 candidate_stage = self._doc_stage(candidate) if candidate is not None else ""
                 stage_bonus = 0.04 if candidate_stage and selected_stages[candidate_stage] == 0 else 0.0
                 mirror_bonus = 0.03 if item.relation_type in {"same_concept", "comparison"} else 0.0
-                score = item.score * (0.9 + 0.1 * max(getattr(item.edge, "utility_score", 0.0), 0.0))
-                score += 0.12 * novelty + utility_bonus + relation_bonus + stage_bonus + mirror_bonus
+                utility_value = max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0))
+                scientific_same_concept = (
+                    candidate is not None
+                    and item.relation_type == "same_concept"
+                    and self._supports_same_concept_pair(anchor, candidate)
+                )
+                specificity_bonus = 0.0
+                if scientific_same_concept:
+                    specific_rarity = 0.0
+                    if candidate_specific_terms:
+                        rarity_scores = [
+                            1.0 / max(1, specific_term_frequency.get(term, 1))
+                            for term in candidate_specific_terms
+                        ]
+                        specific_rarity = sum(rarity_scores) / len(rarity_scores)
+                    specificity_bonus += 0.16 * specific_novelty
+                    specificity_bonus += 0.1 * min(len(candidate_specific_terms) / 4.0, 1.0)
+                    specificity_bonus += 0.06 * max(0.0, min(self._bridge_information_gain(anchor, candidate), 1.0))
+                    specificity_bonus += 0.18 * specific_rarity
+                base_multiplier = 0.9 + 0.1 * utility_value
+                if scientific_same_concept:
+                    base_multiplier = 0.58 + 0.12 * utility_value
+                score = item.score * base_multiplier
+                score += 0.12 * novelty + utility_bonus + relation_bonus + stage_bonus + mirror_bonus + specificity_bonus
                 if score > best_score:
                     best_score = score
                     best_index = index
@@ -1074,6 +1137,7 @@ class LogicOrchestrator:
             if chosen_stage:
                 selected_stages[chosen_stage] += 1
             selected_terms.append(self._normalized_tokens(self._content_terms(chosen_candidate)) if chosen_candidate is not None else set())
+            selected_specific_terms.append(self._specific_title_terms(chosen_candidate) if chosen_candidate is not None else set())
         return selected
 
     def _dense_neighbor_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False) -> list[tuple[float, CandidateProposal]]:
@@ -1528,6 +1592,7 @@ class LogicOrchestrator:
 
         accepted = model_accepts
         rescued_by_reviewer = False
+        rescued_by_utility = False
         if model_accepts and reviewer_accepts:
             accepted = True
         elif model_accepts and not reviewer_accepts:
@@ -1541,7 +1606,37 @@ class LogicOrchestrator:
             )
             rescued_by_reviewer = accepted
         else:
-            accepted = False
+            rescue_relation = reviewer_relation if reviewer_relation in RELATION_TYPES else best_relation
+            if (
+                best_relation in RELATION_TYPES
+                and fit_scores.get(best_relation, 0.0) >= fit_scores.get(rescue_relation, 0.0) + 0.08
+            ):
+                rescue_relation = best_relation
+            if (
+                best_relation == "same_concept"
+                and self._supports_same_concept_pair(anchor, candidate)
+                and fit_scores.get("same_concept", 0.0) >= max(0.58, fit_scores.get(rescue_relation, 0.0))
+            ):
+                rescue_relation = "same_concept"
+            rescue_utility = max(
+                signal_bundle.utility_score,
+                float(getattr(result, "utility_score", 0.0)),
+                float(getattr(review_result, "utility_score", 0.0)),
+            )
+            accepted = (
+                rescue_relation in {"same_concept", "comparison", "supporting_evidence"}
+                and fit_scores.get(rescue_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.08
+                and local_strength >= 0.44
+                and rescue_utility >= 0.72
+                and not ({"service_surface", "foundational_support"} & risk_flags)
+                and not (
+                    rescue_relation == "supporting_evidence"
+                    and "weak_direction" in risk_flags
+                )
+            )
+            rescued_by_utility = accepted
+            if rescued_by_utility:
+                resolved_relation = rescue_relation
 
         if not accepted:
             return SimpleNamespace(
@@ -1584,6 +1679,22 @@ class LogicOrchestrator:
                 signal_bundle.utility_score,
                 0.25 * float(getattr(result, "utility_score", 0.0)) + 0.75 * float(getattr(review_result, "utility_score", 0.0)),
             )
+        elif rescued_by_utility:
+            confidence = max(
+                0.82,
+                0.22 * float(result.confidence)
+                + 0.28 * float(review_result.confidence)
+                + 0.18 * fit_scores.get(resolved_relation, 0.0)
+                + 0.32 * max(signal_bundle.utility_score, signal_bundle.local_support),
+            )
+            support_score = max(
+                signal_bundle.local_support,
+                0.35 * float(getattr(result, "support_score", 0.0)) + 0.65 * float(getattr(review_result, "support_score", 0.0)),
+            )
+            utility_score = max(
+                signal_bundle.utility_score,
+                0.2 * float(getattr(result, "utility_score", 0.0)) + 0.8 * float(getattr(review_result, "utility_score", 0.0)),
+            )
         else:
             confidence = (
                 0.44 * float(result.confidence)
@@ -1618,9 +1729,15 @@ class LogicOrchestrator:
                 [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
             ),
             decision_reason=(
-                f"Consensus edge review kept {resolved_relation}. "
-                f"judge={model_relation}:{float(result.confidence):.2f}, "
-                f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
+                (
+                    f"Utility recovery kept {resolved_relation}. "
+                    f"judge={model_relation}:{float(result.confidence):.2f}, "
+                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
+                    if rescued_by_utility
+                    else f"Consensus edge review kept {resolved_relation}. "
+                    f"judge={model_relation}:{float(result.confidence):.2f}, "
+                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
+                )
             )[:200],
             semantic_relation_label=str(getattr(review_result, "semantic_relation_label", getattr(result, "semantic_relation_label", resolved_relation)))[:80],
             canonical_relation=resolved_relation,
@@ -2315,6 +2432,13 @@ class LogicOrchestrator:
             final_result.relation_type == "same_concept"
             and self._supports_same_concept_pair(anchor, candidate)
             and self._bridge_information_gain(anchor, candidate) < 0.52
+            and not self._high_utility_same_concept_bridge(
+                anchor,
+                candidate,
+                metrics,
+                blended_support=blended_support,
+                blended_utility=blended_utility,
+            )
         ):
             return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if (
@@ -2630,6 +2754,27 @@ class LogicOrchestrator:
             support_group = [item for item in evidence_group if item.relation_type == "supporting_evidence"]
             if same_concept_group:
                 cap = min(cap, 2 + min(1, len(support_group)))
+                top_same = same_concept_group[0]
+                top_candidate = candidate_map.get(top_same.candidate_doc_id)
+                top_specific_terms = self._specific_title_terms(top_candidate) if top_candidate is not None else set()
+                for runner in same_concept_group[1:]:
+                    runner_candidate = candidate_map.get(runner.candidate_doc_id)
+                    runner_specific_terms = self._specific_title_terms(runner_candidate) if runner_candidate is not None else set()
+                    specificity_gap = 1.0
+                    if top_specific_terms and runner_specific_terms:
+                        specificity_gap = 1.0 - (
+                            len(top_specific_terms & runner_specific_terms)
+                            / max(1, len(top_specific_terms | runner_specific_terms))
+                        )
+                    if (
+                        runner.edge is not None
+                        and runner.edge.utility_score >= 0.78
+                        and runner.local_support >= 0.68
+                        and len(runner_specific_terms) >= 3
+                        and specificity_gap >= 0.72
+                    ):
+                        cap = max(cap, 2)
+                        break
             if len(evidence_group) >= 2 and evidence_group[0].score - evidence_group[1].score <= self._edge_quality().second_edge_margin + 0.05:
                 cap = max(cap, min(3, len(evidence_group)))
         if self._is_live_provider() and self._doc_stage(anchor) == "logic_graph":
@@ -2647,7 +2792,7 @@ class LogicOrchestrator:
             ):
                 cap = max(cap, 2)
 
-        kept_ids = {item.candidate_doc_id for item in self._select_diverse_assessments(accepted, candidate_map, cap)}
+        kept_ids = {item.candidate_doc_id for item in self._select_diverse_assessments(anchor, accepted, candidate_map, cap)}
         final: list[CandidateAssessment] = []
         for item in assessments:
             if item.accepted and item.candidate_doc_id not in kept_ids:

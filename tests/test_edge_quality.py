@@ -473,6 +473,70 @@ def test_scientific_methodology_match_does_not_stay_same_concept():
     assert not (assessment.accepted and assessment.relation_type == "same_concept")
 
 
+def test_high_utility_scientific_same_concept_bridge_survives_weak_link_gate(monkeypatch):
+    class ScientificProvider(FakeProvider):
+        def embed_texts(self, texts):
+            rows = []
+            for text in texts:
+                lowered = text.lower()
+                if "hematopoietic" in lowered or "stem cell" in lowered or "chromosome" in lowered or "thrombopoietin" in lowered:
+                    rows.append(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32))
+                else:
+                    rows.append(np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32))
+            return np.vstack(rows)
+
+    provider = type("OpenAICompatibleProvider", (ScientificProvider,), {})()
+    anchor = _brief(
+        "32170702",
+        "Thrombopoietin signaling regulates hematopoietic stem cell quiescence",
+        "Thrombopoietin signaling regulates hematopoietic stem cell quiescence in the osteoblastic niche.",
+        ["thrombopoietin", "hematopoietic", "stem", "cell", "quiescence", "niche"],
+        ["hematopoietic stem cell"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "hsc-quiescence"},
+    )
+    candidate = _brief(
+        "4381486",
+        "Hematopoietic stem cells do not asymmetrically segregate chromosomes",
+        "Hematopoietic stem cells do not asymmetrically segregate chromosomes or retain BrdU.",
+        ["hematopoietic", "stem", "cells", "chromosomes", "segregate", "brdu"],
+        ["hematopoietic stem cell"],
+        ["claim", "evidence", "study"],
+        {"source_dataset": "scifact", "topic": "scientific_claims", "topic_cluster": "hsc-quiescence"},
+    )
+    verdicts = {
+        "4381486": JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.86,
+            evidence_spans=[
+                "Both passages describe hematopoietic stem cell behavior.",
+                "The candidate contributes a complementary HSC finding rather than a contradictory topic.",
+            ],
+            rationale="The candidate is a bridge document in the same HSC evidence family.",
+            support_score=0.78,
+            contradiction_flags=[],
+            decision_reason="Shared HSC evidence family.",
+            utility_score=0.8,
+            uncertainty=0.2,
+            canonical_relation="same_concept",
+            semantic_relation_label="same_evidence_family",
+        )
+    }
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, verdicts),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    monkeypatch.setattr(type(orchestrator), "_bridge_information_gain", lambda self, *_args, **_kwargs: 0.51)
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+    assert assessment.accepted is True
+    assert assessment.relation_type == "same_concept"
+
+
 def test_semantic_detail_bridge_accepts_high_dense_mechanism_pair():
     class SemanticProvider(FakeProvider):
         def embed_texts(self, texts):

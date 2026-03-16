@@ -152,6 +152,16 @@ class ProviderBase:
             "risk_penalty": round(penalty, 6),
         }
 
+    def check_counterevidence_many(
+        self,
+        anchor: DocBrief,
+        candidates: list[tuple[DocBrief, JudgeSignals, JudgeResult]],
+    ) -> dict[str, dict]:
+        return {
+            candidate.doc_id: self.check_counterevidence(anchor, candidate, signals, verdict)
+            for candidate, signals, verdict in candidates
+        }
+
     def review_with_utility(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> JudgeResult:
         return self.review_relation_with_signals(anchor, candidate, signals, verdict)
 
@@ -617,7 +627,12 @@ class OpenAICompatibleProvider(StubProvider):
             or "expecting ',' delimiter" in message
             or "unterminated string" in message
             or "extra data" in message
+            or "empty response body" in message
         )
+
+    def _is_output_limit_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "router_output_limitation" in message or "output token rate limit exceeded" in message
 
     def _init_local_bge_m3(self) -> None:
         from huggingface_hub import snapshot_download
@@ -671,14 +686,15 @@ class OpenAICompatibleProvider(StubProvider):
     def _invoke_json(self, system_prompt: str, user_prompt: str, *, thinking: bool = False, stage: str = "generic"):
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        kwargs = {}
-        if thinking:
-            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        else:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        thinking_enabled = thinking
         current_user_prompt = user_prompt
         last_exc: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(3):
+            kwargs = {
+                "extra_body": {
+                    "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
+                }
+            }
             try:
                 response = self._chat.invoke([SystemMessage(content=system_prompt), HumanMessage(content=current_user_prompt)], **kwargs)
                 content = response.content if isinstance(response.content, str) else "".join(part.get("text", "") for part in response.content)
@@ -695,6 +711,14 @@ class OpenAICompatibleProvider(StubProvider):
                         f"{user_prompt}\n\n"
                         "Previous response was not valid JSON. Return exactly one JSON object or JSON array matching the schema. "
                         "Do not include markdown fences, prose, or explanations outside JSON."
+                    )
+                    continue
+                if thinking_enabled and self._is_output_limit_error(exc):
+                    thinking_enabled = False
+                    current_user_prompt = (
+                        f"{user_prompt}\n\n"
+                        "Keep the response concise. Return only the required JSON fields. "
+                        "Use short evidence spans and a brief decision_reason."
                     )
                     continue
                 raise
@@ -1090,6 +1114,71 @@ class OpenAICompatibleProvider(StubProvider):
             self._handle_remote_failure("check_counterevidence", exc)
             return super().check_counterevidence(anchor, candidate, signals, verdict)
 
+    def check_counterevidence_many(
+        self,
+        anchor: DocBrief,
+        candidates: list[tuple[DocBrief, JudgeSignals, JudgeResult]],
+    ) -> dict[str, dict]:
+        if not candidates:
+            return {}
+        results: dict[str, dict] = {}
+        for batch in self._chunk(candidates, 8):
+            try:
+                payload = self._invoke_json(
+                    self._counterevidence_instruction(),
+                    json.dumps(
+                        {
+                            "task": "Check each tentative edge for duplicate, direction, and low-utility risk.",
+                            "anchor": to_jsonable(anchor),
+                            "candidates": [
+                                {
+                                    "candidate_doc_id": candidate.doc_id,
+                                    "candidate": to_jsonable(candidate),
+                                    "signals": to_jsonable(signals),
+                                    "verdict": to_jsonable(verdict),
+                                }
+                                for candidate, signals, verdict in batch
+                            ],
+                            "output_schema": [
+                                {
+                                    "candidate_doc_id": "string",
+                                    "keep": "boolean",
+                                    "risk_flags": ["string"],
+                                    "counterevidence": ["string"],
+                                    "decision_reason": "string",
+                                    "risk_penalty": "float",
+                                }
+                            ],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    thinking=self.live_reasoning["reviewer"],
+                    stage="check_counterevidence_batch",
+                )
+                items = payload if isinstance(payload, list) else payload.get("checks", [])
+                for item in items:
+                    candidate_doc_id = str(item.get("candidate_doc_id", ""))
+                    if not candidate_doc_id:
+                        continue
+                    results[candidate_doc_id] = {
+                        "keep": bool(item.get("keep", True)),
+                        "risk_flags": [str(flag) for flag in item.get("risk_flags", [])][:8],
+                        "counterevidence": [str(flag) for flag in item.get("counterevidence", [])][:8],
+                        "decision_reason": str(item.get("decision_reason", ""))[:220],
+                        "risk_penalty": float(item.get("risk_penalty", 0.0)),
+                    }
+            except Exception as exc:
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc)) and len(batch) > 1:
+                    midpoint = max(1, len(batch) // 2)
+                    for partial in (batch[:midpoint], batch[midpoint:]):
+                        results.update(self.check_counterevidence_many(anchor, partial))
+                    continue
+                self._handle_remote_failure("check_counterevidence_batch", exc)
+                results.update(super().check_counterevidence_many(anchor, batch))
+            for candidate, signals, verdict in batch:
+                results.setdefault(candidate.doc_id, super().check_counterevidence(anchor, candidate, signals, verdict))
+        return results
+
     def summarize_memory_learnings(self, payload: dict) -> dict:
         try:
             return self._invoke_json(
@@ -1158,8 +1247,9 @@ class OpenAICompatibleProvider(StubProvider):
             )
             return self._postprocess_profile(doc, payload)
         except Exception as exc:
-            if self._is_content_filter_error(exc):
-                self._trace_remote("profile_doc", "blocked_local", doc.doc_id)
+            if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
+                status = "blocked_local" if self._is_content_filter_error(exc) else "fallback_local"
+                self._trace_remote("profile_doc", status, doc.doc_id)
                 return self._postprocess_profile(doc, None)
             self._handle_remote_failure("profile_doc", exc)
             return self._postprocess_profile(doc, None)
@@ -1168,7 +1258,7 @@ class OpenAICompatibleProvider(StubProvider):
         if not docs:
             return []
         results: dict[str, DocBrief] = {}
-        for batch in self._chunk(docs, 8):
+        for batch in self._chunk(docs, 4):
             try:
                 payload = self._invoke_json(
                     "You are a document profiler. Return JSON only.",
@@ -1202,7 +1292,7 @@ class OpenAICompatibleProvider(StubProvider):
                         continue
                     results[doc_id] = self._postprocess_profile(source, item)
             except Exception as exc:
-                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
                     if len(batch) > 1:
                         midpoint = max(1, len(batch) // 2)
                         for partial in (batch[:midpoint], batch[midpoint:]):
@@ -1442,12 +1532,12 @@ class OpenAICompatibleProvider(StubProvider):
                         continue
                     verdicts[candidate_doc_id] = self._verdict_from_payload(item)
             except Exception as exc:
-                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc)) and len(batch) > 1:
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc)) and len(batch) > 1:
                     midpoint = max(1, len(batch) // 2)
                     for partial in (batch[:midpoint], batch[midpoint:]):
                         verdicts.update(self.judge_relations_with_signals(anchor, partial))
                     continue
-                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
                     blocked_ids = ",".join(candidate.doc_id for candidate, _ in batch)
                     status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
                     self._trace_remote("judge_relations_batch", status, blocked_ids)
@@ -1509,7 +1599,7 @@ class OpenAICompatibleProvider(StubProvider):
         if not candidates:
             return {}
         verdicts: dict[str, JudgeResult] = {}
-        for batch in self._chunk(candidates, 6):
+        for batch in self._chunk(candidates, 4):
             try:
                 payload = self._invoke_json(
                     self._review_instruction(),
@@ -1562,12 +1652,12 @@ class OpenAICompatibleProvider(StubProvider):
                         continue
                     verdicts[candidate_doc_id] = self._verdict_from_payload(item)
             except Exception as exc:
-                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc)) and len(batch) > 1:
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc)) and len(batch) > 1:
                     midpoint = max(1, len(batch) // 2)
                     for partial in (batch[:midpoint], batch[midpoint:]):
                         verdicts.update(self.review_relations_with_signals(anchor, partial))
                     continue
-                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc):
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
                     blocked_ids = ",".join(candidate.doc_id for candidate, _, _ in batch)
                     status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
                     self._trace_remote("review_relations_batch", status, blocked_ids)
