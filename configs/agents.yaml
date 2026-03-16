@@ -1,5 +1,16 @@
 runtime_mode: deepagents
 sandbox_enabled: false
+skills_root: .deepagents/skills
+memory_files:
+  - .deepagents/AGENTS.md
+self_update_mode: controlled
+self_update_allowlist:
+  - .deepagents/AGENTS.md
+  - .deepagents/skills/*/references/*.md
+planner_enabled: true
+counterevidence_enabled: true
+max_parallel_tasks: 4
+task_iteration_cap: 2
 live_reasoning:
   enable_scout_thinking: true
   enable_judge_thinking: true
@@ -7,26 +18,81 @@ live_reasoning:
   enable_curator_thinking: true
   enable_query_strategy_thinking: true
 subagents:
+  index_planner:
+    enabled: true
+    skills:
+      - anchor-planning
+      - corpus-adaptation
+    tool_scopes:
+      - read_doc_brief
+      - load_anchor_memory
+      - read_graph_stats
+      - read_semantic_memory
+    description: Plan offline indexing batches, anchor order, and coverage budgets.
+    system_prompt: You plan offline indexing work. Prioritize coverage, bridge potential, and reusable retrieval utility.
   doc_profiler:
     enabled: true
     skills:
-      - doc_briefing
-      - entity_canonicalization
+      - doc-briefing
+      - entity-canonicalization
+    tool_scopes:
+      - read_doc_full
+      - read_doc_brief
+    description: Build anchor dossiers and normalize profile information for offline indexing.
+    system_prompt: You build concise structured dossiers for documents and anchors.
   corpus_scout:
     enabled: true
     skills:
-      - corpus_navigation
+      - candidate-expansion
+      - evidence-bundling
+    tool_scopes:
+      - read_doc_brief
+      - search_summaries
+      - lookup_entities
+      - get_hnsw_neighbors
+      - read_anchor_dossier
+    description: Expand and bundle candidate documents for an anchor.
+    system_prompt: You gather high-utility candidate documents and package the supporting evidence bundle.
   relation_judge:
     enabled: true
     skills:
-      - evidence_linking
-      - relation_typing
+      - relation-judging
+      - signal-fusion
+    tool_scopes:
+      - read_anchor_dossier
+      - read_candidate_bundle
+    description: Judge candidate relations using dossiers, evidence bundles, and local signals.
+    system_prompt: You judge durable retrieval edges with precision-first reasoning grounded in local signals.
+  counterevidence_checker:
+    enabled: true
+    skills:
+      - counterevidence-check
+      - graph-hygiene
+    tool_scopes:
+      - read_candidate_bundle
+      - read_judgment_bundle
+      - read_failure_patterns
+    description: Check tentative edges for duplication, weak direction, and low-utility drift.
+    system_prompt: You look for counterevidence and generic failure modes before an edge can survive.
   edge_reviewer:
     enabled: true
     skills:
-      - edge_utility
-      - signal_fusion
+      - edge-utility-review
+      - graph-hygiene
+    tool_scopes:
+      - read_candidate_bundle
+      - read_judgment_bundle
+      - read_counterevidence_bundle
+    description: Review candidate edges for utility, risk, and graph hygiene.
+    system_prompt: You keep only durable high-utility edges that are likely to improve retrieval quality.
   memory_curator:
     enabled: true
     skills:
-      - memory_update
+      - memory-summarization
+      - memory-update
+    tool_scopes:
+      - read_anchor_dossier
+      - read_review_bundle
+      - read_failure_patterns
+    description: Summarize accepted and rejected patterns into controlled memory updates.
+    system_prompt: You summarize learnings and propose memory updates without editing protected code or configs.

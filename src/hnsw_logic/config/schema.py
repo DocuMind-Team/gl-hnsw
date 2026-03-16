@@ -46,11 +46,27 @@ class HnswConfig(BaseModel):
 class SubagentConfig(BaseModel):
     enabled: bool = True
     skills: list[str] = Field(default_factory=list)
+    tool_scopes: list[str] = Field(default_factory=list)
+    description: str = ""
+    system_prompt: str = ""
 
 
 class AgentsConfig(BaseModel):
     runtime_mode: str = "deepagents"
     sandbox_enabled: bool = False
+    skills_root: Path = Path(".deepagents/skills")
+    memory_files: list[Path] = Field(default_factory=lambda: [Path(".deepagents/AGENTS.md")])
+    self_update_mode: str = "controlled"
+    self_update_allowlist: list[str] = Field(
+        default_factory=lambda: [
+            ".deepagents/AGENTS.md",
+            ".deepagents/skills/*/references/*.md",
+        ]
+    )
+    planner_enabled: bool = True
+    counterevidence_enabled: bool = True
+    max_parallel_tasks: int = 4
+    task_iteration_cap: int = 2
     subagents: dict[str, SubagentConfig] = Field(default_factory=dict)
     live_reasoning: "LiveReasoningConfig" = Field(default_factory=lambda: LiveReasoningConfig())
 
