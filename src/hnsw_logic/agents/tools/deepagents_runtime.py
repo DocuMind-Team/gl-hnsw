@@ -1,0 +1,388 @@
+from __future__ import annotations
+
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Callable
+
+from hnsw_logic.agents.runtime_models import (
+    AnchorDossier,
+    AnchorPlan,
+    CandidateBundle,
+    CandidateBundleItem,
+    CounterevidenceBundle,
+    CounterevidenceBundleItem,
+    IndexingPlan,
+    JudgmentBundle,
+    JudgmentBundleItem,
+    MemoryLearningBundle,
+    ReviewBundle,
+    ReviewBundleItem,
+)
+from hnsw_logic.core.models import LogicEdge
+from hnsw_logic.core.utils import read_json, to_jsonable, utc_now, write_json
+
+
+def build_deepagent_toolsets(
+    *,
+    provider,
+    corpus_store,
+    brief_store,
+    graph_store,
+    anchor_memory_store,
+    semantic_memory_store,
+    graph_memory_store,
+    hnsw_searcher,
+    orchestrator,
+    workspace_root: Path,
+    config_subagents: dict[str, Any],
+) -> dict[str, dict[str, Callable]]:
+    processed_docs_cache: list | None = None
+
+    def processed_docs():
+        nonlocal processed_docs_cache
+        if processed_docs_cache is None:
+            processed_docs_cache = corpus_store.read_processed()
+        return processed_docs_cache
+
+    def brief_map() -> dict[str, Any]:
+        return {brief.doc_id: brief for brief in brief_store.all()}
+
+    def doc_map() -> dict[str, Any]:
+        return {doc.doc_id: doc for doc in processed_docs()}
+
+    def stage_dir(name: str) -> Path:
+        path = workspace_root / "indexing" / name
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def stage_path(stage: str, doc_id: str, suffix: str = ".json") -> Path:
+        return stage_dir(stage) / f"{doc_id}{suffix}"
+
+    def read_graph_stats() -> dict:
+        return graph_memory_store.read()
+
+    def read_semantic_memory() -> dict:
+        return to_jsonable(semantic_memory_store.read())
+
+    def read_failure_patterns() -> dict:
+        memory = semantic_memory_store.read()
+        return {"rejection_patterns": memory.rejection_patterns}
+
+    def read_anchor_dossier(doc_id: str) -> dict | None:
+        return read_json(stage_path("dossiers", doc_id))
+
+    def read_candidate_bundle(doc_id: str) -> dict | None:
+        return read_json(stage_path("candidates", doc_id))
+
+    def read_judgment_bundle(doc_id: str) -> dict | None:
+        return read_json(stage_path("judgments", doc_id))
+
+    def read_counterevidence_bundle(doc_id: str) -> dict | None:
+        return read_json(stage_path("checks", doc_id))
+
+    def read_review_bundle(doc_id: str) -> dict | None:
+        return read_json(stage_path("reviews", doc_id))
+
+    def execute_index_planning(output_path: str = "/data/workspace/indexing/plans/indexing_plan.json") -> dict:
+        briefs = brief_store.all()
+        ordered = orchestrator.rank_discovery_anchors(briefs)
+        graph_profile = orchestrator._corpus_graph_profile(briefs) if briefs else {"graph_potential": 0.0}
+        batches: list[AnchorPlan] = []
+        batch_size = max(1, min(getattr(orchestrator.retrieval_config, "adaptive_graph_seed_cap", 15), 12))
+        brief_lookup = {brief.doc_id: brief for brief in briefs}
+        for index, doc_id in enumerate(ordered):
+            brief = brief_lookup.get(doc_id)
+            if brief is None:
+                continue
+            batches.append(
+                AnchorPlan(
+                    doc_id=doc_id,
+                    priority=round(orchestrator.discovery_anchor_priority(brief), 6),
+                    batch_id=f"batch-{index // batch_size + 1:03d}",
+                    bridge_potential=round(orchestrator._specific_title_bridge_potential(brief, briefs), 6),
+                    coverage_pressure=round(orchestrator._dataset_edge_signal(brief), 6),
+                    reason="priority-ranked by offline utility and coverage pressure",
+                )
+            )
+        dataset_hint = str(briefs[0].metadata.get("dataset", briefs[0].metadata.get("topic", "unknown"))) if briefs else "unknown"
+        plan = IndexingPlan(
+            generated_at=utc_now(),
+            dataset_hint=dataset_hint,
+            graph_potential=round(float(graph_profile.get("graph_potential", 0.0)), 6),
+            anchors=batches,
+            notes=[
+                "offline deepagents supervisor plan",
+                "anchors sorted by utility, centrality, coverage pressure, and bridge reserve",
+            ],
+        )
+        planning_payload = provider.plan_indexing_batch(to_jsonable(plan))
+        if isinstance(planning_payload, dict):
+            if planning_payload.get("notes"):
+                plan.notes = [str(item) for item in planning_payload.get("notes", [])][:8]
+            if planning_payload.get("graph_potential") is not None:
+                plan.graph_potential = round(float(planning_payload["graph_potential"]), 6)
+        destination = workspace_root.parent.parent / output_path.lstrip("/") if output_path.startswith("/") else workspace_root / output_path
+        write_json(destination, plan)
+        return {"plan_path": str(destination), "anchors": len(plan.anchors)}
+
+    def execute_doc_profiling(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        brief = brief_store.read(anchor_doc_id)
+        if brief is None:
+            doc = doc_map()[anchor_doc_id]
+            brief = orchestrator.profile(doc)
+            brief_store.write(brief)
+        payload = AnchorDossier(
+            anchor_doc_id=anchor_doc_id,
+            dataset_hint=str(brief.metadata.get("dataset", brief.metadata.get("topic", "unknown"))),
+            brief=to_jsonable(brief),
+            full_doc=to_jsonable(doc_map().get(anchor_doc_id)),
+            anchor_memory=to_jsonable(anchor_memory_store.read(anchor_doc_id)),
+            semantic_memory=to_jsonable(semantic_memory_store.read()),
+            graph_stats=graph_memory_store.read(),
+            surrogate_query_terms=orchestrator._surrogate_query_terms(brief),
+            active_hypotheses=anchor_memory_store.read(anchor_doc_id).active_hypotheses,
+        )
+        destination = Path(output_path) if output_path else stage_path("dossiers", anchor_doc_id)
+        write_json(destination, payload)
+        return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id}
+
+    def execute_candidate_expansion(anchor_doc_id: str, output_path: str | None = None, expanded: bool = False) -> dict:
+        briefs = brief_store.all()
+        lookup = {brief.doc_id: brief for brief in briefs}
+        anchor = lookup[anchor_doc_id]
+        proposals = orchestrator.scout(anchor, briefs, expanded=expanded)
+        items: list[CandidateBundleItem] = []
+        for proposal in proposals:
+            candidate = lookup.get(proposal.doc_id)
+            if candidate is None:
+                continue
+            metrics = orchestrator._candidate_metrics(anchor, candidate)
+            _, relation_type, fit_scores = orchestrator._pair_rerank(anchor, candidate, metrics)
+            signals = orchestrator._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+            items.append(
+                CandidateBundleItem(
+                    candidate_doc_id=candidate.doc_id,
+                    proposal_reason=proposal.reason,
+                    query=proposal.query,
+                    score_hint=proposal.score_hint,
+                    signals=to_jsonable(signals),
+                    candidate_brief=to_jsonable(candidate),
+                )
+            )
+        bundle = CandidateBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), candidates=items)
+        destination = Path(output_path) if output_path else stage_path("candidates", anchor_doc_id)
+        write_json(destination, bundle)
+        return {"candidate_bundle_path": str(destination), "candidate_count": len(items)}
+
+    def execute_relation_judging(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        anchor = brief_map()[anchor_doc_id]
+        bundle_payload = read_candidate_bundle(anchor_doc_id) or {}
+        items = bundle_payload.get("candidates", [])
+        from hnsw_logic.embedding.provider import JudgeSignals
+
+        normalized_pairs = []
+        for item in items:
+            candidate = brief_map().get(item["candidate_doc_id"])
+            if candidate is None:
+                continue
+            normalized_pairs.append((candidate, JudgeSignals(**item.get("signals", {}))))
+        verdicts = orchestrator.relation_judge.run_many_with_signals(anchor, normalized_pairs) if normalized_pairs else {}
+        bundle = JudgmentBundle(
+            anchor_doc_id=anchor_doc_id,
+            generated_at=utc_now(),
+            judgments=[
+                JudgmentBundleItem(candidate_doc_id=doc_id, verdict=to_jsonable(verdict), signals=next(item.get("signals", {}) for item in items if item["candidate_doc_id"] == doc_id))
+                for doc_id, verdict in verdicts.items()
+            ],
+        )
+        destination = Path(output_path) if output_path else stage_path("judgments", anchor_doc_id)
+        write_json(destination, bundle)
+        return {"judgment_bundle_path": str(destination), "judgment_count": len(bundle.judgments)}
+
+    def execute_counterevidence_check(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        anchor = brief_map()[anchor_doc_id]
+        candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
+        judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
+        candidate_lookup = {item["candidate_doc_id"]: item for item in candidate_payload.get("candidates", [])}
+        checks: list[CounterevidenceBundleItem] = []
+        for item in judgment_payload.get("judgments", []):
+            candidate = brief_map().get(item["candidate_doc_id"])
+            if candidate is None:
+                continue
+            signals = item.get("signals", {})
+            verdict = item.get("verdict", {})
+            metrics = orchestrator._candidate_metrics(anchor, candidate)
+            duplicate_penalty = orchestrator._near_duplicate_penalty(anchor, candidate, metrics)
+            bridge_gain = orchestrator._bridge_information_gain(anchor, candidate)
+            provider_payload = provider.check_counterevidence(
+                anchor,
+                candidate,
+                orchestrator._signal_bundle(
+                    anchor,
+                    candidate,
+                    metrics,
+                    dict(signals.get("relation_fit_scores", {})),
+                    str(verdict.get("canonical_relation", verdict.get("relation_type", "comparison"))),
+                ),
+                orchestrator.relation_judge.provider._verdict_from_payload(verdict)
+                if hasattr(orchestrator.relation_judge.provider, "_verdict_from_payload")
+                else orchestrator.relation_judge.run(anchor, candidate),
+            )
+            risk_flags = sorted(set(signals.get("risk_flags", [])) | set(verdict.get("contradiction_flags", [])) | set(provider_payload.get("risk_flags", [])))
+            counterevidence: list[str] = [str(item) for item in provider_payload.get("counterevidence", [])]
+            risk_penalty = float(provider_payload.get("risk_penalty", 0.0))
+            if duplicate_penalty >= 0.28 and "near_duplicate_bridge" not in risk_flags:
+                risk_flags.append("near_duplicate_bridge")
+                counterevidence.append("duplicate penalty suggests low incremental bridge value")
+                risk_penalty += min(duplicate_penalty, 0.45)
+            if bridge_gain < 0.34 and "low_bridge_gain" not in risk_flags:
+                risk_flags.append("low_bridge_gain")
+                counterevidence.append("candidate adds little new retrieval surface")
+                risk_penalty += 0.12
+            keep = bool(provider_payload.get("keep", True)) and risk_penalty < 0.42
+            checks.append(
+                CounterevidenceBundleItem(
+                    candidate_doc_id=item["candidate_doc_id"],
+                    keep=keep,
+                    risk_flags=sorted(set(risk_flags)),
+                    counterevidence=counterevidence,
+                    decision_reason=str(provider_payload.get("decision_reason", "keep after checker" if keep else "drop after checker due to duplicate or weak bridge value"))[:220],
+                    risk_penalty=round(risk_penalty, 6),
+                )
+            )
+        bundle = CounterevidenceBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), checks=checks)
+        destination = Path(output_path) if output_path else stage_path("checks", anchor_doc_id)
+        write_json(destination, bundle)
+        return {"counterevidence_bundle_path": str(destination), "check_count": len(checks)}
+
+    def execute_edge_review(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        anchor = brief_map()[anchor_doc_id]
+        candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
+        judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
+        check_payload = read_counterevidence_bundle(anchor_doc_id) or {}
+        candidate_lookup = {item["candidate_doc_id"]: item for item in candidate_payload.get("candidates", [])}
+        check_lookup = {item["candidate_doc_id"]: item for item in check_payload.get("checks", [])}
+        review_pairs = []
+        for item in judgment_payload.get("judgments", []):
+            candidate = brief_map().get(item["candidate_doc_id"])
+            if candidate is None:
+                continue
+            from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
+
+            signals = JudgeSignals(**item.get("signals", {}))
+            verdict = JudgeResult(**item.get("verdict", {}))
+            review_pairs.append((candidate, signals, verdict))
+        reviewed = orchestrator.edge_reviewer.run_many_with_signals(anchor, review_pairs) if review_pairs else {}
+        review_rows: list[ReviewBundleItem] = []
+        for candidate, signals, verdict in review_pairs:
+            reviewed_verdict = reviewed.get(candidate.doc_id, verdict)
+            check = check_lookup.get(candidate.doc_id, {})
+            keep = bool(getattr(reviewed_verdict, "accepted", False)) and bool(check.get("keep", True))
+            final_utility = max(float(getattr(reviewed_verdict, "utility_score", 0.0)) - float(check.get("risk_penalty", 0.0)), 0.0)
+            risk_flags = sorted(set(getattr(reviewed_verdict, "contradiction_flags", []) or []) | set(check.get("risk_flags", [])))
+            review_rows.append(
+                ReviewBundleItem(
+                    candidate_doc_id=candidate.doc_id,
+                    keep=keep,
+                    reviewed_utility_score=round(final_utility, 6),
+                    reviewed_confidence=round(float(getattr(reviewed_verdict, "confidence", 0.0)), 6),
+                    relation_type=str(getattr(reviewed_verdict, "relation_type", "comparison")),
+                    decision_reason=(str(getattr(reviewed_verdict, "decision_reason", "")) or str(check.get("decision_reason", "")))[:220],
+                    final_verdict=to_jsonable(reviewed_verdict),
+                    risk_flags=risk_flags,
+                )
+            )
+        review_rows.sort(key=lambda item: (-item.reviewed_utility_score, -item.reviewed_confidence, item.candidate_doc_id))
+        bundle = ReviewBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), reviews=review_rows)
+        destination = Path(output_path) if output_path else stage_path("reviews", anchor_doc_id)
+        write_json(destination, bundle)
+        return {"review_bundle_path": str(destination), "review_count": len(review_rows)}
+
+    def execute_memory_summarization(anchor_doc_id: str, output_path: str | None = None) -> dict:
+        review_payload = read_review_bundle(anchor_doc_id) or {}
+        kept = [item for item in review_payload.get("reviews", []) if item.get("keep")]
+        dropped = [item for item in review_payload.get("reviews", []) if not item.get("keep")]
+        provider_payload = provider.summarize_memory_learnings(
+            {
+                "anchor_doc_id": anchor_doc_id,
+                "accepted": [f"{item['relation_type']}:{item['candidate_doc_id']}" for item in kept[:8]],
+                "rejected": [
+                    f"{item['candidate_doc_id']}:{','.join(item.get('risk_flags', [])[:4]) or 'rejected'}"
+                    for item in dropped[:12]
+                ],
+            }
+        )
+        learned_patterns = [str(item) for item in provider_payload.get("learned_patterns", [])][:8]
+        failure_patterns = [str(item) for item in provider_payload.get("failure_patterns", [])][:12]
+        bundle = MemoryLearningBundle(
+            anchor_doc_id=anchor_doc_id,
+            generated_at=utc_now(),
+            learned_patterns=learned_patterns,
+            failure_patterns=failure_patterns,
+            reference_updates={
+                ".deepagents/skills/graph-hygiene/references/hygiene-rules.md": failure_patterns[:6],
+                **{
+                    str(key): [str(item) for item in value][:12]
+                    for key, value in dict(provider_payload.get("reference_updates", {})).items()
+                },
+            },
+        )
+        destination = Path(output_path) if output_path else stage_path("memory", anchor_doc_id)
+        write_json(destination, bundle)
+        return {"memory_bundle_path": str(destination), "learned": len(learned_patterns), "failed": len(failure_patterns)}
+
+    shared_tools: dict[str, Callable] = {
+        "read_graph_stats": read_graph_stats,
+        "read_semantic_memory": read_semantic_memory,
+        "read_failure_patterns": read_failure_patterns,
+        "read_anchor_dossier": read_anchor_dossier,
+        "read_candidate_bundle": read_candidate_bundle,
+        "read_judgment_bundle": read_judgment_bundle,
+        "read_counterevidence_bundle": read_counterevidence_bundle,
+        "read_review_bundle": read_review_bundle,
+    }
+
+    project_tools = {
+        "search_summaries": None,
+        "lookup_entities": None,
+        "get_hnsw_neighbors": None,
+        "read_doc_brief": lambda doc_id: to_jsonable(brief_store.read(doc_id)),
+        "read_doc_full": lambda doc_id: to_jsonable(doc_map().get(doc_id)),
+        "load_anchor_memory": lambda doc_id: to_jsonable(anchor_memory_store.read(doc_id)),
+    }
+
+    from hnsw_logic.agents.tools.registry import build_agent_tools
+
+    project_tool_impls = build_agent_tools(
+        corpus_store,
+        brief_store,
+        graph_store,
+        anchor_memory_store,
+        semantic_memory_store,
+        hnsw_searcher,
+    )
+    for key in list(project_tools):
+        if key in project_tool_impls:
+            project_tools[key] = project_tool_impls[key]
+    project_tools = {key: value for key, value in project_tools.items() if value is not None}
+
+    stage_tools = {
+        "index_planner": {"execute_index_planning": execute_index_planning},
+        "doc_profiler": {"execute_doc_profiling": execute_doc_profiling},
+        "corpus_scout": {"execute_candidate_expansion": execute_candidate_expansion},
+        "relation_judge": {"execute_relation_judging": execute_relation_judging},
+        "counterevidence_checker": {"execute_counterevidence_check": execute_counterevidence_check},
+        "edge_reviewer": {"execute_edge_review": execute_edge_review},
+        "memory_curator": {"execute_memory_summarization": execute_memory_summarization},
+    }
+
+    scoped: dict[str, dict[str, Callable]] = {}
+    for agent_name, config in config_subagents.items():
+        allowed = dict(stage_tools.get(agent_name, {}))
+        for scope_name in getattr(config, "tool_scopes", []):
+            if scope_name in shared_tools:
+                allowed[scope_name] = shared_tools[scope_name]
+            elif scope_name in project_tools:
+                allowed[scope_name] = project_tools[scope_name]
+        scoped[agent_name] = allowed
+    return scoped

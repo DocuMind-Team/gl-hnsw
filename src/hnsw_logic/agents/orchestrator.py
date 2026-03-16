@@ -2583,39 +2583,12 @@ class LogicOrchestrator:
         assessment = self._assessment_for(anchor, candidate, result, review)
         return assessment.edge if assessment.accepted else None
 
-    def judge_many_with_diagnostics(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[CandidateAssessment]:
-        candidate_map = {candidate.doc_id: candidate for candidate in candidates}
-        signal_map: dict[str, JudgeSignals] = {}
-        if hasattr(self.relation_judge, "run_many_with_signals"):
-            candidate_pairs = []
-            for candidate in candidates:
-                metrics = self._candidate_metrics(anchor, candidate)
-                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
-                candidate_pairs.append((candidate, signal_map[candidate.doc_id]))
-            verdicts = self.relation_judge.run_many_with_signals(anchor, candidate_pairs)
-        elif hasattr(self.relation_judge, "run_many"):
-            verdicts = self.relation_judge.run_many(anchor, candidates)
-        else:
-            verdicts = {candidate.doc_id: self.relation_judge.run(anchor, candidate) for candidate in candidates}
-        if not signal_map:
-            for candidate in candidates:
-                metrics = self._candidate_metrics(anchor, candidate)
-                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
-        reviews: dict[str, Any] = {}
-        if self.edge_reviewer is not None and hasattr(self.edge_reviewer, "run_many_with_signals"):
-            review_pairs = [
-                (candidate, signal_map[candidate.doc_id], verdicts[candidate.doc_id])
-                for candidate in candidates
-                if candidate.doc_id in verdicts and signal_map.get(candidate.doc_id) is not None
-            ]
-            reviews = self.edge_reviewer.run_many_with_signals(anchor, review_pairs)
-        assessments = [
-            self._assessment_for(anchor, candidate, verdicts.get(candidate.doc_id), reviews.get(candidate.doc_id))
-            for candidate in candidates
-            if verdicts.get(candidate.doc_id) is not None
-        ]
+    def _apply_assessment_cap(
+        self,
+        anchor: DocBrief,
+        assessments: list[CandidateAssessment],
+        candidate_map: dict[str, DocBrief],
+    ) -> list[CandidateAssessment]:
         accepted = [item for item in assessments if item.accepted and item.edge is not None]
         accepted.sort(key=lambda item: (-item.score, item.candidate_doc_id))
 
@@ -2694,6 +2667,51 @@ class LogicOrchestrator:
                 final.append(item)
         final.sort(key=lambda item: (-item.score, item.candidate_doc_id))
         return final
+
+    def assess_candidates_from_verdicts(
+        self,
+        anchor: DocBrief,
+        candidates: list[DocBrief],
+        verdicts: dict[str, Any],
+        reviews: dict[str, Any] | None = None,
+    ) -> list[CandidateAssessment]:
+        candidate_map = {candidate.doc_id: candidate for candidate in candidates}
+        review_map = reviews or {}
+        assessments = [
+            self._assessment_for(anchor, candidate, verdicts.get(candidate.doc_id), review_map.get(candidate.doc_id))
+            for candidate in candidates
+            if verdicts.get(candidate.doc_id) is not None
+        ]
+        return self._apply_assessment_cap(anchor, assessments, candidate_map)
+
+    def judge_many_with_diagnostics(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[CandidateAssessment]:
+        signal_map: dict[str, JudgeSignals] = {}
+        if hasattr(self.relation_judge, "run_many_with_signals"):
+            candidate_pairs = []
+            for candidate in candidates:
+                metrics = self._candidate_metrics(anchor, candidate)
+                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+                candidate_pairs.append((candidate, signal_map[candidate.doc_id]))
+            verdicts = self.relation_judge.run_many_with_signals(anchor, candidate_pairs)
+        elif hasattr(self.relation_judge, "run_many"):
+            verdicts = self.relation_judge.run_many(anchor, candidates)
+        else:
+            verdicts = {candidate.doc_id: self.relation_judge.run(anchor, candidate) for candidate in candidates}
+        if not signal_map:
+            for candidate in candidates:
+                metrics = self._candidate_metrics(anchor, candidate)
+                _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
+                signal_map[candidate.doc_id] = self._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+        reviews: dict[str, Any] = {}
+        if self.edge_reviewer is not None and hasattr(self.edge_reviewer, "run_many_with_signals"):
+            review_pairs = [
+                (candidate, signal_map[candidate.doc_id], verdicts[candidate.doc_id])
+                for candidate in candidates
+                if candidate.doc_id in verdicts and signal_map.get(candidate.doc_id) is not None
+            ]
+            reviews = self.edge_reviewer.run_many_with_signals(anchor, review_pairs)
+        return self.assess_candidates_from_verdicts(anchor, candidates, verdicts, reviews)
 
     def judge_many(self, anchor: DocBrief, candidates: list[DocBrief]) -> list[LogicEdge]:
         return [item.edge for item in self.judge_many_with_diagnostics(anchor, candidates) if item.accepted and item.edge is not None]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from hnsw_logic.agents.orchestrator import CandidateAssessment
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.docs.brief_store import BriefStore
 from hnsw_logic.graph.store import GraphStore
@@ -76,22 +77,7 @@ class LogicDiscoveryService:
         briefs.sort(key=lambda brief: brief.doc_id)
         return briefs
 
-    def discover_for_anchor(self, doc_id: str, briefs: list[DocBrief]) -> list[LogicEdge]:
-        brief_map = {brief.doc_id: brief for brief in briefs}
-        anchor = brief_map[doc_id]
-        proposals = self.orchestrator.scout(anchor, briefs)
-        candidate_docs = [brief_map[proposal.doc_id] for proposal in proposals if proposal.doc_id in brief_map]
-        assessments = self.orchestrator.judge_many_with_diagnostics(anchor, candidate_docs)
-        if (
-            self.orchestrator._is_live_provider()
-            and not any(item.accepted for item in assessments)
-            and self.orchestrator.discovery_anchor_priority(anchor) >= 0.42
-        ):
-            retry_proposals = self.orchestrator.scout(anchor, briefs, expanded=True)
-            seen_ids = {item.candidate_doc_id for item in assessments}
-            retry_docs = [brief_map[proposal.doc_id] for proposal in retry_proposals if proposal.doc_id in brief_map and proposal.doc_id not in seen_ids]
-            if retry_docs:
-                assessments.extend(self.orchestrator.judge_many_with_diagnostics(anchor, retry_docs))
+    def commit_assessments(self, anchor: DocBrief, assessments: list[CandidateAssessment]) -> list[LogicEdge]:
         accepted = [item.edge for item in assessments if item.accepted and item.edge is not None]
         accepted = self._augment_with_mirror_edges(accepted)
         accepted_ids = {edge.dst_doc_id for edge in accepted}
@@ -120,3 +106,21 @@ class LogicDiscoveryService:
         stats["accepted_edges"] = len(self.graph_store.all_edges())
         self.graph_memory_store.write(stats)
         return accepted
+
+    def discover_for_anchor(self, doc_id: str, briefs: list[DocBrief]) -> list[LogicEdge]:
+        brief_map = {brief.doc_id: brief for brief in briefs}
+        anchor = brief_map[doc_id]
+        proposals = self.orchestrator.scout(anchor, briefs)
+        candidate_docs = [brief_map[proposal.doc_id] for proposal in proposals if proposal.doc_id in brief_map]
+        assessments = self.orchestrator.judge_many_with_diagnostics(anchor, candidate_docs)
+        if (
+            self.orchestrator._is_live_provider()
+            and not any(item.accepted for item in assessments)
+            and self.orchestrator.discovery_anchor_priority(anchor) >= 0.42
+        ):
+            retry_proposals = self.orchestrator.scout(anchor, briefs, expanded=True)
+            seen_ids = {item.candidate_doc_id for item in assessments}
+            retry_docs = [brief_map[proposal.doc_id] for proposal in retry_proposals if proposal.doc_id in brief_map and proposal.doc_id not in seen_ids]
+            if retry_docs:
+                assessments.extend(self.orchestrator.judge_many_with_diagnostics(anchor, retry_docs))
+        return self.commit_assessments(anchor, assessments)

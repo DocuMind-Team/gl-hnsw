@@ -16,12 +16,14 @@ from hnsw_logic.memory.anchor_memory import AnchorMemoryStore
 from hnsw_logic.memory.curator import MemoryCuratorService
 from hnsw_logic.memory.graph_memory import GraphMemoryStore
 from hnsw_logic.memory.semantic_memory import SemanticMemoryStore
+from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
 from hnsw_logic.retrieval.jump_policy import JumpPolicy
 from hnsw_logic.retrieval.scorer import RetrievalScorer
 from hnsw_logic.retrieval.service import HybridRetrievalService
 from hnsw_logic.services.corpus import CorpusStore
 from hnsw_logic.services.discovery import LogicDiscoveryService
 from hnsw_logic.services.evaluation import EvaluationService
+from hnsw_logic.services.offline_supervisor import OfflineIndexingSupervisor
 from hnsw_logic.services.pipeline import BuildPipeline
 
 
@@ -36,11 +38,13 @@ class AppContainer:
     semantic_memory_store: SemanticMemoryStore
     graph_memory_store: GraphMemoryStore
     searcher: HnswSearcher
+    discovery_service: LogicDiscoveryService
     retrieval: HybridRetrievalService
     pipeline: BuildPipeline
     evaluation: EvaluationService
     jobs: JobRegistry
     agent_factory: AgentFactory
+    offline_supervisor: OfflineIndexingSupervisor
 
 
 def build_app(root_dir=None) -> AppContainer:
@@ -75,9 +79,17 @@ def build_app(root_dir=None) -> AppContainer:
         retrieval_config=settings.retrieval,
         provider=provider,
         tools=tools,
-        skills_root=settings.root_dir / "src" / "hnsw_logic" / "agents" / "skills",
+        skills_root=settings.root_dir / settings.agents.skills_root,
         workspace_root=settings.root_dir / paths.workspace_dir,
         memories_root=settings.root_dir / paths.memories_dir,
+        repo_root=settings.root_dir,
+        corpus_store=corpus_store,
+        brief_store=brief_store,
+        graph_store=graph_store,
+        anchor_memory_store=anchor_memory_store,
+        semantic_memory_store=semantic_memory_store,
+        graph_memory_store=graph_memory_store,
+        searcher=searcher,
     )
     orchestrator = agent_factory.create_orchestrator()
     discovery = LogicDiscoveryService(
@@ -88,6 +100,17 @@ def build_app(root_dir=None) -> AppContainer:
         semantic_memory_store=semantic_memory_store,
         graph_memory_store=graph_memory_store,
         curator_service=MemoryCuratorService(),
+    )
+    self_update_manager = ControlledSelfUpdateManager(settings.root_dir, settings.agents.self_update_allowlist)
+    offline_supervisor = OfflineIndexingSupervisor(
+        orchestrator=orchestrator,
+        discovery_service=discovery,
+        deepagent=orchestrator.deepagent,
+        runtime_toolsets=agent_factory.runtime_toolsets,
+        workspace_root=settings.root_dir / paths.workspace_dir,
+        agents_config=settings.agents,
+        self_update_manager=self_update_manager,
+        agents_memory_path=settings.root_dir / ".deepagents" / "AGENTS.md",
     )
     scorer = RetrievalScorer(provider, settings.retrieval)
     retrieval = HybridRetrievalService(
@@ -109,6 +132,7 @@ def build_app(root_dir=None) -> AppContainer:
         settings=settings,
         graph_store=graph_store,
         graph_memory_store=graph_memory_store,
+        offline_supervisor=offline_supervisor,
     )
     evaluation = EvaluationService(
         retrieval_service=retrieval,
@@ -127,9 +151,11 @@ def build_app(root_dir=None) -> AppContainer:
         semantic_memory_store=semantic_memory_store,
         graph_memory_store=graph_memory_store,
         searcher=searcher,
+        discovery_service=discovery,
         retrieval=retrieval,
         pipeline=pipeline,
         evaluation=evaluation,
         jobs=jobs,
         agent_factory=agent_factory,
+        offline_supervisor=offline_supervisor,
     )

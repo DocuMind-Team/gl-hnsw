@@ -127,6 +127,43 @@ class ProviderBase:
             for candidate, signals, verdict in candidates
         }
 
+    def plan_indexing_batch(self, payload: dict) -> dict:
+        return payload
+
+    def judge_with_signals(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals) -> JudgeResult:
+        return self.judge_relation_with_signals(anchor, candidate, signals)
+
+    def check_counterevidence(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> dict:
+        risk_flags = list(signals.risk_flags or [])
+        penalty = 0.0
+        if "weak_direction" in risk_flags:
+            penalty += 0.1
+        if "service_surface" in risk_flags:
+            penalty += 0.14
+        if "foundational_support" in risk_flags:
+            penalty += 0.18
+        if "methodology_gap" in risk_flags:
+            penalty += 0.12
+        return {
+            "keep": penalty < 0.42,
+            "risk_flags": sorted(set(risk_flags)),
+            "counterevidence": [],
+            "decision_reason": "base checker fallback",
+            "risk_penalty": round(penalty, 6),
+        }
+
+    def review_with_utility(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> JudgeResult:
+        return self.review_relation_with_signals(anchor, candidate, signals, verdict)
+
+    def summarize_memory_learnings(self, payload: dict) -> dict:
+        accepted = payload.get("accepted", [])
+        rejected = payload.get("rejected", [])
+        return {
+            "learned_patterns": [str(item) for item in accepted[:8]],
+            "failure_patterns": [str(item) for item in rejected[:12]],
+            "reference_updates": {},
+        }
+
     def plan_query_strategy(self, payload: dict) -> dict:
         return {}
 
@@ -758,6 +795,27 @@ class OpenAICompatibleProvider(StubProvider):
             "You are not ranking documents directly; you are selecting a safe retrieval strategy."
         )
 
+    def _planner_instruction(self) -> str:
+        return (
+            "You are an offline indexing planner. Return JSON only. "
+            "You receive a proposed anchor plan. Improve only notes or graph_potential if there is clear utility. "
+            "Do not invent anchors that do not exist in the payload."
+        )
+
+    def _counterevidence_instruction(self) -> str:
+        return (
+            "You are a counterevidence checker for durable retrieval edges. Return JSON only. "
+            "Decide whether a tentative edge should be kept after looking for duplicate bridges, weak direction, "
+            "topic-only overlap, methodology-only overlap, or low retrieval utility."
+        )
+
+    def _memory_learning_instruction(self) -> str:
+        return (
+            "You summarize offline indexing learnings. Return JSON only. "
+            "Condense accepted patterns and rejected patterns into short reusable bullets. "
+            "Only produce updates suitable for AGENTS.md learned sections or skill references."
+        )
+
     def _verdict_from_payload(self, payload: dict) -> JudgeResult:
         canonical_relation = str(payload.get("canonical_relation", payload.get("relation_type", "comparison")))
         accepted = bool(payload.get("accepted", False))
@@ -981,6 +1039,79 @@ class OpenAICompatibleProvider(StubProvider):
         except Exception as exc:
             self._handle_remote_failure("query_strategy", exc)
             return {}
+
+    def plan_indexing_batch(self, payload: dict) -> dict:
+        try:
+            return self._invoke_json(
+                self._planner_instruction(),
+                json.dumps(
+                    {
+                        "task": "Review and lightly improve the offline indexing plan.",
+                        "payload": payload,
+                        "output_schema": {
+                            "graph_potential": "float",
+                            "notes": ["string"],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                thinking=self.live_reasoning["scout"],
+                stage="plan_indexing_batch",
+            )
+        except Exception as exc:
+            self._handle_remote_failure("plan_indexing_batch", exc)
+            return super().plan_indexing_batch(payload)
+
+    def check_counterevidence(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> dict:
+        try:
+            return self._invoke_json(
+                self._counterevidence_instruction(),
+                json.dumps(
+                    {
+                        "task": "Check whether this tentative edge has strong counterevidence or duplicate risk.",
+                        "anchor": to_jsonable(anchor),
+                        "candidate": to_jsonable(candidate),
+                        "signals": to_jsonable(signals),
+                        "verdict": to_jsonable(verdict),
+                        "output_schema": {
+                            "keep": "boolean",
+                            "risk_flags": ["string"],
+                            "counterevidence": ["string"],
+                            "decision_reason": "string",
+                            "risk_penalty": "float",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                thinking=self.live_reasoning["reviewer"],
+                stage="check_counterevidence",
+            )
+        except Exception as exc:
+            self._handle_remote_failure("check_counterevidence", exc)
+            return super().check_counterevidence(anchor, candidate, signals, verdict)
+
+    def summarize_memory_learnings(self, payload: dict) -> dict:
+        try:
+            return self._invoke_json(
+                self._memory_learning_instruction(),
+                json.dumps(
+                    {
+                        "task": "Summarize reusable learning patterns from offline indexing outcomes.",
+                        "payload": payload,
+                        "output_schema": {
+                            "learned_patterns": ["string"],
+                            "failure_patterns": ["string"],
+                            "reference_updates": {"path": ["string"]},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                thinking=self.live_reasoning["curator"],
+                stage="summarize_memory_learnings",
+            )
+        except Exception as exc:
+            self._handle_remote_failure("summarize_memory_learnings", exc)
+            return super().summarize_memory_learnings(payload)
 
     def _embed_local_bge_m3(self, texts: list[str]) -> np.ndarray:
         import torch

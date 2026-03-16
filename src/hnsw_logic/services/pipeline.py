@@ -17,6 +17,7 @@ class BuildPipeline:
         settings,
         graph_store,
         graph_memory_store,
+        offline_supervisor=None,
     ):
         self.corpus_store = corpus_store
         self.encoder = encoder
@@ -27,6 +28,7 @@ class BuildPipeline:
         self.settings = settings
         self.graph_store = graph_store
         self.graph_memory_store = graph_memory_store
+        self.offline_supervisor = offline_supervisor
 
     def build_embeddings(self):
         docs = self.corpus_store.ingest()
@@ -67,15 +69,22 @@ class BuildPipeline:
                 doc for doc in docs
                 if self.discovery_service.orchestrator.should_attempt_discovery(brief_map[doc.doc_id])
             ]
-            selected_order = self.discovery_service.orchestrator.rank_discovery_anchors(
-                [brief_map[doc.doc_id] for doc in docs if doc.doc_id in brief_map]
-            )
-            selected_rank = {doc_id: index for index, doc_id in enumerate(selected_order)}
-            docs = [doc for doc in docs if doc.doc_id in selected_rank]
-            docs.sort(key=lambda doc: (selected_rank[doc.doc_id], doc.doc_id))
-        accepted = []
-        for doc in docs:
-            accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))
+            if self.offline_supervisor is not None:
+                accepted = self.offline_supervisor.discover_edges(docs, briefs)
+            else:
+                selected_order = self.discovery_service.orchestrator.rank_discovery_anchors(
+                    [brief_map[doc.doc_id] for doc in docs if doc.doc_id in brief_map]
+                )
+                selected_rank = {doc_id: index for index, doc_id in enumerate(selected_order)}
+                docs = [doc for doc in docs if doc.doc_id in selected_rank]
+                docs.sort(key=lambda doc: (selected_rank[doc.doc_id], doc.doc_id))
+                accepted = []
+                for doc in docs:
+                    accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))
+        else:
+            accepted = []
+            for doc in docs:
+                accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))
         self.graph_store.reload()
         stats = self.graph_memory_store.read()
         stats["accepted_edges"] = len(self.graph_store.all_edges())
