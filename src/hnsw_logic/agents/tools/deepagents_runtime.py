@@ -11,6 +11,8 @@ from hnsw_logic.agents.runtime_models import (
     CandidateBundleItem,
     CounterevidenceBundle,
     CounterevidenceBundleItem,
+    ExecutionAudit,
+    ExecutionManifest,
     IndexingPlan,
     JudgmentBundle,
     JudgmentBundleItem,
@@ -20,6 +22,115 @@ from hnsw_logic.agents.runtime_models import (
 )
 from hnsw_logic.core.models import DocBrief, LogicEdge
 from hnsw_logic.core.utils import read_json, to_jsonable, utc_now, write_json
+
+
+STAGE_SEQUENCE = ("dossiers", "candidates", "judgments", "checks", "reviews", "memory")
+COMMIT_REQUIRED_STAGES = ("dossiers", "candidates", "judgments", "checks", "reviews")
+
+
+def required_indexing_stages(counterevidence_enabled: bool = True) -> list[str]:
+    return [stage for stage in STAGE_SEQUENCE if counterevidence_enabled or stage != "checks"]
+
+
+def manifest_path(workspace_root: Path, anchor_doc_id: str) -> Path:
+    return workspace_root / "indexing" / "manifests" / f"{anchor_doc_id}.json"
+
+
+def stage_artifact_path(workspace_root: Path, stage: str, anchor_doc_id: str, suffix: str = ".json") -> Path:
+    return workspace_root / "indexing" / stage / f"{anchor_doc_id}{suffix}"
+
+
+def load_execution_manifest(workspace_root: Path, anchor_doc_id: str) -> ExecutionManifest:
+    payload = read_json(manifest_path(workspace_root, anchor_doc_id))
+    if isinstance(payload, dict):
+        return ExecutionManifest(**payload)
+    now = utc_now()
+    manifest = ExecutionManifest(anchor_doc_id=anchor_doc_id, generated_at=now, updated_at=now)
+    save_execution_manifest(workspace_root, manifest)
+    return manifest
+
+
+def save_execution_manifest(workspace_root: Path, manifest: ExecutionManifest) -> None:
+    manifest.updated_at = utc_now()
+    write_json(manifest_path(workspace_root, manifest.anchor_doc_id), manifest)
+
+
+def record_manifest_stage_event(
+    workspace_root: Path,
+    anchor_doc_id: str,
+    *,
+    stage: str,
+    status: str,
+    note: str = "",
+    error: str = "",
+    increment_round: bool = False,
+    force_fallback: bool = False,
+) -> ExecutionManifest:
+    manifest = load_execution_manifest(workspace_root, anchor_doc_id)
+    manifest.current_stage = stage
+    if increment_round:
+        manifest.delegation_round += 1
+    if status == "completed":
+        if stage not in manifest.completed_stages:
+            manifest.completed_stages.append(stage)
+        manifest.failed_stages.pop(stage, None)
+        manifest.last_error = ""
+    elif status == "failed":
+        manifest.retry_counts[stage] = int(manifest.retry_counts.get(stage, 0)) + 1
+        manifest.failed_stages[stage] = (error or note or "stage failed")[:240]
+        manifest.last_error = manifest.failed_stages[stage]
+    elif status == "started":
+        manifest.failed_stages.pop(stage, None)
+    if note:
+        manifest.notes = [*manifest.notes[-11:], note[:240]]
+    if force_fallback:
+        manifest.needs_fallback = True
+    save_execution_manifest(workspace_root, manifest)
+    return manifest
+
+
+def audit_execution_state(
+    workspace_root: Path,
+    anchor_doc_id: str,
+    *,
+    counterevidence_enabled: bool = True,
+    task_iteration_cap: int = 2,
+) -> ExecutionAudit:
+    manifest = load_execution_manifest(workspace_root, anchor_doc_id)
+    required = required_indexing_stages(counterevidence_enabled)
+    artifact_paths = {stage: str(stage_artifact_path(workspace_root, stage, anchor_doc_id)) for stage in required}
+    completed = []
+    for stage in required:
+        if stage_artifact_path(workspace_root, stage, anchor_doc_id).exists():
+            completed.append(stage)
+        elif stage in manifest.completed_stages:
+            completed.append(stage)
+    completed = [stage for stage in required if stage in completed]
+    if completed != manifest.completed_stages:
+        manifest.completed_stages = completed
+        save_execution_manifest(workspace_root, manifest)
+    missing = [stage for stage in required if stage not in completed]
+    required_for_commit = [stage for stage in COMMIT_REQUIRED_STAGES if counterevidence_enabled or stage != "checks"]
+    ready_for_commit = all(stage in completed for stage in required_for_commit)
+    workflow_complete = all(stage in completed for stage in required)
+    should_fallback = bool(manifest.needs_fallback)
+    if not should_fallback and missing:
+        next_stage = missing[0]
+        should_fallback = int(manifest.retry_counts.get(next_stage, 0)) >= max(task_iteration_cap, 1)
+    return ExecutionAudit(
+        anchor_doc_id=anchor_doc_id,
+        generated_at=utc_now(),
+        current_stage=manifest.current_stage,
+        completed_stages=completed,
+        missing_stages=missing,
+        retry_counts=dict(manifest.retry_counts),
+        artifact_paths=artifact_paths,
+        next_stage=missing[0] if missing else "",
+        ready_for_commit=ready_for_commit,
+        workflow_complete=workflow_complete,
+        should_fallback=should_fallback,
+        notes=list(manifest.notes),
+    )
 
 
 def build_deepagent_toolsets(
@@ -35,6 +146,8 @@ def build_deepagent_toolsets(
     orchestrator,
     workspace_root: Path,
     config_subagents: dict[str, Any],
+    counterevidence_enabled: bool,
+    task_iteration_cap: int,
 ) -> dict[str, dict[str, Callable]]:
     processed_docs_cache: list | None = None
 
@@ -56,7 +169,16 @@ def build_deepagent_toolsets(
         return path
 
     def stage_path(stage: str, doc_id: str, suffix: str = ".json") -> Path:
-        return stage_dir(stage) / f"{doc_id}{suffix}"
+        return stage_artifact_path(workspace_root, stage, doc_id, suffix)
+
+    def mark_stage_started(anchor_doc_id: str, stage: str, note: str = "") -> None:
+        record_manifest_stage_event(workspace_root, anchor_doc_id, stage=stage, status="started", note=note)
+
+    def mark_stage_completed(anchor_doc_id: str, stage: str, note: str = "") -> None:
+        record_manifest_stage_event(workspace_root, anchor_doc_id, stage=stage, status="completed", note=note)
+
+    def mark_stage_failed(anchor_doc_id: str, stage: str, error: str) -> None:
+        record_manifest_stage_event(workspace_root, anchor_doc_id, stage=stage, status="failed", error=error)
 
     def read_graph_stats() -> dict:
         """Read persisted graph statistics for offline indexing planning."""
@@ -90,6 +212,43 @@ def build_deepagent_toolsets(
     def read_review_bundle(doc_id: str) -> dict | None:
         """Read a review bundle for a specific anchor from the workspace."""
         return read_json(stage_path("reviews", doc_id))
+
+    def read_execution_manifest(doc_id: str) -> dict:
+        """Read the execution manifest that tracks stage completion for an anchor."""
+        return to_jsonable(load_execution_manifest(workspace_root, doc_id))
+
+    def audit_anchor_execution(doc_id: str) -> dict:
+        """Audit workspace artifacts for an anchor and report the next required stage."""
+        return to_jsonable(
+            audit_execution_state(
+                workspace_root,
+                doc_id,
+                counterevidence_enabled=counterevidence_enabled,
+                task_iteration_cap=task_iteration_cap,
+            )
+        )
+
+    def evaluate_anchor_utility(doc_id: str) -> dict:
+        """Summarize review-stage utility signals for an anchor to support prioritization and auditing."""
+        review_payload = read_review_bundle(doc_id) or {}
+        reviews = list(review_payload.get("reviews", []))
+        kept = [item for item in reviews if item.get("keep")]
+        utilities = [float(item.get("reviewed_utility_score", 0.0) or 0.0) for item in reviews]
+        return {
+            "anchor_doc_id": doc_id,
+            "review_count": len(reviews),
+            "kept_count": len(kept),
+            "top_reviewed_utility": round(max(utilities), 6) if utilities else 0.0,
+            "mean_reviewed_utility": round(sum(utilities) / len(utilities), 6) if utilities else 0.0,
+            "risk_flags": sorted(
+                {
+                    str(flag)
+                    for item in reviews
+                    for flag in item.get("risk_flags", [])
+                    if str(flag)
+                }
+            )[:16],
+        }
 
     def execute_index_planning(output_path: str = "/data/workspace/indexing/plans/indexing_plan.json") -> dict:
         """Generate the offline indexing plan and persist it to the workspace."""
@@ -156,7 +315,9 @@ def build_deepagent_toolsets(
             existing_brief = existing_dossier.get("brief")
             if brief_store.read(anchor_doc_id) is None and isinstance(existing_brief, dict):
                 brief_store.write(DocBrief(**existing_brief))
+            mark_stage_completed(anchor_doc_id, "dossiers", "reused cached dossier")
             return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id, "cached": True}
+        mark_stage_started(anchor_doc_id, "dossiers", "building anchor dossier")
         brief = brief_store.read(anchor_doc_id)
         if brief is None:
             doc = doc_map()[anchor_doc_id]
@@ -174,6 +335,7 @@ def build_deepagent_toolsets(
             active_hypotheses=anchor_memory_store.read(anchor_doc_id).active_hypotheses,
         )
         write_json(destination, payload)
+        mark_stage_completed(anchor_doc_id, "dossiers", "anchor dossier materialized")
         return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id}
 
     def execute_candidate_expansion(anchor_doc_id: str, output_path: str | None = None, expanded: bool = False) -> dict:
@@ -181,7 +343,9 @@ def build_deepagent_toolsets(
         destination = Path(output_path) if output_path else stage_path("candidates", anchor_doc_id)
         existing_bundle = read_json(destination)
         if existing_bundle:
+            mark_stage_completed(anchor_doc_id, "candidates", "reused cached candidate bundle")
             return {"candidate_bundle_path": str(destination), "candidate_count": len(existing_bundle.get("candidates", [])), "cached": True}
+        mark_stage_started(anchor_doc_id, "candidates", "expanding candidate bundle")
         briefs = brief_store.all()
         lookup = {brief.doc_id: brief for brief in briefs}
         anchor = lookup[anchor_doc_id]
@@ -206,6 +370,7 @@ def build_deepagent_toolsets(
             )
         bundle = CandidateBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), candidates=items)
         write_json(destination, bundle)
+        mark_stage_completed(anchor_doc_id, "candidates", f"candidate bundle with {len(items)} items")
         return {"candidate_bundle_path": str(destination), "candidate_count": len(items)}
 
     def execute_relation_judging(anchor_doc_id: str, output_path: str | None = None) -> dict:
@@ -213,7 +378,9 @@ def build_deepagent_toolsets(
         destination = Path(output_path) if output_path else stage_path("judgments", anchor_doc_id)
         existing_bundle = read_json(destination)
         if existing_bundle:
+            mark_stage_completed(anchor_doc_id, "judgments", "reused cached judgment bundle")
             return {"judgment_bundle_path": str(destination), "judgment_count": len(existing_bundle.get("judgments", [])), "cached": True}
+        mark_stage_started(anchor_doc_id, "judgments", "judging candidate relations")
         anchor = brief_map()[anchor_doc_id]
         bundle_payload = read_candidate_bundle(anchor_doc_id) or {}
         items = bundle_payload.get("candidates", [])
@@ -235,6 +402,7 @@ def build_deepagent_toolsets(
             ],
         )
         write_json(destination, bundle)
+        mark_stage_completed(anchor_doc_id, "judgments", f"judgment bundle with {len(bundle.judgments)} verdicts")
         return {"judgment_bundle_path": str(destination), "judgment_count": len(bundle.judgments)}
 
     def execute_counterevidence_check(anchor_doc_id: str, output_path: str | None = None) -> dict:
@@ -242,11 +410,13 @@ def build_deepagent_toolsets(
         destination = Path(output_path) if output_path else stage_path("checks", anchor_doc_id)
         existing_bundle = read_json(destination)
         if existing_bundle:
+            mark_stage_completed(anchor_doc_id, "checks", "reused cached counterevidence bundle")
             return {
                 "counterevidence_bundle_path": str(destination),
                 "check_count": len(existing_bundle.get("checks", [])),
                 "cached": True,
             }
+        mark_stage_started(anchor_doc_id, "checks", "checking counterevidence and duplicate bridges")
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
@@ -300,6 +470,7 @@ def build_deepagent_toolsets(
             )
         bundle = CounterevidenceBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), checks=checks)
         write_json(destination, bundle)
+        mark_stage_completed(anchor_doc_id, "checks", f"counterevidence bundle with {len(checks)} checks")
         return {"counterevidence_bundle_path": str(destination), "check_count": len(checks)}
 
     def execute_edge_review(anchor_doc_id: str, output_path: str | None = None) -> dict:
@@ -307,7 +478,9 @@ def build_deepagent_toolsets(
         destination = Path(output_path) if output_path else stage_path("reviews", anchor_doc_id)
         existing_bundle = read_json(destination)
         if existing_bundle:
+            mark_stage_completed(anchor_doc_id, "reviews", "reused cached review bundle")
             return {"review_bundle_path": str(destination), "review_count": len(existing_bundle.get("reviews", [])), "cached": True}
+        mark_stage_started(anchor_doc_id, "reviews", "reviewing edge utility and risk")
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
@@ -347,6 +520,7 @@ def build_deepagent_toolsets(
         review_rows.sort(key=lambda item: (-item.reviewed_utility_score, -item.reviewed_confidence, item.candidate_doc_id))
         bundle = ReviewBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), reviews=review_rows)
         write_json(destination, bundle)
+        mark_stage_completed(anchor_doc_id, "reviews", f"review bundle with {len(review_rows)} items")
         return {"review_bundle_path": str(destination), "review_count": len(review_rows)}
 
     def execute_memory_summarization(anchor_doc_id: str, output_path: str | None = None) -> dict:
@@ -354,12 +528,14 @@ def build_deepagent_toolsets(
         destination = Path(output_path) if output_path else stage_path("memory", anchor_doc_id)
         existing_bundle = read_json(destination)
         if existing_bundle:
+            mark_stage_completed(anchor_doc_id, "memory", "reused cached memory bundle")
             return {
                 "memory_bundle_path": str(destination),
                 "learned": len(existing_bundle.get("learned_patterns", [])),
                 "failed": len(existing_bundle.get("failure_patterns", [])),
                 "cached": True,
             }
+        mark_stage_started(anchor_doc_id, "memory", "summarizing memory learnings")
         review_payload = read_review_bundle(anchor_doc_id) or {}
         kept = [item for item in review_payload.get("reviews", []) if item.get("keep")]
         dropped = [item for item in review_payload.get("reviews", []) if not item.get("keep")]
@@ -389,6 +565,7 @@ def build_deepagent_toolsets(
             },
         )
         write_json(destination, bundle)
+        mark_stage_completed(anchor_doc_id, "memory", f"memory bundle with {len(learned_patterns)} learned patterns")
         return {"memory_bundle_path": str(destination), "learned": len(learned_patterns), "failed": len(failure_patterns)}
 
     shared_tools: dict[str, Callable] = {
@@ -400,6 +577,9 @@ def build_deepagent_toolsets(
         "read_judgment_bundle": read_judgment_bundle,
         "read_counterevidence_bundle": read_counterevidence_bundle,
         "read_review_bundle": read_review_bundle,
+        "read_execution_manifest": read_execution_manifest,
+        "audit_anchor_execution": audit_anchor_execution,
+        "evaluate_anchor_utility": evaluate_anchor_utility,
     }
 
     project_tools = {
@@ -446,3 +626,51 @@ def build_deepagent_toolsets(
                 allowed[scope_name] = project_tools[scope_name]
         scoped[agent_name] = allowed
     return scoped
+
+
+def build_deepagent_supervisor_tools(
+    *,
+    workspace_root: Path,
+    graph_memory_store,
+    counterevidence_enabled: bool,
+    task_iteration_cap: int,
+) -> list[Callable]:
+    def read_indexing_plan() -> dict:
+        """Read the current offline indexing plan from the workspace."""
+        return read_json(workspace_root / "indexing" / "plans" / "indexing_plan.json", {}) or {}
+
+    def read_execution_manifest(doc_id: str) -> dict:
+        """Read the execution manifest for an anchor and inspect stage progress."""
+        return to_jsonable(load_execution_manifest(workspace_root, doc_id))
+
+    def audit_anchor_execution(doc_id: str) -> dict:
+        """Audit an anchor workflow and report missing stages, readiness, and fallback state."""
+        return to_jsonable(
+            audit_execution_state(
+                workspace_root,
+                doc_id,
+                counterevidence_enabled=counterevidence_enabled,
+                task_iteration_cap=task_iteration_cap,
+            )
+        )
+
+    def evaluate_anchor_metrics(doc_id: str) -> dict:
+        """Summarize graph coverage and review utility signals for an anchor."""
+        review_payload = read_json(stage_artifact_path(workspace_root, "reviews", doc_id), {}) or {}
+        reviews = list(review_payload.get("reviews", []))
+        graph_stats = graph_memory_store.read()
+        utilities = [float(item.get("reviewed_utility_score", 0.0) or 0.0) for item in reviews]
+        return {
+            "anchor_doc_id": doc_id,
+            "review_count": len(reviews),
+            "kept_count": sum(1 for item in reviews if item.get("keep")),
+            "top_reviewed_utility": round(max(utilities), 6) if utilities else 0.0,
+            "graph_stats": graph_stats,
+        }
+
+    return [
+        read_indexing_plan,
+        read_execution_manifest,
+        audit_anchor_execution,
+        evaluate_anchor_metrics,
+    ]

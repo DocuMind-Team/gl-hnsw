@@ -23,6 +23,7 @@ subagents:
     skills:
       - anchor-planning
       - corpus-adaptation
+      - delegation-policy
     tool_scopes:
       - read_doc_brief
       - load_anchor_memory
@@ -68,10 +69,13 @@ subagents:
     skills:
       - counterevidence-check
       - graph-hygiene
+      - execution-audit
     tool_scopes:
       - read_candidate_bundle
       - read_judgment_bundle
       - read_failure_patterns
+      - read_execution_manifest
+      - audit_anchor_execution
     description: Check tentative edges for duplication, weak direction, and low-utility drift.
     system_prompt: You look for counterevidence and generic failure modes before an edge can survive.
   edge_reviewer:
@@ -79,10 +83,12 @@ subagents:
     skills:
       - edge-utility-review
       - graph-hygiene
+      - metric-evaluation
     tool_scopes:
       - read_candidate_bundle
       - read_judgment_bundle
       - read_counterevidence_bundle
+      - evaluate_anchor_utility
     description: Review candidate edges for utility, risk, and graph hygiene.
     system_prompt: You keep only durable high-utility edges that are likely to improve retrieval quality.
   memory_curator:

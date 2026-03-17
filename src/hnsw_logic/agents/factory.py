@@ -13,7 +13,10 @@ from hnsw_logic.agents.subagents.index_planner import IndexPlannerAgent
 from hnsw_logic.agents.subagents.memory_curator import MemoryCuratorAgent
 from hnsw_logic.agents.subagents.query_strategy import QueryStrategyAgent
 from hnsw_logic.agents.subagents.relation_judge import RelationJudgeAgent
-from hnsw_logic.agents.tools.deepagents_runtime import build_deepagent_toolsets
+from hnsw_logic.agents.tools.deepagents_runtime import (
+    build_deepagent_supervisor_tools,
+    build_deepagent_toolsets,
+)
 from hnsw_logic.config.schema import AgentsConfig, ProviderConfig, RetrievalConfig
 from hnsw_logic.core.utils import ensure_dir
 from hnsw_logic.embedding.provider import OpenAICompatibleProvider, ProviderBase
@@ -117,6 +120,14 @@ class AgentFactory:
             orchestrator=orchestrator,
             workspace_root=self.workspace_root,
             config_subagents=self.agents_config.subagents,
+            counterevidence_enabled=self.agents_config.counterevidence_enabled,
+            task_iteration_cap=self.agents_config.task_iteration_cap,
+        )
+        self.supervisor_tools = build_deepagent_supervisor_tools(
+            workspace_root=self.workspace_root,
+            graph_memory_store=self.graph_memory_store,
+            counterevidence_enabled=self.agents_config.counterevidence_enabled,
+            task_iteration_cap=self.agents_config.task_iteration_cap,
         )
         return self.runtime_toolsets
 

@@ -110,3 +110,34 @@ class MemoryLearningBundle:
     learned_patterns: list[str] = field(default_factory=list)
     failure_patterns: list[str] = field(default_factory=list)
     reference_updates: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ExecutionManifest:
+    anchor_doc_id: str
+    generated_at: str
+    updated_at: str
+    current_stage: str = "pending"
+    completed_stages: list[str] = field(default_factory=list)
+    failed_stages: dict[str, str] = field(default_factory=dict)
+    retry_counts: dict[str, int] = field(default_factory=dict)
+    delegation_round: int = 0
+    last_error: str = ""
+    needs_fallback: bool = False
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ExecutionAudit:
+    anchor_doc_id: str
+    generated_at: str
+    current_stage: str
+    completed_stages: list[str] = field(default_factory=list)
+    missing_stages: list[str] = field(default_factory=list)
+    retry_counts: dict[str, int] = field(default_factory=dict)
+    artifact_paths: dict[str, str] = field(default_factory=dict)
+    next_stage: str = ""
+    ready_for_commit: bool = False
+    workflow_complete: bool = False
+    should_fallback: bool = False
+    notes: list[str] = field(default_factory=list)
