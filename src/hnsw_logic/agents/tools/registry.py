@@ -8,6 +8,7 @@ from hnsw_logic.graph.store import GraphStore
 from hnsw_logic.hnsw.searcher import HnswSearcher
 from hnsw_logic.memory.anchor_memory import AnchorMemoryStore
 from hnsw_logic.memory.semantic_memory import SemanticMemoryStore
+from hnsw_logic.core.utils import to_jsonable
 from hnsw_logic.services.corpus import CorpusStore
 
 
@@ -54,18 +55,18 @@ def build_agent_tools(
 
         provider = StubProvider(ProviderConfig(embedding_dim=hnsw_searcher.config.vector_dim))
         query_vector = provider.embed_texts([f"{doc.title}\n{doc.text}"])[0]
-        return [neighbor.__dict__ for neighbor in hnsw_searcher.search(query_vector, top_k=k + 1) if neighbor.doc_id != doc_id][:k]
+        return [to_jsonable(neighbor) for neighbor in hnsw_searcher.search(query_vector, top_k=k + 1) if neighbor.doc_id != doc_id][:k]
 
     def read_doc_brief(doc_id: str) -> dict | None:
         """Read the stored DocBrief for a document id."""
         brief = brief_store.read(doc_id)
-        return brief.__dict__ if brief else None
+        return to_jsonable(brief) if brief else None
 
     def read_doc_full(doc_id: str) -> dict | None:
         """Read the full normalized document payload for a document id."""
         for doc in corpus_store.read_processed():
             if doc.doc_id == doc_id:
-                return doc.__dict__
+                return to_jsonable(doc)
         return None
 
     def commit_logic_edge(edge_payload: dict) -> dict:
@@ -78,7 +79,7 @@ def build_agent_tools(
 
     def load_anchor_memory(doc_id: str) -> dict:
         """Load anchor memory state for a specific document id."""
-        return anchor_memory_store.read(doc_id).__dict__
+        return to_jsonable(anchor_memory_store.read(doc_id))
 
     def update_global_memory(payload: dict) -> dict:
         """Merge aliases, relation patterns, and rejection patterns into global memory."""

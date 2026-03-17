@@ -12,6 +12,7 @@ from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
 from hnsw_logic.core.models import LogicEdge
 from hnsw_logic.core.utils import write_json
 from hnsw_logic.embedding.provider import JudgeResult
+from hnsw_logic.agents.tools.registry import build_agent_tools
 
 
 def test_settings_enable_deepagents_runtime(test_root: Path):
@@ -90,6 +91,25 @@ def test_runtime_tool_scopes_exclude_edge_commit(app_container):
             assert "evaluate_anchor_utility" in tools
     supervisor_tool_names = {tool.__name__ for tool in app_container.agent_factory.supervisor_tools}
     assert {"read_indexing_plan", "read_execution_manifest", "audit_anchor_execution"} <= supervisor_tool_names
+
+
+def test_registry_tools_serialize_slotted_models(app_container):
+    tools = build_agent_tools(
+        app_container.corpus_store,
+        app_container.brief_store,
+        app_container.graph_store,
+        app_container.anchor_memory_store,
+        app_container.semantic_memory_store,
+        app_container.searcher,
+    )
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    doc_id = briefs[0].doc_id
+
+    assert isinstance(tools["read_doc_brief"](doc_id), dict)
+    assert isinstance(tools["read_doc_full"](doc_id), dict)
+    assert isinstance(tools["load_anchor_memory"](doc_id), dict)
 
 
 def test_offline_supervisor_local_workflow_writes_bundles(app_container):
