@@ -1368,6 +1368,112 @@ def test_argumentative_comparison_edge_is_allowed_for_live_provider():
     assert assessment.edge is not None
 
 
+def test_argumentative_comparison_can_survive_without_topic_cluster_if_bridge_is_specific():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "arg-2": JudgeResult(
+                    accepted=True,
+                    relation_type="comparison",
+                    confidence=0.88,
+                    evidence_spans=[
+                        "The claim says highway expansion worsens congestion and cities should invest in transit.",
+                        "The counterclaim says highway expansion remains the best congestion solution for cities.",
+                    ],
+                    rationale="The documents address the same highway-expansion policy from opposing positions.",
+                    support_score=0.76,
+                    contradiction_flags=[],
+                    decision_reason="Specific policy bridge with contrasting stance.",
+                    utility_score=0.68,
+                    canonical_relation="comparison",
+                    semantic_relation_label="comparison",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "arg-1",
+        "Highway expansion should not be the main congestion strategy",
+        "Cities should invest in public transit rather than expanding highways to reduce congestion.",
+        ["highway", "expansion", "congestion", "transit", "cities", "strategy"],
+        relation_hints=["debate", "comparison"],
+    )
+    anchor.metadata.update({"source_dataset": "arguana", "topic": "argument", "stance": "con"})
+    candidate = _brief(
+        "arg-2",
+        "Highway expansion remains the best congestion strategy",
+        "Expanding highways remains the best way to relieve congestion in cities.",
+        ["highway", "expansion", "congestion", "cities", "strategy", "relieve"],
+        relation_hints=["debate", "comparison"],
+    )
+    candidate.metadata.update({"source_dataset": "arguana", "topic": "argument", "stance": "pro"})
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is True
+    assert assessment.relation_type == "comparison"
+    assert assessment.edge is not None
+
+
+def test_clinical_evidence_bridge_is_allowed_for_live_provider():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "med-2": JudgeResult(
+                    accepted=True,
+                    relation_type="supporting_evidence",
+                    confidence=0.8,
+                    evidence_spans=[
+                        "Obesity and metabolic syndrome increase chronic kidney disease progression risk.",
+                        "The passage links metabolic syndrome to worse chronic kidney disease outcomes.",
+                    ],
+                    rationale="The candidate adds clinically aligned risk and progression evidence.",
+                    support_score=0.74,
+                    contradiction_flags=[],
+                    decision_reason="Clinical risk evidence is aligned and retrieval-useful.",
+                    utility_score=0.63,
+                    canonical_relation="supporting_evidence",
+                    semantic_relation_label="supporting_evidence",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "med-1",
+        "Obesity increases chronic kidney disease progression risk",
+        "The clinical passage describes obesity and metabolic syndrome as risk factors for chronic kidney disease progression.",
+        ["obesity", "metabolic", "syndrome", "chronic", "kidney", "disease", "progression", "risk"],
+        relation_hints=["clinical", "risk", "disease burden"],
+    )
+    anchor.metadata.update({"source_dataset": "nfcorpus", "topic": "clinical_retrieval"})
+    candidate = _brief(
+        "med-2",
+        "Metabolic syndrome worsens chronic kidney disease outcomes",
+        "The candidate explains how metabolic syndrome worsens chronic kidney disease outcomes and patient risk.",
+        ["metabolic", "syndrome", "chronic", "kidney", "disease", "outcomes", "risk", "patient"],
+        relation_hints=["clinical", "outcome", "risk"],
+    )
+    candidate.metadata.update({"source_dataset": "nfcorpus", "topic": "clinical_retrieval"})
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is True
+    assert assessment.relation_type in {"supporting_evidence", "same_concept"}
+    assert assessment.edge is not None
+
+
 def test_stage_reranker_prefers_graph_to_policy_over_fusion():
     provider = FakeProvider()
     orchestrator = LogicOrchestrator(

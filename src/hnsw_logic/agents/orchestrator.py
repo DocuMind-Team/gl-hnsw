@@ -323,6 +323,23 @@ class LogicOrchestrator:
     def _supports_same_concept_pair(self, anchor: DocBrief, candidate: DocBrief) -> bool:
         return self._is_evidence_like_doc(anchor) and self._doc_stage(candidate) == self._doc_stage(anchor)
 
+    def _has_same_concept_signature(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> bool:
+        if not self._supports_same_concept_pair(anchor, candidate):
+            return False
+        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
+        return (
+            metrics["family_bridge_score"] >= 0.45
+            or metrics["shared_dominant_family"] >= 1.0
+            or metrics["entity_overlap"] >= 1.0
+            or specific_title_bridge >= 1.0
+            or (
+                evidence_bridge_strength >= 0.58
+                and metrics["title_overlap"] >= 2.0
+                and metrics["topic_alignment"] >= 1.0
+            )
+        )
+
     def _high_utility_same_concept_bridge(
         self,
         anchor: DocBrief,
@@ -424,6 +441,40 @@ class LogicOrchestrator:
         if not shared:
             return 0.0
         return min(len(shared) / 2.0, 1.0)
+
+    def _argument_bridge_strength(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
+        if not self._is_argumentative_pair(anchor, candidate):
+            return 0.0
+        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.28 * metrics["topic_cluster_match"]
+                + 0.24 * metrics["stance_contrast"]
+                + 0.18 * metrics["content_overlap_score"]
+                + 0.14 * metrics["overlap_score"]
+                + 0.16 * specific_title_bridge,
+            ),
+        )
+
+    def _evidence_bridge_strength(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
+        if not self._supports_same_concept_pair(anchor, candidate):
+            return 0.0
+        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.24 * metrics["dense_score"]
+                + 0.16 * metrics["family_bridge_score"]
+                + 0.12 * metrics["shared_dominant_family"]
+                + 0.14 * metrics["topic_alignment"]
+                + 0.1 * metrics["topic_cluster_match"]
+                + 0.12 * metrics["novelty_bridge_score"]
+                + 0.12 * specific_title_bridge,
+            ),
+        )
 
     def _specific_title_bridge_potential(self, anchor: DocBrief, corpus: list[DocBrief]) -> float:
         anchor_terms = self._specific_title_terms(anchor)
@@ -626,6 +677,8 @@ class LogicOrchestrator:
         support_cue_score = min(len(cue_terms & SUPPORT_CUES) / 4.0, 1.0)
         comparison_cue_score = min(len(cue_terms & ARGUMENT_COMPARISON_CUES) / 5.0, 1.0)
         methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
 
         implementation_detail = (
             0.32 * metrics["dense_score"]
@@ -653,6 +706,8 @@ class LogicOrchestrator:
             + self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics)
             - 0.24 * metrics["service_surface_score"]
         )
+        if self._supports_same_concept_pair(anchor, candidate):
+            supporting_evidence += 0.1 * evidence_bridge_strength
         prerequisite = (
             0.34 * metrics["specific_role_score"]
             + 0.24 * metrics["role_listing_score"]
@@ -675,6 +730,7 @@ class LogicOrchestrator:
             + self._relation_stage_bonus(anchor, candidate, "comparison", metrics)
             - 0.12 * metrics["service_surface_score"]
         )
+        comparison += 0.12 * argument_bridge_strength
         same_concept = (
             0.26 * metrics["dense_score"]
             + 0.22 * metrics["overlap_score"]
@@ -691,6 +747,8 @@ class LogicOrchestrator:
             - 0.12 * max(0.0, 0.14 - metrics["novel_term_ratio"])
             - 0.1 * max(0.0, metrics["novel_term_ratio"] - 0.82)
         )
+        if self._supports_same_concept_pair(anchor, candidate):
+            same_concept += 0.08 * evidence_bridge_strength
         return {
             "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
             "supporting_evidence": max(0.0, min(supporting_evidence, 1.2)),
@@ -705,6 +763,8 @@ class LogicOrchestrator:
         bridge_gain = self._bridge_information_gain(anchor, candidate)
         duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
         specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
         score = (
             0.28 * metrics["dense_score"]
             + 0.22 * metrics["local_support"]
@@ -731,17 +791,23 @@ class LogicOrchestrator:
         if relation_type == "comparison":
             score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
             score += 0.08 * metrics["novelty_bridge_score"]
+            score += 0.18 * argument_bridge_strength
+            score += 0.06 * specific_title_bridge
         if relation_type == "same_concept":
             score -= 0.3 * methodology_penalty
             score += 0.16 * metrics["novelty_bridge_score"]
             score += 0.1 * metrics["shared_dominant_family"]
             score += 0.16 * bridge_gain
             score += 0.16 * specific_title_bridge
+            score += 0.14 * evidence_bridge_strength
             score -= 0.1 * max(0.0, 0.42 - metrics["family_bridge_score"])
             score -= 0.14 * max(0.0, 0.14 - metrics["novel_term_ratio"])
             score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
         if relation_type == "supporting_evidence" and methodology_penalty > 0.0:
             score += 0.06 * methodology_penalty
+        if relation_type == "supporting_evidence" and self._supports_same_concept_pair(anchor, candidate):
+            score += 0.12 * evidence_bridge_strength
+            score += 0.06 * specific_title_bridge
         if relation_type in {"supporting_evidence", "same_concept", "comparison"}:
             score -= 0.28 * duplicate_penalty
         return max(0.0, min(score, 1.0))
@@ -757,7 +823,7 @@ class LogicOrchestrator:
             risk_flags.append("foundational_support")
         if relation_type == "implementation_detail" and self._implementation_direction_score(anchor, candidate, metrics) < 0.08:
             risk_flags.append("weak_direction")
-        if relation_type == "comparison" and metrics["topic_cluster_match"] < 1.0:
+        if relation_type == "comparison" and self._argument_bridge_strength(anchor, candidate, metrics) < 0.52:
             risk_flags.append("weak_topic_match")
         if relation_type == "same_concept" and self._same_concept_methodology_penalty(anchor, candidate) >= 0.45:
             risk_flags.append("methodology_gap")
@@ -768,7 +834,7 @@ class LogicOrchestrator:
         if relation_type == "same_concept" and (
             (metrics["family_bridge_score"] < 0.45 and not (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0))
             or (metrics["shared_dominant_family"] < 1.0 and metrics["entity_overlap"] < 1.0)
-        ):
+        ) and self._evidence_bridge_strength(anchor, candidate, metrics) < 0.6:
             risk_flags.append("weak_family_bridge")
         if relation_type in {"same_concept", "supporting_evidence"} and self._bridge_information_gain(anchor, candidate) < 0.34:
             risk_flags.append("low_bridge_gain")
@@ -1389,6 +1455,7 @@ class LogicOrchestrator:
                 or stage_detail_bridge
             )
         if relation_type == "supporting_evidence":
+            evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
             stage_supported = (
                 self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
                 and metrics["service_surface_score"] < 0.5
@@ -1407,6 +1474,7 @@ class LogicOrchestrator:
                     metrics["topic_cluster_match"] >= 1.0
                     or metrics["topic_alignment"] >= 1.0
                     or metrics["content_overlap_score"] >= 0.14
+                    or evidence_bridge_strength >= 0.56
                 )
             )
             return (
@@ -1425,6 +1493,7 @@ class LogicOrchestrator:
                 or (self._workflow_prerequisite_signal(anchor, candidate, metrics) and metrics["dense_score"] >= 0.5)
             )
         if relation_type == "comparison":
+            argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
             return (
                 metrics["topic_cluster_match"] >= 1.0
                 and (
@@ -1439,10 +1508,19 @@ class LogicOrchestrator:
                     or metrics["content_overlap_score"] >= 0.22
                     or metrics["overlap_score"] >= 0.28
                 )
+            ) or (
+                argument_bridge_strength >= 0.52
+                and (
+                    metrics["stance_contrast"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.24
+                    or metrics["overlap_score"] >= 0.32
+                )
+                and metrics["dense_score"] >= 0.16
             )
         if relation_type == "same_concept":
             methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
             specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+            evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
             scientific_supported = (
                 self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
                 and self._doc_stage(candidate) == self._doc_stage(anchor)
@@ -1460,13 +1538,13 @@ class LogicOrchestrator:
                     metrics["shared_dominant_family"] >= 1.0
                     or metrics["title_overlap"] >= 2.0
                     or metrics["entity_overlap"] >= 1.0
-                    or specific_title_bridge >= 0.5
+                    or specific_title_bridge >= 1.0
                 )
                 and (
                     metrics["title_overlap"] >= 1.0
                     or metrics["mention_score"] >= 0.12
                     or metrics["content_overlap_score"] >= 0.24
-                    or specific_title_bridge >= 0.5
+                    or specific_title_bridge >= 1.0
                 )
                 and not (
                     methodology_penalty >= 0.55
@@ -1479,18 +1557,19 @@ class LogicOrchestrator:
                 and (
                     metrics["family_bridge_score"] >= 0.45
                     or (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0)
-                    or specific_title_bridge >= 0.5
+                    or specific_title_bridge >= 1.0
                 )
                 and (
                     metrics["overlap_score"] >= 0.3
                     or metrics["topic_cluster_match"] >= 1.0
-                    or specific_title_bridge >= 0.5
+                    or specific_title_bridge >= 1.0
                 )
                 and not (
                     methodology_penalty >= 0.42
                     and metrics["title_overlap"] < 2.0
                     and metrics["mention_score"] < 0.22
                 )
+                and evidence_bridge_strength >= 0.46
             )
         return True
 
@@ -1500,11 +1579,15 @@ class LogicOrchestrator:
     def _effective_threshold(self, anchor: DocBrief, candidate: DocBrief, relation_type: str) -> RelationQualityConfig:
         threshold = self._relation_threshold(relation_type)
         if relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
+            if self._argument_bridge_strength(anchor, candidate, self._candidate_metrics(anchor, candidate)) >= 0.62:
+                return RelationQualityConfig(enabled=True, min_confidence=0.76, min_support=0.22, min_evidence_quality=0.26)
             return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.26, min_evidence_quality=0.28)
         if relation_type == "same_concept" and self._is_argumentative_pair(anchor, candidate):
             return RelationQualityConfig(enabled=True, min_confidence=0.82, min_support=0.3, min_evidence_quality=0.28)
         if self._supports_same_concept_pair(anchor, candidate):
             if relation_type == "supporting_evidence":
+                if self._evidence_bridge_strength(anchor, candidate, self._candidate_metrics(anchor, candidate)) >= 0.58:
+                    return RelationQualityConfig(enabled=True, min_confidence=0.74, min_support=0.24, min_evidence_quality=0.26)
                 return RelationQualityConfig(enabled=True, min_confidence=0.78, min_support=0.26, min_evidence_quality=0.28)
             if relation_type == "same_concept":
                 return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.28, min_evidence_quality=0.26)
@@ -2234,6 +2317,7 @@ class LogicOrchestrator:
             )
         ):
             methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
+            same_concept_signature = self._has_same_concept_signature(anchor, candidate, metrics)
             if methodology_penalty >= 0.6 and fit_scores["supporting_evidence"] >= 0.55:
                 return self._make_fallback_result(
                     anchor,
@@ -2243,15 +2327,33 @@ class LogicOrchestrator:
                     reason="The candidate is better treated as supporting evidence because it is a methodological or measurement study within the same scientific topic family.",
                     support_score=min(0.9, metrics["local_support"] + 0.12),
                 )
-            if fit_scores["same_concept"] >= max(0.62, fit_scores["supporting_evidence"] + 0.12):
+            if (
+                not same_concept_signature
+                and fit_scores["supporting_evidence"] >= 0.52
+                and (
+                    metrics["topic_alignment"] >= 1.0
+                    or metrics["content_overlap_score"] >= 0.18
+                    or metrics["mention_score"] >= 0.18
+                )
+            ):
                 return self._make_fallback_result(
                     anchor,
                     candidate,
-                    "same_concept",
-                    confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                    reason="The documents describe the same scientific or clinical finding family with highly aligned evidence and bridge terms.",
+                    "supporting_evidence",
+                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
+                    reason="The candidate strengthens the same clinical or scientific topic with aligned evidence, but lacks a strong concept-level bridge signature.",
                     support_score=min(0.9, metrics["local_support"] + 0.12),
                 )
+            if fit_scores["same_concept"] >= max(0.62, fit_scores["supporting_evidence"] + 0.12):
+                if same_concept_signature:
+                    return self._make_fallback_result(
+                        anchor,
+                        candidate,
+                        "same_concept",
+                        confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
+                        reason="The documents describe the same scientific or clinical finding family with highly aligned evidence and bridge terms.",
+                        support_score=min(0.9, metrics["local_support"] + 0.12),
+                    )
             if (
                 methodology_penalty >= 0.42
                 and fit_scores["supporting_evidence"] >= max(0.42, fit_scores["same_concept"] - 0.08)
@@ -2292,7 +2394,7 @@ class LogicOrchestrator:
                     reason="The candidate provides closely aligned scientific or clinical evidence for the anchor's claim.",
                     support_score=min(0.9, metrics["local_support"] + 0.12),
                 )
-            if fit_scores["same_concept"] >= 0.5:
+            if fit_scores["same_concept"] >= 0.5 and same_concept_signature:
                 return self._make_fallback_result(
                     anchor,
                     candidate,
@@ -2473,7 +2575,11 @@ class LogicOrchestrator:
         if final_result.relation_type == "supporting_evidence":
             if self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) < -0.08:
                 return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate) and metrics["topic_cluster_match"] < 1.0:
+        if (
+            final_result.relation_type == "comparison"
+            and self._is_argumentative_pair(anchor, candidate)
+            and self._argument_bridge_strength(anchor, candidate, metrics) < 0.52
+        ):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)

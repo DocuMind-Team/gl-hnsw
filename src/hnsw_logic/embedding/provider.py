@@ -220,6 +220,24 @@ class ProviderBase:
                 "why": "Both documents discuss the same policy topic from contrasting positions.",
             },
             {
+                "label": "positive",
+                "anchor_title": "Obesity increases the risk of chronic kidney disease",
+                "anchor_text": "The passage links obesity and metabolic risk factors to later chronic kidney disease outcomes.",
+                "candidate_title": "Metabolic syndrome and chronic kidney disease progression",
+                "candidate_text": "The candidate passage explains how metabolic syndrome worsens chronic kidney disease progression and patient risk.",
+                "expected_relation_type": "supporting_evidence",
+                "why": "The candidate adds clinically aligned risk and outcome evidence that can strengthen retrieval for the anchor claim family.",
+            },
+            {
+                "label": "positive",
+                "anchor_title": "Vitamin D deficiency and bone fracture risk",
+                "anchor_text": "The evidence passage focuses on vitamin D deficiency as a driver of fracture risk.",
+                "candidate_title": "Fracture outcomes in patients with low vitamin D",
+                "candidate_text": "The candidate describes the same deficiency-risk family with overlapping outcome terminology and clinically specific evidence.",
+                "expected_relation_type": "same_concept",
+                "why": "The pair describes the same clinical finding family with aligned specific bridge terms and retrieval utility.",
+            },
+            {
                 "label": "negative",
                 "anchor_title": "Logic Overlay Graph",
                 "anchor_text": "The overlay stores durable document-to-document relations used after initial recall.",
@@ -245,6 +263,15 @@ class ProviderBase:
                 "candidate_text": "The service exposes endpoints that can submit jobs to the registry.",
                 "expected_relation_type": "none",
                 "why": "A service using the same registry is not by itself durable supporting evidence for the worker design.",
+            },
+            {
+                "label": "negative",
+                "anchor_title": "Public transit should replace highway expansion",
+                "anchor_text": "The argument says public transit investment is better than highway expansion for city mobility.",
+                "candidate_title": "Transit funding improves city mobility outcomes",
+                "candidate_text": "The supporting document agrees that transit funding improves urban mobility and should be expanded.",
+                "expected_relation_type": "none",
+                "why": "Shared stance and topic overlap alone are not enough for a durable comparison edge.",
             },
         ]
         return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
@@ -371,6 +398,48 @@ class ProviderBase:
                     "accepted": True,
                     "canonical_relation": "supporting_evidence",
                     "why": "The pair is related, but the candidate looks more like supporting context than the same concept.",
+                },
+            },
+            {
+                "label": "approve-comparison",
+                "anchor_title": "Transit investment should replace highway expansion",
+                "candidate_title": "Highway expansion remains the stronger congestion policy",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "comparison",
+                    "confidence": 0.84,
+                    "utility_score": 0.63,
+                },
+                "signals": {
+                    "best_relation": "comparison",
+                    "utility_score": 0.66,
+                    "risk_flags": [],
+                },
+                "expected": {
+                    "accepted": True,
+                    "canonical_relation": "comparison",
+                    "why": "Opposing positions on the same policy topic can create a durable contrast edge for retrieval.",
+                },
+            },
+            {
+                "label": "approve-clinical-support",
+                "anchor_title": "Obesity increases chronic kidney disease risk",
+                "candidate_title": "Metabolic syndrome worsens chronic kidney disease progression",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "supporting_evidence",
+                    "confidence": 0.8,
+                    "utility_score": 0.58,
+                },
+                "signals": {
+                    "best_relation": "supporting_evidence",
+                    "utility_score": 0.64,
+                    "risk_flags": [],
+                },
+                "expected": {
+                    "accepted": True,
+                    "canonical_relation": "supporting_evidence",
+                    "why": "Clinically specific risk and outcome overlap can justify a durable evidence edge.",
                 },
             },
         ]
@@ -814,6 +883,8 @@ class OpenAICompatibleProvider(StubProvider):
             "supporting_evidence means the candidate explains, constrains, or gates a claim in the anchor; do not use it for mere co-usage, API exposure, or two components that share the same registry or service surface. "
             "prerequisite means the candidate is an explicitly named role or earlier step required by the anchor. "
             "comparison is appropriate for debate or argument corpora when two documents address the same topic from contrasting or alternative positions. "
+            "For scientific or clinical corpora, prefer supporting_evidence when the candidate adds aligned risk, treatment, outcome, or progression evidence; prefer same_concept only when both documents clearly describe the same finding family rather than merely related methodology. "
+            "For argumentative corpora, require either contrasting stance or a strong alternative-position signal; same-side topical overlap is not enough. "
             "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
         )
 
@@ -824,6 +895,8 @@ class OpenAICompatibleProvider(StubProvider):
             "Focus on durable retrieval utility, uncertainty, and generic failure modes such as weak direction, "
             "methodology-only overlap, generic service-surface overlap, and foundational-but-not-actionable support. "
             "Approve only when the edge is likely to help retrieval across many queries, not just because the pair is topically related. "
+            "For scientific or clinical corpora, reward clinically specific bridge terms and aligned outcome or treatment language when they increase retrieval surface. "
+            "For argumentative corpora, approve comparison edges only when the pair creates a reusable contrast bridge rather than repeating the same stance. "
             "If the pair is related but not durable or not useful, set canonical_relation='none'. "
             "You may keep the original relation, reject it, or replace it with a safer canonical relation."
         )
