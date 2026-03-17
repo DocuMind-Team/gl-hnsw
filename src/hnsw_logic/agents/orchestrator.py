@@ -242,6 +242,9 @@ class LogicOrchestrator:
             penalty += 0.16
         if metrics["mention_score"] >= 0.45 and metrics["novel_term_ratio"] >= 0.9 and bridge_gain < 0.48:
             penalty += 0.08
+        contrastive_reuse = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        if contrastive_reuse >= 0.56:
+            penalty = max(0.0, penalty - (0.18 + 0.14 * contrastive_reuse))
         penalty = max(0.0, min(penalty, 0.55))
         self._embedding_cache[cache_key] = penalty
         return penalty
@@ -256,6 +259,8 @@ class LogicOrchestrator:
             return False
         if metrics is None:
             metrics = self._candidate_metrics(anchor, candidate)
+        if self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6:
+            return False
         return metrics["content_overlap_score"] >= 0.85 and metrics["dense_score"] >= 0.7
 
     def _source_dataset(self, brief: DocBrief) -> str:
@@ -455,6 +460,23 @@ class LogicOrchestrator:
                 + 0.18 * metrics["content_overlap_score"]
                 + 0.14 * metrics["overlap_score"]
                 + 0.16 * specific_title_bridge,
+            ),
+        )
+
+    def _contrastive_argument_reuse(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
+        if not self._is_argumentative_pair(anchor, candidate):
+            return 0.0
+        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+        if metrics["stance_contrast"] < 1.0:
+            return 0.0
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.46 * argument_bridge_strength
+                + 0.24 * metrics["topic_cluster_match"]
+                + 0.18 * metrics["content_overlap_score"]
+                + 0.12 * min(metrics["title_overlap"] / 3.0, 1.0),
             ),
         )
 
@@ -840,7 +862,12 @@ class LogicOrchestrator:
             risk_flags.append("low_bridge_gain")
         if relation_type == "same_concept" and self._specific_title_bridge_score(anchor, candidate) < 0.2 and metrics["title_overlap"] < 2.0:
             risk_flags.append("low_specific_title_bridge")
-        if self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.34:
+        duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
+        contrastive_bridge_score = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        if duplicate_penalty >= 0.34 and not (
+            relation_type == "comparison"
+            and contrastive_bridge_score >= 0.56
+        ):
             risk_flags.append("near_duplicate")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
@@ -858,6 +885,11 @@ class LogicOrchestrator:
             stage_pair=stage_pair,
             risk_flags=risk_flags,
             relation_fit_scores={key: round(value, 4) for key, value in fit_scores.items()},
+            topic_cluster_match=metrics["topic_cluster_match"],
+            stance_contrast=metrics["stance_contrast"],
+            bridge_gain=self._bridge_information_gain(anchor, candidate),
+            duplicate_penalty=duplicate_penalty,
+            contrastive_bridge_score=contrastive_bridge_score,
         )
 
     def _pair_rerank(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> tuple[float, str, dict[str, float]]:
@@ -2547,11 +2579,19 @@ class LogicOrchestrator:
             final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
             and self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.38
             and self._bridge_information_gain(anchor, candidate) < 0.62
+            and not (
+                final_result.relation_type == "comparison"
+                and self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.56
+            )
         ):
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if (
             final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
             and self._is_effective_duplicate(anchor, candidate, metrics)
+            and not (
+                final_result.relation_type == "comparison"
+                and self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6
+            )
         ):
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._passes_structural_gate(anchor, candidate, metrics, final_result):

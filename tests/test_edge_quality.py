@@ -8,7 +8,7 @@ from hnsw_logic.agents.orchestrator import LogicOrchestrator
 from hnsw_logic.config.schema import ProviderConfig, RetrievalConfig
 from hnsw_logic.core.models import DocBrief
 from hnsw_logic.core.utils import deterministic_vector
-from hnsw_logic.embedding.provider import JudgeResult, OpenAICompatibleProvider, StubProvider
+from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals, OpenAICompatibleProvider, StubProvider
 
 
 class FakeProvider(StubProvider):
@@ -1419,6 +1419,72 @@ def test_argumentative_comparison_can_survive_without_topic_cluster_if_bridge_is
     assert assessment.accepted is True
     assert assessment.relation_type == "comparison"
     assert assessment.edge is not None
+
+
+def test_argumentative_contrast_bridge_is_not_rejected_as_duplicate():
+    provider = FakeProvider()
+    anchor = _brief(
+        "arg-dup-1",
+        "Universities should restrict hate speech on campus",
+        "Campuses should restrict hate speech to protect vulnerable students.",
+        ["universities", "restrict", "hate", "speech", "campus", "students"],
+        relation_hints=["debate", "comparison"],
+    )
+    anchor.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "campus-hate-speech", "stance": "pro"})
+    candidate = _brief(
+        "arg-dup-2",
+        "Universities should not restrict hate speech on campus",
+        "Campuses should not restrict hate speech because open expression matters more.",
+        ["universities", "restrict", "hate", "speech", "campus", "expression"],
+        relation_hints=["debate", "comparison"],
+    )
+    candidate.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "campus-hate-speech", "stance": "con"})
+    signals = JudgeSignals(
+        dense_score=0.71,
+        sparse_score=0.66,
+        overlap_score=0.62,
+        content_overlap_score=0.58,
+        mention_score=0.44,
+        role_listing_score=0.0,
+        forward_reference_score=0.0,
+        reverse_reference_score=0.0,
+        direction_score=0.0,
+        local_support=0.63,
+        utility_score=0.69,
+        best_relation="comparison",
+        stage_pair="argument_claim->argument_claim",
+        risk_flags=["near_duplicate"],
+        relation_fit_scores={"comparison": 0.76, "same_concept": 0.18, "supporting_evidence": 0.12},
+        topic_cluster_match=1.0,
+        stance_contrast=1.0,
+        bridge_gain=0.48,
+        duplicate_penalty=0.42,
+        contrastive_bridge_score=0.8,
+    )
+    verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.88,
+        evidence_spans=[
+            "One document supports restricting hate speech on campus.",
+            "The other argues the restriction should not happen.",
+        ],
+        rationale="The pair presents directly opposing policy positions on the same campus-speech topic.",
+        support_score=0.74,
+        contradiction_flags=[],
+        decision_reason="Contrastive argumentative bridge.",
+        utility_score=0.72,
+        semantic_relation_label="comparison",
+        canonical_relation="comparison",
+    )
+
+    check = provider.check_counterevidence(anchor, candidate, signals, verdict)
+    review = provider.review_relation_with_signals(anchor, candidate, signals, verdict)
+
+    assert check["keep"] is True
+    assert "near_duplicate" not in check["risk_flags"]
+    assert review.accepted is True
+    assert review.relation_type == "comparison"
 
 
 def test_clinical_evidence_bridge_is_allowed_for_live_provider():

@@ -58,6 +58,11 @@ class JudgeSignals:
     stage_pair: str
     risk_flags: list[str]
     relation_fit_scores: dict[str, float]
+    topic_cluster_match: float = 0.0
+    stance_contrast: float = 0.0
+    bridge_gain: float = 0.0
+    duplicate_penalty: float = 0.0
+    contrastive_bridge_score: float = 0.0
 
 
 class ProviderBase:
@@ -145,6 +150,14 @@ class ProviderBase:
             penalty += 0.18
         if "methodology_gap" in risk_flags:
             penalty += 0.12
+        if (
+            verdict.relation_type == "comparison"
+            and signals.stance_contrast >= 1.0
+            and signals.contrastive_bridge_score >= 0.56
+            and signals.bridge_gain >= 0.38
+        ):
+            penalty = max(0.0, penalty - 0.18)
+            risk_flags = [flag for flag in risk_flags if flag != "near_duplicate"]
         return {
             "keep": penalty < 0.42,
             "risk_flags": sorted(set(risk_flags)),
@@ -422,6 +435,27 @@ class ProviderBase:
                 },
             },
             {
+                "label": "approve-contrast-despite-overlap",
+                "anchor_title": "Universities should restrict hate speech on campus",
+                "candidate_title": "Universities should not restrict hate speech on campus",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "comparison",
+                    "confidence": 0.86,
+                    "utility_score": 0.67,
+                },
+                "signals": {
+                    "best_relation": "comparison",
+                    "utility_score": 0.7,
+                    "risk_flags": ["near_duplicate"],
+                },
+                "expected": {
+                    "accepted": True,
+                    "canonical_relation": "comparison",
+                    "why": "High topic overlap is acceptable when the pair supplies a reusable same-topic contrast with opposing stances.",
+                },
+            },
+            {
                 "label": "approve-clinical-support",
                 "anchor_title": "Obesity increases chronic kidney disease risk",
                 "candidate_title": "Metabolic syndrome worsens chronic kidney disease progression",
@@ -555,6 +589,14 @@ class StubProvider(ProviderBase):
         reviewed_relation = current_relation
         if best_relation in RELATION_TYPES and best_fit >= current_fit + 0.08:
             reviewed_relation = best_relation
+        if (
+            reviewed_relation == "comparison"
+            and signals.stance_contrast >= 1.0
+            and signals.contrastive_bridge_score >= 0.56
+            and signals.bridge_gain >= 0.38
+        ):
+            risk_penalty = max(0.0, risk_penalty - 0.2)
+            risk_flags = {flag for flag in risk_flags if flag != "near_duplicate"}
         if reviewed_relation == "same_concept" and "methodology_gap" in risk_flags and fit_scores.get("supporting_evidence", 0.0) >= current_fit - 0.05:
             reviewed_relation = "supporting_evidence"
 
@@ -897,6 +939,7 @@ class OpenAICompatibleProvider(StubProvider):
             "Approve only when the edge is likely to help retrieval across many queries, not just because the pair is topically related. "
             "For scientific or clinical corpora, reward clinically specific bridge terms and aligned outcome or treatment language when they increase retrieval surface. "
             "For argumentative corpora, approve comparison edges only when the pair creates a reusable contrast bridge rather than repeating the same stance. "
+            "Do not reject a comparison as a duplicate only because both sides share topic terms; strong stance contrast plus a reusable contrast bridge should survive duplicate checks. "
             "If the pair is related but not durable or not useful, set canonical_relation='none'. "
             "You may keep the original relation, reject it, or replace it with a safer canonical relation."
         )
@@ -923,7 +966,8 @@ class OpenAICompatibleProvider(StubProvider):
         return (
             "You are a counterevidence checker for durable retrieval edges. Return JSON only. "
             "Decide whether a tentative edge should be kept after looking for duplicate bridges, weak direction, "
-            "topic-only overlap, methodology-only overlap, or low retrieval utility."
+            "topic-only overlap, methodology-only overlap, or low retrieval utility. "
+            "For comparison edges in argument corpora, treat opposing stances on the same topic as a reusable contrast bridge rather than a duplicate unless the content is effectively the same claim."
         )
 
     def _memory_learning_instruction(self) -> str:
