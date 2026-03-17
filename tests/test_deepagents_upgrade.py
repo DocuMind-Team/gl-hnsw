@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 from hnsw_logic.agents.orchestrator import CandidateAssessment
+from hnsw_logic.agents.tools.deepagents_runtime import (
+    audit_execution_state,
+    load_execution_manifest,
+    record_manifest_stage_event,
+    stage_artifact_path,
+)
 from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
 from hnsw_logic.core.models import LogicEdge
+from hnsw_logic.core.utils import write_json
 from hnsw_logic.embedding.provider import JudgeResult
 
 
@@ -77,6 +84,10 @@ def test_runtime_tool_scopes_exclude_edge_commit(app_container):
         assert "commit_logic_edge" not in tools
         if agent_name == "memory_curator":
             assert "execute_memory_summarization" in tools
+        if agent_name == "edge_reviewer":
+            assert "evaluate_anchor_utility" in tools
+    supervisor_tool_names = {tool.__name__ for tool in app_container.agent_factory.supervisor_tools}
+    assert {"read_indexing_plan", "read_execution_manifest", "audit_anchor_execution"} <= supervisor_tool_names
 
 
 def test_offline_supervisor_local_workflow_writes_bundles(app_container):
@@ -105,6 +116,44 @@ def test_runtime_tools_reuse_existing_stage_outputs(app_container):
 
     assert "cached" not in first
     assert second["cached"] is True
+
+
+def test_execution_audit_reports_missing_stages(tmp_path: Path):
+    audit = audit_execution_state(tmp_path, "doc-1", counterevidence_enabled=True, task_iteration_cap=2)
+    assert audit.next_stage == "dossiers"
+    assert audit.workflow_complete is False
+
+    write_json(stage_artifact_path(tmp_path, "dossiers", "doc-1"), {"anchor_doc_id": "doc-1"})
+    record_manifest_stage_event(tmp_path, "doc-1", stage="dossiers", status="completed", note="seeded dossier")
+
+    next_audit = audit_execution_state(tmp_path, "doc-1", counterevidence_enabled=True, task_iteration_cap=2)
+    assert "dossiers" in next_audit.completed_stages
+    assert next_audit.next_stage == "candidates"
+
+
+def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor_doc_id = briefs[0].doc_id
+
+    class DummyDeepAgent:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, payload):
+            self.calls.append(payload)
+
+    app_container.offline_supervisor.deepagent = DummyDeepAgent()
+    app_container.offline_supervisor.anchor_task_delegation_enabled = True
+    app_container.offline_supervisor.agents_config.task_iteration_cap = 1
+
+    app_container.offline_supervisor._run_anchor_workflow_with_deepagents(anchor_doc_id)
+
+    manifest = load_execution_manifest(app_container.offline_supervisor.workspace_root, anchor_doc_id)
+    assert manifest.needs_fallback is True
+    assert "reviews" in manifest.completed_stages
+    assert (app_container.offline_supervisor.workspace_root / "indexing" / "reviews" / f"{anchor_doc_id}.json").exists()
 
 
 
