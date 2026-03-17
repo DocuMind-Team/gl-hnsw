@@ -24,6 +24,8 @@ def test_settings_enable_deepagents_runtime(test_root: Path):
     assert settings.agents.memory_files == [Path(".deepagents/AGENTS.md")]
     assert settings.agents.planner_enabled is True
     assert settings.agents.counterevidence_enabled is True
+    assert settings.agents.enable_supervisor_delegation is True
+    assert settings.agents.enable_anchor_task_delegation is True
 
 
 def test_skill_packages_have_frontmatter_and_resources(test_root: Path):
@@ -154,6 +156,31 @@ def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
     assert manifest.needs_fallback is True
     assert "reviews" in manifest.completed_stages
     assert (app_container.offline_supervisor.workspace_root / "indexing" / "reviews" / f"{anchor_doc_id}.json").exists()
+
+
+def test_discover_for_anchor_does_not_silent_fallback_to_direct_discovery(app_container, monkeypatch):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor_doc_id = briefs[0].doc_id
+
+    monkeypatch.setattr(
+        app_container.offline_supervisor,
+        "_run_anchor_workflow_local",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        app_container.discovery_service,
+        "discover_for_anchor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct discovery fallback should not run")),
+    )
+
+    workspace = app_container.offline_supervisor.workspace_root / "indexing"
+    write_json(workspace / "candidates" / f"{anchor_doc_id}.json", {"anchor_doc_id": anchor_doc_id, "candidates": []})
+    write_json(workspace / "judgments" / f"{anchor_doc_id}.json", {"anchor_doc_id": anchor_doc_id, "judgments": []})
+
+    accepted = app_container.offline_supervisor.discover_for_anchor(anchor_doc_id, briefs)
+    assert accepted == []
 
 
 

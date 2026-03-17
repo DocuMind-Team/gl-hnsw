@@ -37,10 +37,16 @@ class OfflineIndexingSupervisor:
         self.agents_config = agents_config
         self.self_update_manager = self_update_manager
         self.agents_memory_path = agents_memory_path
-        self.supervisor_task_delegation_enabled = os.getenv("GL_HNSW_ENABLE_DEEPAGENT_SUPERVISOR", "0") == "1"
+        self.supervisor_task_delegation_enabled = self._flag_from_env(
+            "GL_HNSW_ENABLE_DEEPAGENT_SUPERVISOR",
+            self.agents_config.enable_supervisor_delegation,
+        )
         self.anchor_task_delegation_enabled = (
             self.supervisor_task_delegation_enabled
-            and os.getenv("GL_HNSW_ENABLE_ANCHOR_TASK_DELEGATION", "0") == "1"
+            and self._flag_from_env(
+                "GL_HNSW_ENABLE_ANCHOR_TASK_DELEGATION",
+                self.agents_config.enable_anchor_task_delegation,
+            )
         )
         self._stage_runners = {
             "dossiers": ("doc_profiler", "execute_doc_profiling"),
@@ -50,6 +56,13 @@ class OfflineIndexingSupervisor:
             "reviews": ("edge_reviewer", "execute_edge_review"),
             "memory": ("memory_curator", "execute_memory_summarization"),
         }
+
+    @staticmethod
+    def _flag_from_env(name: str, default: bool) -> bool:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return value.strip().lower() not in {"0", "false", "no", "off"}
 
     @staticmethod
     def _normalize_risk_flag(flag: str) -> str:
@@ -315,13 +328,24 @@ class OfflineIndexingSupervisor:
     def discover_for_anchor(self, anchor_doc_id: str, briefs: list[DocBrief]) -> list:
         brief_map = {brief.doc_id: brief for brief in briefs}
         anchor = brief_map[anchor_doc_id]
-        if self.deepagent is not None and self.anchor_task_delegation_enabled:
+        used_delegation = self.deepagent is not None and self.anchor_task_delegation_enabled
+        if used_delegation:
             self._run_anchor_workflow_with_deepagents(anchor_doc_id)
         else:
             self._run_anchor_workflow_local(anchor_doc_id, stages=self._audit_anchor_execution(anchor_doc_id).missing_stages)
         candidates, verdicts, reviews, bundle_lookup = self._load_candidate_assets(anchor_doc_id, briefs)
-        if not candidates or not verdicts:
-            return self.discovery_service.discover_for_anchor(anchor_doc_id, briefs)
+        if not candidates:
+            self._apply_memory_updates(anchor_doc_id)
+            return []
+        if not verdicts:
+            self._apply_memory_updates(anchor_doc_id)
+            if used_delegation:
+                audit = self._audit_anchor_execution(anchor_doc_id)
+                raise RuntimeError(
+                    f"deepagents workflow for `{anchor_doc_id}` did not materialize judgments; "
+                    f"missing stages={audit.missing_stages}, completed={audit.completed_stages}"
+                )
+            return []
         assessments = self._apply_review_consensus(anchor, candidates, verdicts, reviews, bundle_lookup)
         accepted = self.discovery_service.commit_assessments(anchor, assessments)
         self._apply_memory_updates(anchor_doc_id)

@@ -9,6 +9,8 @@ self_update_allowlist:
   - .deepagents/skills/*/references/*.md
 planner_enabled: true
 counterevidence_enabled: true
+enable_supervisor_delegation: true
+enable_anchor_task_delegation: true
 max_parallel_tasks: 4
 task_iteration_cap: 2
 live_reasoning:

@@ -65,6 +65,8 @@ class AgentsConfig(BaseModel):
     )
     planner_enabled: bool = True
     counterevidence_enabled: bool = True
+    enable_supervisor_delegation: bool = True
+    enable_anchor_task_delegation: bool = True
     max_parallel_tasks: int = 4
     task_iteration_cap: int = 2
     subagents: dict[str, SubagentConfig] = Field(default_factory=dict)
