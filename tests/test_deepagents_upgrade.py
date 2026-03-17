@@ -93,6 +93,21 @@ def test_offline_supervisor_local_workflow_writes_bundles(app_container):
     assert (workspace / "memory" / f"{anchor_doc_id}.json").exists()
 
 
+def test_runtime_tools_reuse_existing_stage_outputs(app_container):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor_doc_id = briefs[0].doc_id
+    tools = app_container.agent_factory.runtime_toolsets
+
+    first = tools["doc_profiler"]["execute_doc_profiling"](anchor_doc_id=anchor_doc_id)
+    second = tools["doc_profiler"]["execute_doc_profiling"](anchor_doc_id=anchor_doc_id)
+
+    assert "cached" not in first
+    assert second["cached"] is True
+
+
+
 def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container, monkeypatch):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()

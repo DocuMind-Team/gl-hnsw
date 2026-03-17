@@ -29,6 +29,10 @@ class LogicDiscoveryService:
         self.graph_memory_store = graph_memory_store
         self.curator_service = curator_service
 
+    @staticmethod
+    def _chunk_docs(docs: list[DocRecord], size: int) -> list[list[DocRecord]]:
+        return [docs[index : index + size] for index in range(0, len(docs), size)]
+
     def _augment_with_mirror_edges(self, accepted: list[LogicEdge]) -> list[LogicEdge]:
         if not accepted:
             return accepted
@@ -70,10 +74,12 @@ class LogicDiscoveryService:
             else:
                 briefs.append(brief)
         if missing_docs:
-            profiled = self.orchestrator.profile_many(missing_docs)
-            for brief in profiled:
-                self.brief_store.write(brief)
-                briefs.append(brief)
+            batch_size = 4 if self.orchestrator._is_live_provider() else 16
+            for batch in self._chunk_docs(missing_docs, batch_size):
+                profiled = self.orchestrator.profile_many(batch)
+                for brief in profiled:
+                    self.brief_store.write(brief)
+                    briefs.append(brief)
         briefs.sort(key=lambda brief: brief.doc_id)
         return briefs
 

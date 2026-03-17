@@ -18,7 +18,7 @@ from hnsw_logic.agents.runtime_models import (
     ReviewBundle,
     ReviewBundleItem,
 )
-from hnsw_logic.core.models import LogicEdge
+from hnsw_logic.core.models import DocBrief, LogicEdge
 from hnsw_logic.core.utils import read_json, to_jsonable, utc_now, write_json
 
 
@@ -93,6 +93,10 @@ def build_deepagent_toolsets(
 
     def execute_index_planning(output_path: str = "/data/workspace/indexing/plans/indexing_plan.json") -> dict:
         """Generate the offline indexing plan and persist it to the workspace."""
+        destination = workspace_root.parent.parent / output_path.lstrip("/") if output_path.startswith("/") else workspace_root / output_path
+        existing_plan = read_json(destination)
+        if existing_plan:
+            return {"plan_path": str(destination), "anchors": len(existing_plan.get("anchors", [])), "cached": True}
         briefs = brief_store.all()
         ordered = orchestrator.rank_discovery_anchors(briefs)
         anchor_limit = min(
@@ -141,12 +145,18 @@ def build_deepagent_toolsets(
                 plan.notes = [str(item) for item in planning_payload.get("notes", [])][:8]
             if planning_payload.get("graph_potential") is not None:
                 plan.graph_potential = round(float(planning_payload["graph_potential"]), 6)
-        destination = workspace_root.parent.parent / output_path.lstrip("/") if output_path.startswith("/") else workspace_root / output_path
         write_json(destination, plan)
         return {"plan_path": str(destination), "anchors": len(plan.anchors)}
 
     def execute_doc_profiling(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Build or refresh the dossier for a single anchor document."""
+        destination = Path(output_path) if output_path else stage_path("dossiers", anchor_doc_id)
+        existing_dossier = read_json(destination)
+        if existing_dossier:
+            existing_brief = existing_dossier.get("brief")
+            if brief_store.read(anchor_doc_id) is None and isinstance(existing_brief, dict):
+                brief_store.write(DocBrief(**existing_brief))
+            return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id, "cached": True}
         brief = brief_store.read(anchor_doc_id)
         if brief is None:
             doc = doc_map()[anchor_doc_id]
@@ -163,12 +173,15 @@ def build_deepagent_toolsets(
             surrogate_query_terms=orchestrator._surrogate_query_terms(brief),
             active_hypotheses=anchor_memory_store.read(anchor_doc_id).active_hypotheses,
         )
-        destination = Path(output_path) if output_path else stage_path("dossiers", anchor_doc_id)
         write_json(destination, payload)
         return {"dossier_path": str(destination), "anchor_doc_id": anchor_doc_id}
 
     def execute_candidate_expansion(anchor_doc_id: str, output_path: str | None = None, expanded: bool = False) -> dict:
         """Create a candidate bundle for an anchor using scout and local signals."""
+        destination = Path(output_path) if output_path else stage_path("candidates", anchor_doc_id)
+        existing_bundle = read_json(destination)
+        if existing_bundle:
+            return {"candidate_bundle_path": str(destination), "candidate_count": len(existing_bundle.get("candidates", [])), "cached": True}
         briefs = brief_store.all()
         lookup = {brief.doc_id: brief for brief in briefs}
         anchor = lookup[anchor_doc_id]
@@ -192,12 +205,15 @@ def build_deepagent_toolsets(
                 )
             )
         bundle = CandidateBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), candidates=items)
-        destination = Path(output_path) if output_path else stage_path("candidates", anchor_doc_id)
         write_json(destination, bundle)
         return {"candidate_bundle_path": str(destination), "candidate_count": len(items)}
 
     def execute_relation_judging(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a judgment bundle for all candidates attached to an anchor."""
+        destination = Path(output_path) if output_path else stage_path("judgments", anchor_doc_id)
+        existing_bundle = read_json(destination)
+        if existing_bundle:
+            return {"judgment_bundle_path": str(destination), "judgment_count": len(existing_bundle.get("judgments", [])), "cached": True}
         anchor = brief_map()[anchor_doc_id]
         bundle_payload = read_candidate_bundle(anchor_doc_id) or {}
         items = bundle_payload.get("candidates", [])
@@ -218,12 +234,19 @@ def build_deepagent_toolsets(
                 for doc_id, verdict in verdicts.items()
             ],
         )
-        destination = Path(output_path) if output_path else stage_path("judgments", anchor_doc_id)
         write_json(destination, bundle)
         return {"judgment_bundle_path": str(destination), "judgment_count": len(bundle.judgments)}
 
     def execute_counterevidence_check(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a counterevidence bundle that checks tentative edges for risk and duplication."""
+        destination = Path(output_path) if output_path else stage_path("checks", anchor_doc_id)
+        existing_bundle = read_json(destination)
+        if existing_bundle:
+            return {
+                "counterevidence_bundle_path": str(destination),
+                "check_count": len(existing_bundle.get("checks", [])),
+                "cached": True,
+            }
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
@@ -276,12 +299,15 @@ def build_deepagent_toolsets(
                 )
             )
         bundle = CounterevidenceBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), checks=checks)
-        destination = Path(output_path) if output_path else stage_path("checks", anchor_doc_id)
         write_json(destination, bundle)
         return {"counterevidence_bundle_path": str(destination), "check_count": len(checks)}
 
     def execute_edge_review(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a review bundle with reviewed utility scores and keep/drop decisions."""
+        destination = Path(output_path) if output_path else stage_path("reviews", anchor_doc_id)
+        existing_bundle = read_json(destination)
+        if existing_bundle:
+            return {"review_bundle_path": str(destination), "review_count": len(existing_bundle.get("reviews", [])), "cached": True}
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
@@ -320,12 +346,20 @@ def build_deepagent_toolsets(
             )
         review_rows.sort(key=lambda item: (-item.reviewed_utility_score, -item.reviewed_confidence, item.candidate_doc_id))
         bundle = ReviewBundle(anchor_doc_id=anchor_doc_id, generated_at=utc_now(), reviews=review_rows)
-        destination = Path(output_path) if output_path else stage_path("reviews", anchor_doc_id)
         write_json(destination, bundle)
         return {"review_bundle_path": str(destination), "review_count": len(review_rows)}
 
     def execute_memory_summarization(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Summarize accepted and rejected outcomes into a memory learning bundle."""
+        destination = Path(output_path) if output_path else stage_path("memory", anchor_doc_id)
+        existing_bundle = read_json(destination)
+        if existing_bundle:
+            return {
+                "memory_bundle_path": str(destination),
+                "learned": len(existing_bundle.get("learned_patterns", [])),
+                "failed": len(existing_bundle.get("failure_patterns", [])),
+                "cached": True,
+            }
         review_payload = read_review_bundle(anchor_doc_id) or {}
         kept = [item for item in review_payload.get("reviews", []) if item.get("keep")]
         dropped = [item for item in review_payload.get("reviews", []) if not item.get("keep")]
@@ -354,7 +388,6 @@ def build_deepagent_toolsets(
                 },
             },
         )
-        destination = Path(output_path) if output_path else stage_path("memory", anchor_doc_id)
         write_json(destination, bundle)
         return {"memory_bundle_path": str(destination), "learned": len(learned_patterns), "failed": len(failure_patterns)}
 

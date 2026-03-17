@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.core.models import DocBrief, DocRecord
@@ -227,6 +228,39 @@ def test_profile_docs_output_limit_batch_splits_then_succeeds():
     assert calls[1:] == [("profile_docs_batch", 1), ("profile_docs_batch", 1)]
 
 
+def test_profile_docs_emits_successful_briefs_via_callback():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = True
+    provider.trace_path = None
+
+    def fake_invoke_json(system_prompt, user_prompt, **kwargs):
+        payload = json.loads(user_prompt)
+        return [
+            {
+                "doc_id": doc["doc_id"],
+                "summary": f"summary for {doc['doc_id']}",
+                "entities": [],
+                "keywords": [doc["doc_id"]],
+                "claims": [f"claim {doc['doc_id']}"],
+                "relation_hints": ["hint"],
+            }
+            for doc in payload["documents"]
+        ]
+
+    provider._invoke_json = fake_invoke_json
+    seen: list[str] = []
+    docs = [
+        DocRecord(doc_id="a", title="Alpha", text="Alpha text.", metadata={"source_dataset": "scifact"}),
+        DocRecord(doc_id="b", title="Beta", text="Beta text.", metadata={"source_dataset": "nfcorpus"}),
+    ]
+
+    briefs = provider.profile_docs(docs, on_brief=lambda brief: seen.append(brief.doc_id))
+
+    assert [brief.doc_id for brief in briefs] == ["a", "b"]
+    assert seen == ["a", "b"]
+
+
 def test_profile_doc_empty_response_falls_back_to_local_profile():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
@@ -246,6 +280,30 @@ def test_profile_doc_empty_response_falls_back_to_local_profile():
     assert brief.doc_id == "empty"
     assert brief.summary
     assert brief.metadata["source_dataset"] == "scifact"
+
+
+def test_invoke_json_retries_transient_connection_errors(monkeypatch):
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = True
+    provider.trace_path = None
+
+    calls = {"count": 0}
+
+    class FakeChat:
+        def invoke(self, *_args, **_kwargs):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise RuntimeError("Connection error: unexpected eof while reading")
+            return SimpleNamespace(content='{"ok": true}')
+
+    provider._chat = FakeChat()
+    monkeypatch.setattr("hnsw_logic.embedding.provider.time.sleep", lambda *_args, **_kwargs: None)
+
+    payload = provider._invoke_json("system", "user", stage="generic")
+
+    assert payload == {"ok": True}
+    assert calls["count"] == 3
 
 
 def test_judge_relations_malformed_batch_retries_single_remote_calls():

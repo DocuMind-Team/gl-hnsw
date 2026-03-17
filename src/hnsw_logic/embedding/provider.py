@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 
@@ -100,7 +101,7 @@ class ProviderBase:
     def profile_doc(self, doc: DocRecord) -> DocBrief:
         raise NotImplementedError
 
-    def profile_docs(self, docs: list[DocRecord]) -> list[DocBrief]:
+    def profile_docs(self, docs: list[DocRecord], on_brief: Callable[[DocBrief], None] | None = None) -> list[DocBrief]:
         return [self.profile_doc(doc) for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
@@ -634,6 +635,19 @@ class OpenAICompatibleProvider(StubProvider):
         message = str(exc).lower()
         return "router_output_limitation" in message or "output token rate limit exceeded" in message
 
+    def _is_connection_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "connection error" in message
+            or "apiconnectionerror" in message
+            or "connecterror" in message
+            or "unexpected eof while reading" in message
+            or "ssl:" in message
+            or "timed out" in message
+            or "timeout" in message
+            or "remoteprotocolerror" in message
+        )
+
     def _init_local_bge_m3(self) -> None:
         from huggingface_hub import snapshot_download
         from transformers import AutoModel, AutoTokenizer
@@ -689,7 +703,8 @@ class OpenAICompatibleProvider(StubProvider):
         thinking_enabled = thinking
         current_user_prompt = user_prompt
         last_exc: Exception | None = None
-        for attempt in range(3):
+        max_attempts = 5
+        for attempt in range(max_attempts):
             kwargs = {
                 "extra_body": {
                     "thinking": {"type": "enabled" if thinking_enabled else "disabled"}
@@ -720,6 +735,11 @@ class OpenAICompatibleProvider(StubProvider):
                         "Keep the response concise. Return only the required JSON fields. "
                         "Use short evidence spans and a brief decision_reason."
                     )
+                    continue
+                if self._is_connection_error(exc) and attempt < max_attempts - 1:
+                    backoff_seconds = min(8.0, 1.5 * (2**attempt))
+                    self._trace_remote(stage, "retry", f"sleep={backoff_seconds:.1f}s after attempt={attempt + 1}")
+                    time.sleep(backoff_seconds)
                     continue
                 raise
         if last_exc is not None:
@@ -1254,10 +1274,17 @@ class OpenAICompatibleProvider(StubProvider):
             self._handle_remote_failure("profile_doc", exc)
             return self._postprocess_profile(doc, None)
 
-    def profile_docs(self, docs: list[DocRecord]) -> list[DocBrief]:
+    def profile_docs(self, docs: list[DocRecord], on_brief: Callable[[DocBrief], None] | None = None) -> list[DocBrief]:
         if not docs:
             return []
         results: dict[str, DocBrief] = {}
+
+        def remember(brief: DocBrief) -> None:
+            existing = results.get(brief.doc_id)
+            results[brief.doc_id] = brief
+            if existing is None and on_brief is not None:
+                on_brief(brief)
+
         for batch in self._chunk(docs, 4):
             try:
                 payload = self._invoke_json(
@@ -1290,28 +1317,28 @@ class OpenAICompatibleProvider(StubProvider):
                     source = next((doc for doc in batch if doc.doc_id == doc_id), None)
                     if source is None:
                         continue
-                    results[doc_id] = self._postprocess_profile(source, item)
+                    remember(self._postprocess_profile(source, item))
             except Exception as exc:
                 if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
                     if len(batch) > 1:
                         midpoint = max(1, len(batch) // 2)
                         for partial in (batch[:midpoint], batch[midpoint:]):
-                            for brief in self.profile_docs(partial):
-                                results[brief.doc_id] = brief
+                            for brief in self.profile_docs(partial, on_brief=on_brief):
+                                remember(brief)
                         continue
                     blocked = batch[0]
                     status = "blocked_local" if self._is_content_filter_error(exc) else "retry_single"
                     self._trace_remote("profile_docs_batch", status, blocked.doc_id)
-                    results[blocked.doc_id] = self.profile_doc(blocked)
+                    remember(self.profile_doc(blocked))
                     continue
                 self._handle_remote_failure("profile_docs_batch", exc)
             for doc in batch:
                 if doc.doc_id in results:
                     continue
                 if self.require_remote:
-                    results[doc.doc_id] = self.profile_doc(doc)
+                    remember(self.profile_doc(doc))
                 else:
-                    results.setdefault(doc.doc_id, self.profile_doc(doc))
+                    remember(self.profile_doc(doc))
         return [results[doc.doc_id] for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
