@@ -1204,6 +1204,12 @@ class OpenAICompatibleProvider(StubProvider):
                 stage="check_counterevidence",
             )
         except Exception as exc:
+            if self._is_content_filter_error(exc):
+                self._trace_remote("check_counterevidence", "blocked_local", candidate.doc_id)
+                return super().check_counterevidence(anchor, candidate, signals, verdict)
+            if self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
+                self._trace_remote("check_counterevidence", "fallback_local", candidate.doc_id)
+                return super().check_counterevidence(anchor, candidate, signals, verdict)
             self._handle_remote_failure("check_counterevidence", exc)
             return super().check_counterevidence(anchor, candidate, signals, verdict)
 
@@ -1265,6 +1271,12 @@ class OpenAICompatibleProvider(StubProvider):
                     midpoint = max(1, len(batch) // 2)
                     for partial in (batch[:midpoint], batch[midpoint:]):
                         results.update(self.check_counterevidence_many(anchor, partial))
+                    continue
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
+                    status = "blocked_local" if self._is_content_filter_error(exc) else "fallback_local"
+                    for candidate, signals, verdict in batch:
+                        self._trace_remote("check_counterevidence_batch", status, candidate.doc_id)
+                        results[candidate.doc_id] = super().check_counterevidence(anchor, candidate, signals, verdict)
                     continue
                 self._handle_remote_failure("check_counterevidence_batch", exc)
                 results.update(super().check_counterevidence_many(anchor, batch))
