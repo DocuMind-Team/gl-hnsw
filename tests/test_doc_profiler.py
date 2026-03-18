@@ -209,6 +209,67 @@ def test_counterevidence_content_filter_falls_back_to_local_checker():
     assert checks["candidate"]["decision_reason"] == "base checker fallback"
 
 
+def test_counterevidence_connection_error_falls_back_to_local_checker():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = True
+    provider.trace_path = None
+    provider._invoke_json = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Connection error"))
+
+    anchor = DocBrief(
+        doc_id="anchor",
+        title="Transit investment should replace highway expansion",
+        summary="The anchor argues for transit-first congestion policy.",
+        entities=["transit", "congestion"],
+        keywords=["transit", "congestion", "policy"],
+        claims=["Transit investment is a better congestion strategy."],
+        relation_hints=["debate", "comparison"],
+        metadata={},
+    )
+    candidate = DocBrief(
+        doc_id="candidate",
+        title="Highway expansion remains the best congestion strategy",
+        summary="The candidate advocates the opposite highway-first policy.",
+        entities=["highway expansion", "congestion"],
+        keywords=["highway", "expansion", "congestion", "policy"],
+        claims=["Highway expansion is the strongest congestion strategy."],
+        relation_hints=["debate", "comparison"],
+        metadata={},
+    )
+    signals = JudgeSignals(
+        dense_score=0.42,
+        sparse_score=0.35,
+        overlap_score=0.38,
+        content_overlap_score=0.31,
+        mention_score=0.18,
+        role_listing_score=0.0,
+        forward_reference_score=0.0,
+        reverse_reference_score=0.0,
+        direction_score=0.0,
+        local_support=0.58,
+        utility_score=0.66,
+        best_relation="comparison",
+        stage_pair="argument_claim->argument_claim",
+        risk_flags=["near_duplicate"],
+        relation_fit_scores={"comparison": 0.71},
+    )
+    verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.84,
+        evidence_spans=["The pair offers a reusable policy contrast."],
+        rationale="The candidate creates a contrasting stance bridge.",
+        support_score=0.68,
+        contradiction_flags=[],
+        decision_reason="Argumentative contrast bridge.",
+    )
+
+    checks = provider.check_counterevidence_many(anchor, [(candidate, signals, verdict)])
+
+    assert checks["candidate"]["keep"] is True
+    assert checks["candidate"]["decision_reason"] == "base checker fallback"
+
+
 def test_profile_docs_malformed_batch_retries_single_remote_calls():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))

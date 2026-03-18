@@ -1251,7 +1251,7 @@ class OpenAICompatibleProvider(StubProvider):
             if self._is_content_filter_error(exc):
                 self._trace_remote("check_counterevidence", "blocked_local", candidate.doc_id)
                 return super().check_counterevidence(anchor, candidate, signals, verdict)
-            if self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
+            if self._is_response_parse_error(exc) or self._is_output_limit_error(exc) or self._is_connection_error(exc):
                 self._trace_remote("check_counterevidence", "fallback_local", candidate.doc_id)
                 return super().check_counterevidence(anchor, candidate, signals, verdict)
             self._handle_remote_failure("check_counterevidence", exc)
@@ -1311,12 +1311,12 @@ class OpenAICompatibleProvider(StubProvider):
                         "risk_penalty": float(item.get("risk_penalty", 0.0)),
                     }
             except Exception as exc:
-                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc)) and len(batch) > 1:
+                if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc) or self._is_connection_error(exc)) and len(batch) > 1:
                     midpoint = max(1, len(batch) // 2)
                     for partial in (batch[:midpoint], batch[midpoint:]):
                         results.update(self.check_counterevidence_many(anchor, partial))
                     continue
-                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
+                if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc) or self._is_connection_error(exc):
                     status = "blocked_local" if self._is_content_filter_error(exc) else "fallback_local"
                     for candidate, signals, verdict in batch:
                         self._trace_remote("check_counterevidence_batch", status, candidate.doc_id)
