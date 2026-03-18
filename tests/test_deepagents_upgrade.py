@@ -335,3 +335,85 @@ def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container,
 
     assert assessments
     assert assessments[0].accepted is True
+
+
+def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_duplicate_only_risk(app_container, monkeypatch):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+    accepted = CandidateAssessment(
+        candidate_doc_id=candidate.doc_id,
+        accepted=True,
+        reject_reason="",
+        score=0.88,
+        local_support=0.6,
+        evidence_quality=0.82,
+        relation_type="comparison",
+        confidence=0.84,
+        edge=LogicEdge(
+            src_doc_id=anchor.doc_id,
+            dst_doc_id=candidate.doc_id,
+            relation_type="comparison",
+            confidence=0.84,
+            evidence_spans=[anchor.summary, candidate.summary],
+            discovery_path=["judge", "review", "gate"],
+            edge_card_text=f"{anchor.title} <> {candidate.title}",
+            created_at="2026-03-16T00:00:00Z",
+            last_validated_at="2026-03-16T00:00:00Z",
+            utility_score=0.93,
+        ),
+    )
+
+    monkeypatch.setattr(
+        type(app_container.offline_supervisor.orchestrator),
+        "_assessment_for",
+        lambda self, *_args, **_kwargs: accepted,
+    )
+
+    verdicts = {
+        candidate.doc_id: JudgeResult(
+            accepted=True,
+            relation_type="comparison",
+            confidence=0.84,
+            evidence_spans=[],
+            rationale="durable comparison bridge",
+            support_score=0.0,
+            contradiction_flags=["near_duplicate"],
+            decision_reason="duplicate-only risk",
+            utility_score=0.93,
+            uncertainty=0.22,
+            canonical_relation="comparison",
+            semantic_relation_label="comparison",
+        )
+    }
+    reviews = dict(verdicts)
+    bundle_lookup = {
+        "reviews": {
+            candidate.doc_id: {
+                "keep": False,
+                "reviewed_utility_score": 0.2,
+                "reviewed_confidence": 0.84,
+                "risk_flags": ["near_duplicate", "near_duplicate_bridge"],
+            }
+        },
+        "checks": {
+            candidate.doc_id: {
+                "keep": False,
+                "risk_penalty": 0.16,
+                "risk_flags": ["near_duplicate", "near_duplicate_bridge"],
+            }
+        },
+    }
+
+    assessments = app_container.offline_supervisor._apply_review_consensus(
+        anchor,
+        [candidate],
+        verdicts,
+        reviews,
+        bundle_lookup,
+    )
+
+    assert assessments
+    assert assessments[0].accepted is True

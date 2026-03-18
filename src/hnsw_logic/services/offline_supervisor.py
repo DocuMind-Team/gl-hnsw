@@ -275,6 +275,7 @@ class OfflineIndexingSupervisor:
                 if str(flag)
             }
             soft_bridge_risks = {"excess_novelty", "weak_family_bridge", "topic_only_overlap", "low_retrieval_utility", "weak_direction"}
+            duplicate_only_comparison_risks = {"near_duplicate", "near_duplicate_bridge"}
             same_concept_soft_keep = (
                 assessment.edge is not None
                 and assessment.edge.relation_type == "same_concept"
@@ -283,6 +284,16 @@ class OfflineIndexingSupervisor:
                 and assessment.evidence_quality >= 0.84
                 and risk_penalty <= 0.22
                 and risk_flags.issubset(soft_bridge_risks)
+            )
+            comparison_bridge_keep = (
+                assessment.edge is not None
+                and assessment.edge.relation_type == "comparison"
+                and assessment.edge.utility_score >= 0.86
+                and assessment.local_support >= 0.52
+                and assessment.evidence_quality >= 0.76
+                and risk_penalty <= 0.28
+                and risk_flags
+                and risk_flags.issubset(duplicate_only_comparison_risks)
             )
             rescue_keep = (
                 assessment.accepted
@@ -295,6 +306,9 @@ class OfflineIndexingSupervisor:
                     )
                     or (
                         same_concept_soft_keep
+                    )
+                    or (
+                        comparison_bridge_keep
                     )
                 )
             )
