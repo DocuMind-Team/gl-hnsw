@@ -22,6 +22,41 @@ def test_graph_store_roundtrip(test_root):
     assert store.get_out_edges("a")[0].dst_doc_id == "b"
 
 
+def test_graph_store_deduplicates_edges_by_relation_key(test_root):
+    from hnsw_logic.graph.store import GraphStore
+
+    store = GraphStore(test_root / "data" / "graph" / "accepted_edges.jsonl")
+    low = LogicEdge(
+        src_doc_id="a",
+        dst_doc_id="b",
+        relation_type="comparison",
+        confidence=0.7,
+        evidence_spans=["x"],
+        discovery_path=["unit"],
+        edge_card_text="low",
+        created_at="2026-03-10T00:00:00Z",
+        last_validated_at="2026-03-10T00:00:00Z",
+        utility_score=0.6,
+    )
+    high = LogicEdge(
+        src_doc_id="a",
+        dst_doc_id="b",
+        relation_type="comparison",
+        confidence=0.92,
+        evidence_spans=["y"],
+        discovery_path=["unit"],
+        edge_card_text="high",
+        created_at="2026-03-10T00:00:00Z",
+        last_validated_at="2026-03-10T00:00:00Z",
+        utility_score=0.9,
+    )
+    store.add_edges([low, high, low])
+    store.reload()
+    edges = store.get_out_edges("a")
+    assert len(edges) == 1
+    assert edges[0].edge_card_text == "high"
+
+
 def test_discovery_service_adds_mirror_edges_for_symmetric_relations(test_root):
     from hnsw_logic.graph.store import GraphStore
     from hnsw_logic.services.discovery import LogicDiscoveryService
