@@ -450,12 +450,13 @@ class LogicOrchestrator:
     def _argument_bridge_strength(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
         if not self._is_argumentative_pair(anchor, candidate):
             return 0.0
+        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
         specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
         return max(
             0.0,
             min(
                 1.0,
-                0.28 * metrics["topic_cluster_match"]
+                0.26 * topic_consistency
                 + 0.24 * metrics["stance_contrast"]
                 + 0.18 * metrics["content_overlap_score"]
                 + 0.14 * metrics["overlap_score"]
@@ -463,10 +464,30 @@ class LogicOrchestrator:
             ),
         )
 
+    def _argument_topic_consistency(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
+        if not self._is_argumentative_pair(anchor, candidate):
+            return 0.0
+        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        normalized_title_overlap = min(metrics["title_overlap"] / 3.0, 1.0)
+        normalized_content_overlap = min(metrics["content_overlap_score"] / 0.3, 1.0)
+        normalized_mention = min(metrics["mention_score"] / 0.24, 1.0)
+        return max(
+            0.0,
+            min(
+                1.0,
+                0.34 * metrics["topic_cluster_match"]
+                + 0.26 * specific_title_bridge
+                + 0.16 * normalized_title_overlap
+                + 0.14 * normalized_content_overlap
+                + 0.10 * normalized_mention,
+            ),
+        )
+
     def _contrastive_argument_reuse(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
         if not self._is_argumentative_pair(anchor, candidate):
             return 0.0
         argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
         if metrics["stance_contrast"] < 1.0:
             return 0.0
         return max(
@@ -474,7 +495,7 @@ class LogicOrchestrator:
             min(
                 1.0,
                 0.46 * argument_bridge_strength
-                + 0.24 * metrics["topic_cluster_match"]
+                + 0.24 * topic_consistency
                 + 0.18 * metrics["content_overlap_score"]
                 + 0.12 * min(metrics["title_overlap"] / 3.0, 1.0),
             ),
@@ -700,6 +721,7 @@ class LogicOrchestrator:
         comparison_cue_score = min(len(cue_terms & ARGUMENT_COMPARISON_CUES) / 5.0, 1.0)
         methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
         argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+        argument_topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
         evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
 
         implementation_detail = (
@@ -745,14 +767,16 @@ class LogicOrchestrator:
             + 0.18 * metrics["overlap_score"]
             + 0.14 * metrics["content_overlap_score"]
             + 0.16 * metrics["topic_alignment"]
-            + 0.18 * metrics["topic_cluster_match"]
+            + 0.14 * metrics["topic_cluster_match"]
             + 0.18 * metrics["stance_contrast"]
             + 0.08 * metrics["novelty_bridge_score"]
             + 0.08 * comparison_cue_score
             + self._relation_stage_bonus(anchor, candidate, "comparison", metrics)
             - 0.12 * metrics["service_surface_score"]
         )
-        comparison += 0.12 * argument_bridge_strength
+        comparison += 0.12 * argument_bridge_strength + 0.12 * argument_topic_consistency
+        if self._is_argumentative_pair(anchor, candidate) and argument_topic_consistency < 0.56:
+            comparison -= 0.2 * (0.56 - argument_topic_consistency) / 0.56
         same_concept = (
             0.26 * metrics["dense_score"]
             + 0.22 * metrics["overlap_score"]
@@ -1526,8 +1550,9 @@ class LogicOrchestrator:
             )
         if relation_type == "comparison":
             argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
+            argument_topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
             return (
-                metrics["topic_cluster_match"] >= 1.0
+                argument_topic_consistency >= 0.58
                 and (
                     (
                         metrics["stance_contrast"] >= 1.0
@@ -1542,6 +1567,7 @@ class LogicOrchestrator:
                 )
             ) or (
                 argument_bridge_strength >= 0.52
+                and argument_topic_consistency >= 0.66
                 and (
                     metrics["stance_contrast"] >= 1.0
                     or metrics["content_overlap_score"] >= 0.24
@@ -2618,7 +2644,14 @@ class LogicOrchestrator:
         if (
             final_result.relation_type == "comparison"
             and self._is_argumentative_pair(anchor, candidate)
-            and self._argument_bridge_strength(anchor, candidate, metrics) < 0.52
+            and (
+                self._argument_bridge_strength(anchor, candidate, metrics) < 0.52
+                or self._argument_topic_consistency(anchor, candidate, metrics) < 0.58
+                or (
+                    metrics["topic_cluster_match"] < 1.0
+                    and self._argument_topic_consistency(anchor, candidate, metrics) < 0.6
+                )
+            )
         ):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:

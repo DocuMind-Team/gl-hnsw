@@ -1421,6 +1421,58 @@ def test_argumentative_comparison_can_survive_without_topic_cluster_if_bridge_is
     assert assessment.edge is not None
 
 
+def test_argumentative_comparison_rejects_cross_topic_bridge_without_specific_overlap():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(
+            provider,
+            {
+                "arg-2": JudgeResult(
+                    accepted=True,
+                    relation_type="comparison",
+                    confidence=0.9,
+                    evidence_spans=[
+                        "The argument discusses restricting hate speech on campus.",
+                        "The counterargument focuses on transportation spending and highways.",
+                    ],
+                    rationale="Both are policy arguments with opposing positions.",
+                    support_score=0.73,
+                    contradiction_flags=[],
+                    decision_reason="Opposing policy arguments.",
+                    utility_score=0.62,
+                    canonical_relation="comparison",
+                    semantic_relation_label="comparison",
+                )
+            },
+        ),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "arg-1",
+        "Universities should restrict hate speech on campus",
+        "Campuses should restrict hate speech to protect vulnerable students.",
+        ["universities", "restrict", "hate", "speech", "campus", "students"],
+        relation_hints=["debate", "comparison"],
+    )
+    anchor.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "campus-hate-speech", "stance": "pro"})
+    candidate = _brief(
+        "arg-2",
+        "Road expansion remains the best mobility strategy",
+        "Expanding highways remains the best way to reduce congestion in cities.",
+        ["road", "expansion", "mobility", "congestion", "cities", "policy"],
+        relation_hints=["debate", "comparison"],
+    )
+    candidate.metadata.update({"source_dataset": "arguana", "topic": "argument", "topic_cluster": "transit-highway-expansion", "stance": "con"})
+
+    assessment = orchestrator.judge_many_with_diagnostics(anchor, [candidate])[0]
+
+    assert assessment.accepted is False
+    assert assessment.reject_reason in {"wrong_relation_type", "weak_link"}
+
+
 def test_argumentative_contrast_bridge_is_not_rejected_as_duplicate():
     provider = FakeProvider()
     anchor = _brief(
