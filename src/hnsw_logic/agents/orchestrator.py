@@ -2010,6 +2010,11 @@ class LogicOrchestrator:
                 ordered.extend(brief.doc_id for brief in group[: min(len(group), 6)])
                 continue
             centrality, neighborhoods = self._dense_anchor_neighborhoods(group)
+            cluster_members: dict[str, list[DocBrief]] = {}
+            for brief in group:
+                cluster = self._topic_cluster(brief)
+                if cluster:
+                    cluster_members.setdefault(cluster, []).append(brief)
             specific_bridge_potential = {
                 brief.doc_id: self._specific_title_bridge_potential(brief, group)
                 for brief in group
@@ -2035,6 +2040,7 @@ class LogicOrchestrator:
             coverage: dict[str, float] = {}
             kept: list[str] = []
             selected_clusters: set[str] = set()
+            followup_clusters: set[str] = set()
             while eligible and len(kept) < cap:
                 best_id = ""
                 best_score = float("-inf")
@@ -2061,6 +2067,39 @@ class LogicOrchestrator:
                 cluster = self._topic_cluster(chosen)
                 if cluster:
                     selected_clusters.add(cluster)
+                if (
+                    cluster
+                    and cluster not in followup_clusters
+                    and len(cluster_members.get(cluster, [])) >= 2
+                    and len(kept) < cap
+                    and (
+                        specific_bridge_potential.get(chosen.doc_id, 0.0) >= 0.62
+                        or profile["argument_ratio"] >= 0.3
+                    )
+                ):
+                    followup_candidates = [
+                        brief
+                        for brief in eligible
+                        if self._topic_cluster(brief) == cluster and brief.doc_id not in kept
+                    ]
+                    if followup_candidates:
+                        followup_candidates.sort(
+                            key=lambda brief: (
+                                -(
+                                    0.5 * priority_map.get(brief.doc_id, 0.0)
+                                    + 0.3 * specific_bridge_potential.get(brief.doc_id, 0.0)
+                                    + 0.2 * centrality.get(brief.doc_id, 0.0)
+                                ),
+                                brief.doc_id,
+                            )
+                        )
+                        followup = followup_candidates[0]
+                        kept.append(followup.doc_id)
+                        eligible = [brief for brief in eligible if brief.doc_id != followup.doc_id]
+                        for neighbor_id, weight in neighborhoods.get(followup.doc_id, [(followup.doc_id, 1.0)]):
+                            coverage[neighbor_id] = max(coverage.get(neighbor_id, 0.0), weight)
+                        selected_clusters.add(cluster)
+                        followup_clusters.add(cluster)
             reserve_cap = max(0, min(len(group) - len(kept), max(4, cap // 2)))
             if reserve_cap > 0:
                 reserve_ranked: list[tuple[float, DocBrief]] = []

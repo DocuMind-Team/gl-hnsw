@@ -2118,3 +2118,45 @@ def test_generic_discovery_uses_content_signals_without_dataset_shortcuts():
     assert orchestrator.should_attempt_discovery(scientific) is True
     assert orchestrator.should_attempt_discovery(argument) is True
     assert orchestrator.discovery_anchor_priority(scientific) > orchestrator.discovery_anchor_priority(generic)
+
+
+def test_rank_discovery_anchors_keeps_followup_from_same_strong_topic_cluster():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    cluster_a_1 = _brief(
+        "arg-a1",
+        "Public transit expansion lowers highway dependence",
+        "This debate compares public transit investment against highway expansion and argues transit reduces congestion.",
+        ["public", "transit", "expansion", "highway", "dependence", "congestion"],
+        ["transit", "highway"],
+        ["comparison", "contrast"],
+        {"source_dataset": "custom", "topic": "argument", "topic_cluster": "transit-highway-expansion", "stance": "pro"},
+    )
+    cluster_a_2 = _brief(
+        "arg-a2",
+        "Highway widening worsens long-term congestion",
+        "This debate revisits the same transit versus highway issue and argues induced demand makes widening ineffective.",
+        ["highway", "widening", "congestion", "transit", "induced", "demand"],
+        ["transit", "highway"],
+        ["comparison", "contrast"],
+        {"source_dataset": "custom", "topic": "argument", "topic_cluster": "transit-highway-expansion", "stance": "con"},
+    )
+    cluster_b = _brief(
+        "arg-b1",
+        "Speech regulation harms democratic trust",
+        "A different debate about speech regulation and democracy.",
+        ["speech", "regulation", "democracy", "trust"],
+        ["speech"],
+        ["comparison"],
+        {"source_dataset": "custom", "topic": "argument", "topic_cluster": "speech-regulation", "stance": "pro"},
+    )
+
+    ranked = orchestrator.rank_discovery_anchors([cluster_a_1, cluster_a_2, cluster_b])
+    assert "arg-a1" in ranked[:2]
+    assert "arg-a2" in ranked[:3]
