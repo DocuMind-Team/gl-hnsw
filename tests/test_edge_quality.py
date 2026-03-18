@@ -1535,6 +1535,7 @@ def test_argumentative_contrast_bridge_is_not_rejected_as_duplicate():
 
     assert check["keep"] is True
     assert "near_duplicate" not in check["risk_flags"]
+    assert "near_duplicate_bridge" not in check["risk_flags"]
     assert review.accepted is True
     assert review.relation_type == "comparison"
 

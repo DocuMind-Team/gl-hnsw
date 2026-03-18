@@ -522,9 +522,45 @@ def build_deepagent_toolsets(
         for candidate, signals, verdict in review_pairs:
             reviewed_verdict = reviewed.get(candidate.doc_id, verdict)
             check = check_lookup.get(candidate.doc_id, {})
-            keep = bool(getattr(reviewed_verdict, "accepted", False)) and bool(check.get("keep", True))
-            final_utility = max(float(getattr(reviewed_verdict, "utility_score", 0.0)) - float(check.get("risk_penalty", 0.0)), 0.0)
             risk_flags = sorted(set(getattr(reviewed_verdict, "contradiction_flags", []) or []) | set(check.get("risk_flags", [])))
+            normalized_risk_flags = {
+                str(flag).strip().lower().replace("-", "_").replace(" ", "_")
+                for flag in risk_flags
+                if str(flag)
+            }
+            contradiction_like = {
+                flag
+                for flag in normalized_risk_flags
+                if flag.startswith("contradict")
+                or flag.startswith("counterargument")
+                or flag.startswith("oppos")
+                or flag.startswith("alternative_position")
+            }
+            contrastive_comparison_bridge = (
+                getattr(reviewed_verdict, "relation_type", "") == "comparison"
+                and signals.stance_contrast >= 1.0
+                and signals.contrastive_bridge_score >= 0.56
+                and signals.bridge_gain >= 0.38
+                and (
+                    signals.topic_cluster_match >= 1.0
+                    or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
+                    or signals.mention_score >= 0.18
+                )
+            )
+            hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility", "weak_direction"}
+            effective_risk_flags = set(normalized_risk_flags)
+            risk_penalty = float(check.get("risk_penalty", 0.0))
+            if contrastive_comparison_bridge and "same_stance" not in effective_risk_flags:
+                effective_risk_flags -= {"near_duplicate", "near_duplicate_bridge"}
+                effective_risk_flags -= contradiction_like
+                if not (effective_risk_flags & hard_blockers):
+                    risk_penalty = min(risk_penalty, 0.22)
+            keep = bool(getattr(reviewed_verdict, "accepted", False)) and (
+                bool(check.get("keep", True)) or (
+                    contrastive_comparison_bridge and not (effective_risk_flags & hard_blockers)
+                )
+            )
+            final_utility = max(float(getattr(reviewed_verdict, "utility_score", 0.0)) - risk_penalty, 0.0)
             review_rows.append(
                 ReviewBundleItem(
                     candidate_doc_id=candidate.doc_id,
@@ -534,7 +570,7 @@ def build_deepagent_toolsets(
                     relation_type=str(getattr(reviewed_verdict, "relation_type", "comparison")),
                     decision_reason=(str(getattr(reviewed_verdict, "decision_reason", "")) or str(check.get("decision_reason", "")))[:220],
                     final_verdict=to_jsonable(reviewed_verdict),
-                    risk_flags=risk_flags,
+                    risk_flags=sorted(effective_risk_flags),
                 )
             )
         review_rows.sort(key=lambda item: (-item.reviewed_utility_score, -item.reviewed_confidence, item.candidate_doc_id))

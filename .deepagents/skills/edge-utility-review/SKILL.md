@@ -14,9 +14,11 @@ Review with a retrieval mindset.
 3. Prefer edges that add bridge vocabulary or cross-cluster access.
 4. In argumentative corpora, keep contrastive bridges only when topic consistency is strong.
 5. Reject edges that are true but not useful.
+6. Treat duplicate-only risk as overridable when the pair forms a same-topic contrast bridge with high reuse value.
 
 ## Recommended tools
 
 - Use `evaluate_anchor_utility` before final keep/drop decisions.
 - Use `read_counterevidence_bundle` as the authoritative source for drift and duplicate risk.
 - Favor one strong comparison bridge over several same-theme but noisy comparisons.
+- If the checker reports only duplicate-style risk and the pair is a same-topic contrast bridge, bias toward keeping it and lowering the penalty instead of dropping it.

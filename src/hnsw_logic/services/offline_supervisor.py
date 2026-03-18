@@ -274,6 +274,14 @@ class OfflineIndexingSupervisor:
                 for flag in [*review_row.get("risk_flags", []), *check_row.get("risk_flags", [])]
                 if str(flag)
             }
+            contradiction_like_risks = {
+                flag
+                for flag in risk_flags
+                if flag.startswith("contradict")
+                or flag.startswith("counterargument")
+                or flag.startswith("oppos")
+                or flag.startswith("alternative_position")
+            }
             soft_bridge_risks = {"excess_novelty", "weak_family_bridge", "topic_only_overlap", "low_retrieval_utility", "weak_direction"}
             duplicate_only_comparison_risks = {"near_duplicate", "near_duplicate_bridge"}
             same_concept_soft_keep = (
@@ -293,7 +301,7 @@ class OfflineIndexingSupervisor:
                 and assessment.evidence_quality >= 0.76
                 and risk_penalty <= 0.28
                 and risk_flags
-                and risk_flags.issubset(duplicate_only_comparison_risks)
+                and (risk_flags - contradiction_like_risks).issubset(duplicate_only_comparison_risks)
             )
             rescue_keep = (
                 assessment.accepted

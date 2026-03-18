@@ -87,6 +87,67 @@ class ProviderBase:
         self.review_few_shot_text = self._build_generic_review_examples()
         self.query_strategy_few_shot_text = self._build_query_strategy_examples()
 
+    @staticmethod
+    def _normalize_risk_flag(flag: str) -> str:
+        return str(flag).strip().lower().replace("-", "_").replace(" ", "_")
+
+    def _is_contrastive_comparison_bridge(self, signals: JudgeSignals, verdict: JudgeResult) -> bool:
+        if verdict.relation_type != "comparison":
+            return False
+        return (
+            signals.stance_contrast >= 1.0
+            and signals.contrastive_bridge_score >= 0.56
+            and signals.bridge_gain >= 0.38
+            and (
+                signals.topic_cluster_match >= 1.0
+                or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
+                or signals.mention_score >= 0.18
+            )
+        )
+
+    def _normalize_counterevidence_result(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        signals: JudgeSignals,
+        verdict: JudgeResult,
+        result: dict,
+    ) -> dict:
+        risk_flags = [str(flag) for flag in result.get("risk_flags", []) if str(flag)]
+        normalized_flags = {self._normalize_risk_flag(flag) for flag in risk_flags}
+        keep = bool(result.get("keep", True))
+        risk_penalty = float(result.get("risk_penalty", 0.0) or 0.0)
+        decision_reason = str(result.get("decision_reason", ""))[:220]
+
+        contradiction_like = {
+            flag
+            for flag in normalized_flags
+            if flag.startswith("contradict")
+            or flag.startswith("counterargument")
+            or flag.startswith("oppos")
+            or flag.startswith("alternative_position")
+        }
+        duplicate_only_flags = {"near_duplicate", "near_duplicate_bridge"}
+        hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility", "weak_direction"}
+
+        if self._is_contrastive_comparison_bridge(signals, verdict) and "same_stance" not in normalized_flags:
+            normalized_flags -= duplicate_only_flags
+            remaining_blockers = {flag for flag in normalized_flags if flag in hard_blockers}
+            if not remaining_blockers:
+                keep = True
+                risk_penalty = min(risk_penalty, 0.22)
+                if not decision_reason:
+                    decision_reason = "Kept as a same-topic contrast bridge despite duplicate risk."
+                normalized_flags |= contradiction_like
+
+        return {
+            "keep": keep,
+            "risk_flags": sorted(normalized_flags),
+            "counterevidence": [str(flag) for flag in result.get("counterevidence", [])][:8],
+            "decision_reason": decision_reason,
+            "risk_penalty": round(risk_penalty, 6),
+        }
+
     @property
     def embedding_dim(self) -> int:
         return self.config.embedding_dim
@@ -156,15 +217,16 @@ class ProviderBase:
             and signals.contrastive_bridge_score >= 0.56
             and signals.bridge_gain >= 0.38
         ):
-            penalty = max(0.0, penalty - 0.18)
-            risk_flags = [flag for flag in risk_flags if flag != "near_duplicate"]
-        return {
+            penalty = max(0.0, penalty - 0.24)
+            risk_flags = [flag for flag in risk_flags if flag not in {"near_duplicate", "near_duplicate_bridge"}]
+        result = {
             "keep": penalty < 0.42,
             "risk_flags": sorted(set(risk_flags)),
             "counterevidence": [],
             "decision_reason": "base checker fallback",
             "risk_penalty": round(penalty, 6),
         }
+        return self._normalize_counterevidence_result(anchor, candidate, signals, verdict, result)
 
     def check_counterevidence_many(
         self,
@@ -595,8 +657,18 @@ class StubProvider(ProviderBase):
             and signals.contrastive_bridge_score >= 0.56
             and signals.bridge_gain >= 0.38
         ):
-            risk_penalty = max(0.0, risk_penalty - 0.2)
-            risk_flags = {flag for flag in risk_flags if flag != "near_duplicate"}
+            risk_penalty = max(0.0, risk_penalty - 0.3)
+            risk_flags = {flag for flag in risk_flags if flag not in {"near_duplicate", "near_duplicate_bridge"}}
+            risk_flags = {
+                flag
+                for flag in risk_flags
+                if not (
+                    flag.startswith("contradict")
+                    or flag.startswith("counterargument")
+                    or flag.startswith("oppos")
+                    or flag.startswith("alternative_position")
+                )
+            }
         if reviewed_relation == "same_concept" and "methodology_gap" in risk_flags and fit_scores.get("supporting_evidence", 0.0) >= current_fit - 0.05:
             reviewed_relation = "supporting_evidence"
 
@@ -1225,7 +1297,7 @@ class OpenAICompatibleProvider(StubProvider):
 
     def check_counterevidence(self, anchor: DocBrief, candidate: DocBrief, signals: JudgeSignals, verdict: JudgeResult) -> dict:
         try:
-            return self._invoke_json(
+            payload = self._invoke_json(
                 self._counterevidence_instruction(),
                 json.dumps(
                     {
@@ -1247,6 +1319,7 @@ class OpenAICompatibleProvider(StubProvider):
                 thinking=self.live_reasoning["reviewer"],
                 stage="check_counterevidence",
             )
+            return self._normalize_counterevidence_result(anchor, candidate, signals, verdict, payload)
         except Exception as exc:
             if self._is_content_filter_error(exc):
                 self._trace_remote("check_counterevidence", "blocked_local", candidate.doc_id)
@@ -1303,13 +1376,28 @@ class OpenAICompatibleProvider(StubProvider):
                     candidate_doc_id = str(item.get("candidate_doc_id", ""))
                     if not candidate_doc_id:
                         continue
-                    results[candidate_doc_id] = {
+                    candidate_entry = next(
+                        ((candidate, signals, verdict) for candidate, signals, verdict in batch if candidate.doc_id == candidate_doc_id),
+                        None,
+                    )
+                    result = {
                         "keep": bool(item.get("keep", True)),
                         "risk_flags": [str(flag) for flag in item.get("risk_flags", [])][:8],
                         "counterevidence": [str(flag) for flag in item.get("counterevidence", [])][:8],
                         "decision_reason": str(item.get("decision_reason", ""))[:220],
                         "risk_penalty": float(item.get("risk_penalty", 0.0)),
                     }
+                    if candidate_entry is None:
+                        results[candidate_doc_id] = result
+                    else:
+                        candidate_doc, candidate_signals, candidate_verdict = candidate_entry
+                        results[candidate_doc_id] = self._normalize_counterevidence_result(
+                            anchor,
+                            candidate_doc,
+                            candidate_signals,
+                            candidate_verdict,
+                            result,
+                        )
             except Exception as exc:
                 if (self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc)) and len(batch) > 1:
                     midpoint = max(1, len(batch) // 2)

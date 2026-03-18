@@ -395,14 +395,14 @@ def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_dupli
                 "keep": False,
                 "reviewed_utility_score": 0.2,
                 "reviewed_confidence": 0.84,
-                "risk_flags": ["near_duplicate", "near_duplicate_bridge"],
+                "risk_flags": ["near_duplicate", "near_duplicate_bridge", "contradicts_anchor_claim"],
             }
         },
         "checks": {
             candidate.doc_id: {
                 "keep": False,
                 "risk_penalty": 0.16,
-                "risk_flags": ["near_duplicate", "near_duplicate_bridge"],
+                "risk_flags": ["near_duplicate", "near_duplicate_bridge", "contradicts_anchor_claim"],
             }
         },
     }

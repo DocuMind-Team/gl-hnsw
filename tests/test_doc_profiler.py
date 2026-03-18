@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.core.models import DocBrief, DocRecord
-from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals, OpenAICompatibleProvider, ProviderBase
+from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals, OpenAICompatibleProvider, ProviderBase, StubProvider
 
 
 def test_doc_profiler_returns_expected_fields(app_container):
@@ -207,6 +207,83 @@ def test_counterevidence_content_filter_falls_back_to_local_checker():
 
     assert checks["candidate"]["keep"] is True
     assert checks["candidate"]["decision_reason"] == "base checker fallback"
+
+
+def test_counterevidence_normalizes_duplicate_only_comparison_bridge():
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    anchor = DocBrief(
+        doc_id="anchor",
+        title="Campuses should restrict hate speech",
+        summary="Restricting hate speech protects students in a campus setting.",
+        entities=["campus", "speech"],
+        keywords=["campus", "speech", "restrict"],
+        claims=[],
+        relation_hints=["debate", "comparison"],
+        metadata={"source_dataset": "arguana", "topic_cluster": "campus-hate-speech", "stance": "pro"},
+    )
+    candidate = DocBrief(
+        doc_id="candidate",
+        title="Campuses should not restrict hate speech",
+        summary="Open expression matters more than campus restrictions on speech.",
+        entities=["campus", "speech"],
+        keywords=["campus", "speech", "restrict"],
+        claims=[],
+        relation_hints=["debate", "comparison"],
+        metadata={"source_dataset": "arguana", "topic_cluster": "campus-hate-speech", "stance": "con"},
+    )
+    signals = JudgeSignals(
+        dense_score=0.7,
+        sparse_score=0.65,
+        overlap_score=0.58,
+        content_overlap_score=0.52,
+        mention_score=0.33,
+        role_listing_score=0.0,
+        forward_reference_score=0.0,
+        reverse_reference_score=0.0,
+        direction_score=0.0,
+        local_support=0.61,
+        utility_score=0.72,
+        best_relation="comparison",
+        stage_pair="argument_claim->argument_claim",
+        risk_flags=["near_duplicate", "near_duplicate_bridge"],
+        relation_fit_scores={"comparison": 0.81},
+        topic_cluster_match=1.0,
+        stance_contrast=1.0,
+        bridge_gain=0.49,
+        duplicate_penalty=0.44,
+        contrastive_bridge_score=0.84,
+    )
+    verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.88,
+        evidence_spans=["The pair offers directly opposed campus-speech policies."],
+        rationale="Reusable contrast bridge on the same debate topic.",
+        support_score=0.7,
+        contradiction_flags=[],
+        decision_reason="contrast bridge",
+        utility_score=0.74,
+        canonical_relation="comparison",
+        semantic_relation_label="comparison",
+    )
+
+    normalized = provider._normalize_counterevidence_result(
+        anchor,
+        candidate,
+        signals,
+        verdict,
+        {
+            "keep": False,
+            "risk_flags": ["near_duplicate", "near_duplicate_bridge", "contradicts the anchor claim"],
+            "counterevidence": [],
+            "decision_reason": "duplicate only",
+            "risk_penalty": 0.8,
+        },
+    )
+
+    assert normalized["keep"] is True
+    assert "near_duplicate" not in normalized["risk_flags"]
+    assert normalized["risk_penalty"] <= 0.22
 
 
 def test_profile_docs_malformed_batch_retries_single_remote_calls():
