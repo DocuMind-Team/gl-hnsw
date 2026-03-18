@@ -106,7 +106,7 @@ class OfflineIndexingSupervisor:
                             "Use the delegation-policy skill and keep the plan auditable.",
                             f"Respect a maximum of {self.agents_config.max_parallel_tasks} active task slots.",
                             "Use the task tool to delegate to the index_planner subagent.",
-                            "The subagent must call execute_index_planning and produce /data/workspace/indexing/plans/indexing_plan.json.",
+                            "The subagent must call execute_index_planning and materialize the plan in the current workspace indexing/plans directory.",
                             "Audit the plan by checking the file exists before returning.",
                         ]
                     )

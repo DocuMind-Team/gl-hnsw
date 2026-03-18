@@ -6,6 +6,7 @@ from hnsw_logic.agents.tools.deepagents_runtime import (
     audit_execution_state,
     load_execution_manifest,
     record_manifest_stage_event,
+    resolve_workspace_output_path,
     stage_artifact_path,
 )
 from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
@@ -166,6 +167,29 @@ def test_execution_audit_reports_missing_stages(tmp_path: Path):
     next_audit = audit_execution_state(tmp_path, "doc-1", counterevidence_enabled=True, task_iteration_cap=2)
     assert "dossiers" in next_audit.completed_stages
     assert next_audit.next_stage == "candidates"
+
+
+def test_workspace_output_path_resolution_maps_data_prefixes(tmp_path: Path):
+    workspace_root = tmp_path / "root" / "data" / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    default = workspace_root / "indexing" / "reviews" / "doc-1.json"
+
+    assert resolve_workspace_output_path(workspace_root, None, default) == default
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "indexing/reviews/doc-1.json",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "/data/workspace/indexing/reviews/doc-1.json",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "/data/indexing/reviews/doc-1.json",
+        default,
+    ) == workspace_root.parent / "indexing/reviews/doc-1.json"
 
 
 def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):

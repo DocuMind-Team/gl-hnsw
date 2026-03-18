@@ -40,6 +40,22 @@ def stage_artifact_path(workspace_root: Path, stage: str, anchor_doc_id: str, su
     return workspace_root / "indexing" / stage / f"{anchor_doc_id}{suffix}"
 
 
+def resolve_workspace_output_path(workspace_root: Path, output_path: str | None, default_path: Path) -> Path:
+    if not output_path:
+        return default_path
+    path = Path(output_path)
+    if not path.is_absolute():
+        return workspace_root / output_path
+    raw = path.as_posix()
+    if raw.startswith("/data/workspace/"):
+        return workspace_root / raw.removeprefix("/data/workspace/")
+    if raw.startswith("/data/"):
+        return workspace_root.parent / raw.removeprefix("/data/")
+    if raw.startswith("/workspace/"):
+        return workspace_root.parent.parent.parent / raw.removeprefix("/workspace/")
+    return path
+
+
 def load_execution_manifest(workspace_root: Path, anchor_doc_id: str) -> ExecutionManifest:
     payload = read_json(manifest_path(workspace_root, anchor_doc_id))
     if isinstance(payload, dict):
@@ -250,9 +266,13 @@ def build_deepagent_toolsets(
             )[:16],
         }
 
-    def execute_index_planning(output_path: str = "/data/workspace/indexing/plans/indexing_plan.json") -> dict:
+    def execute_index_planning(output_path: str = "indexing/plans/indexing_plan.json") -> dict:
         """Generate the offline indexing plan and persist it to the workspace."""
-        destination = workspace_root.parent.parent / output_path.lstrip("/") if output_path.startswith("/") else workspace_root / output_path
+        destination = resolve_workspace_output_path(
+            workspace_root,
+            output_path,
+            stage_artifact_path(workspace_root, "plans", "indexing_plan", suffix=".json"),
+        )
         existing_plan = read_json(destination)
         if existing_plan:
             return {"plan_path": str(destination), "anchors": len(existing_plan.get("anchors", [])), "cached": True}
@@ -309,7 +329,7 @@ def build_deepagent_toolsets(
 
     def execute_doc_profiling(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Build or refresh the dossier for a single anchor document."""
-        destination = Path(output_path) if output_path else stage_path("dossiers", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("dossiers", anchor_doc_id))
         existing_dossier = read_json(destination)
         if existing_dossier:
             existing_brief = existing_dossier.get("brief")
@@ -340,7 +360,7 @@ def build_deepagent_toolsets(
 
     def execute_candidate_expansion(anchor_doc_id: str, output_path: str | None = None, expanded: bool = False) -> dict:
         """Create a candidate bundle for an anchor using scout and local signals."""
-        destination = Path(output_path) if output_path else stage_path("candidates", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("candidates", anchor_doc_id))
         existing_bundle = read_json(destination)
         if existing_bundle:
             mark_stage_completed(anchor_doc_id, "candidates", "reused cached candidate bundle")
@@ -375,7 +395,7 @@ def build_deepagent_toolsets(
 
     def execute_relation_judging(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a judgment bundle for all candidates attached to an anchor."""
-        destination = Path(output_path) if output_path else stage_path("judgments", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("judgments", anchor_doc_id))
         existing_bundle = read_json(destination)
         if existing_bundle:
             mark_stage_completed(anchor_doc_id, "judgments", "reused cached judgment bundle")
@@ -407,7 +427,7 @@ def build_deepagent_toolsets(
 
     def execute_counterevidence_check(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a counterevidence bundle that checks tentative edges for risk and duplication."""
-        destination = Path(output_path) if output_path else stage_path("checks", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("checks", anchor_doc_id))
         existing_bundle = read_json(destination)
         if existing_bundle:
             mark_stage_completed(anchor_doc_id, "checks", "reused cached counterevidence bundle")
@@ -475,7 +495,7 @@ def build_deepagent_toolsets(
 
     def execute_edge_review(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Create a review bundle with reviewed utility scores and keep/drop decisions."""
-        destination = Path(output_path) if output_path else stage_path("reviews", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("reviews", anchor_doc_id))
         existing_bundle = read_json(destination)
         if existing_bundle:
             mark_stage_completed(anchor_doc_id, "reviews", "reused cached review bundle")
@@ -525,7 +545,7 @@ def build_deepagent_toolsets(
 
     def execute_memory_summarization(anchor_doc_id: str, output_path: str | None = None) -> dict:
         """Summarize accepted and rejected outcomes into a memory learning bundle."""
-        destination = Path(output_path) if output_path else stage_path("memory", anchor_doc_id)
+        destination = resolve_workspace_output_path(workspace_root, output_path, stage_path("memory", anchor_doc_id))
         existing_bundle = read_json(destination)
         if existing_bundle:
             mark_stage_completed(anchor_doc_id, "memory", "reused cached memory bundle")
