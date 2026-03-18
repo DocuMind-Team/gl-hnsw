@@ -45,15 +45,20 @@ def resolve_workspace_output_path(workspace_root: Path, output_path: str | None,
         return default_path
     path = Path(output_path)
     if not path.is_absolute():
-        return workspace_root / output_path
-    raw = path.as_posix()
-    if raw.startswith("/data/workspace/"):
-        return workspace_root / raw.removeprefix("/data/workspace/")
-    if raw.startswith("/data/"):
-        return workspace_root.parent / raw.removeprefix("/data/")
-    if raw.startswith("/workspace/"):
-        return workspace_root.parent.parent.parent / raw.removeprefix("/workspace/")
-    return path
+        resolved = workspace_root / output_path
+    else:
+        raw = path.as_posix()
+        if raw.startswith("/data/workspace/"):
+            resolved = workspace_root / raw.removeprefix("/data/workspace/")
+        elif raw.startswith("/data/"):
+            resolved = workspace_root.parent / raw.removeprefix("/data/")
+        elif raw.startswith("/workspace/"):
+            resolved = workspace_root.parent.parent.parent / raw.removeprefix("/workspace/")
+        else:
+            resolved = path
+    if resolved == default_path.parent or (not resolved.suffix and resolved.name == default_path.parent.name):
+        return resolved / default_path.name
+    return resolved
 
 
 def load_execution_manifest(workspace_root: Path, anchor_doc_id: str) -> ExecutionManifest:

@@ -190,6 +190,11 @@ def test_workspace_output_path_resolution_maps_data_prefixes(tmp_path: Path):
         "/data/indexing/reviews/doc-1.json",
         default,
     ) == workspace_root.parent / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "indexing/reviews",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
 
 
 def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
