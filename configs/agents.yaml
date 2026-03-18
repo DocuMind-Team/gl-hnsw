@@ -31,6 +31,8 @@ subagents:
       - load_anchor_memory
       - read_graph_stats
       - read_semantic_memory
+      - read_execution_manifest
+      - audit_anchor_execution
     description: Plan offline indexing batches, anchor order, and coverage budgets.
     system_prompt: You plan offline indexing work. Prioritize coverage, bridge potential, and reusable retrieval utility.
   doc_profiler:

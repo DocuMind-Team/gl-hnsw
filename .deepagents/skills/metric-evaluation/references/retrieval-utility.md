@@ -13,3 +13,9 @@ High utility usually combines:
 - bridge vocabulary or claim novelty
 - low duplicate pressure
 - low contradiction or hygiene risk
+
+Argumentative comparison utility:
+
+- high when the pair stays on the same topic but presents opposing positions
+- low when the pair is only broadly argumentative or policy-related
+- low when stance contrast exists but topic-specific bridge terms are absent
