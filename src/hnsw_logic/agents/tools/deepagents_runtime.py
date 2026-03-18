@@ -539,18 +539,16 @@ def build_deepagent_toolsets(
                 if flag.startswith("contradict")
                 or flag.startswith("counterargument")
                 or flag.startswith("oppos")
+                or flag.startswith("contrasting")
+                or "contrast" in flag
                 or flag.startswith("alternative_position")
             }
-            contrastive_comparison_bridge = (
+            reviewer_provider = getattr(orchestrator.edge_reviewer, "provider", None)
+            contrastive_comparison_bridge = bool(
                 getattr(reviewed_verdict, "relation_type", "") == "comparison"
-                and signals.stance_contrast >= 1.0
-                and signals.contrastive_bridge_score >= 0.56
-                and signals.bridge_gain >= 0.38
-                and (
-                    signals.topic_cluster_match >= 1.0
-                    or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
-                    or signals.mention_score >= 0.18
-                )
+                and reviewer_provider is not None
+                and hasattr(reviewer_provider, "_is_contrastive_comparison_bridge")
+                and reviewer_provider._is_contrastive_comparison_bridge(signals, reviewed_verdict)
             )
             hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility", "weak_direction"}
             effective_risk_flags = set(normalized_risk_flags)

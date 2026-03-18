@@ -91,18 +91,46 @@ class ProviderBase:
     def _normalize_risk_flag(flag: str) -> str:
         return str(flag).strip().lower().replace("-", "_").replace(" ", "_")
 
+    def _has_verdict_contrast_signal(self, verdict: JudgeResult) -> bool:
+        text = " ".join(
+            [
+                *(verdict.contradiction_flags or []),
+                verdict.decision_reason,
+                verdict.rationale,
+            ]
+        ).lower()
+        return any(
+            cue in text
+            for cue in (
+                "contrast",
+                "contrasting",
+                "opposing",
+                "opposed",
+                "counterargument",
+                "counter-argument",
+                "alternative position",
+                "direct contrast",
+            )
+        )
+
     def _is_contrastive_comparison_bridge(self, signals: JudgeSignals, verdict: JudgeResult) -> bool:
         if verdict.relation_type != "comparison":
             return False
-        return (
+        topic_consistent = (
+            signals.topic_cluster_match >= 1.0
+            or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
+            or signals.mention_score >= 0.18
+        )
+        contrast_signal = (
             signals.stance_contrast >= 1.0
-            and signals.contrastive_bridge_score >= 0.56
-            and signals.bridge_gain >= 0.38
-            and (
-                signals.topic_cluster_match >= 1.0
-                or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
-                or signals.mention_score >= 0.18
-            )
+            or signals.contrastive_bridge_score >= 0.56
+            or self._has_verdict_contrast_signal(verdict)
+        )
+        bridge_signal = signals.bridge_gain >= 0.38 or verdict.utility_score >= 0.72
+        return (
+            topic_consistent
+            and contrast_signal
+            and bridge_signal
         )
 
     def _normalize_counterevidence_result(
@@ -125,6 +153,8 @@ class ProviderBase:
             if flag.startswith("contradict")
             or flag.startswith("counterargument")
             or flag.startswith("oppos")
+            or flag.startswith("contrasting")
+            or "contrast" in flag
             or flag.startswith("alternative_position")
         }
         duplicate_only_flags = {"near_duplicate", "near_duplicate_bridge"}
@@ -666,6 +696,8 @@ class StubProvider(ProviderBase):
                     flag.startswith("contradict")
                     or flag.startswith("counterargument")
                     or flag.startswith("oppos")
+                    or flag.startswith("contrasting")
+                    or "contrast" in flag
                     or flag.startswith("alternative_position")
                 )
             }

@@ -280,6 +280,8 @@ class OfflineIndexingSupervisor:
                 if flag.startswith("contradict")
                 or flag.startswith("counterargument")
                 or flag.startswith("oppos")
+                or flag.startswith("contrasting")
+                or "contrast" in flag
                 or flag.startswith("alternative_position")
             }
             soft_bridge_risks = {"excess_novelty", "weak_family_bridge", "topic_only_overlap", "low_retrieval_utility", "weak_direction"}
