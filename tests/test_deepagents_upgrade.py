@@ -43,7 +43,7 @@ def test_skill_packages_have_frontmatter_and_resources(test_root: Path):
         assert (skill_dir / "scripts").exists(), skill_dir
 
 
-def test_key_runtime_skills_declare_allowed_tools(test_root: Path):
+def test_key_runtime_skills_document_recommended_tools(test_root: Path):
     skills_root = test_root / ".deepagents" / "skills"
     expected = {
         "candidate-expansion",
@@ -55,7 +55,7 @@ def test_key_runtime_skills_declare_allowed_tools(test_root: Path):
     }
     for skill_name in expected:
         content = (skills_root / skill_name / "SKILL.md").read_text(encoding="utf-8")
-        assert "allowed-tools:" in content, skill_name
+        assert "Recommended tools" in content, skill_name
 
 
 def test_controlled_self_update_only_touches_allowlisted_targets(tmp_path: Path):

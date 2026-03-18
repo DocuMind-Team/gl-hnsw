@@ -117,6 +117,28 @@ class OfflineIndexingSupervisor:
             self._run_stage_locally("index_planner", "execute_index_planning")
         return read_json(self._plan_path(), {}) or {}
 
+    @staticmethod
+    def _ordered_anchor_ids_from_plan(plan: dict[str, Any]) -> list[str]:
+        ordered: list[str] = []
+        if isinstance(plan.get("anchors"), list):
+            ordered.extend(str(item.get("doc_id")) for item in plan["anchors"] if isinstance(item, dict) and item.get("doc_id"))
+        anchor_selection = plan.get("anchor_selection")
+        if isinstance(anchor_selection, dict):
+            ordered.extend(str(doc_id) for doc_id in anchor_selection.get("priority_order", []) if doc_id)
+        if isinstance(plan.get("batches"), list):
+            for batch in plan["batches"]:
+                if not isinstance(batch, dict):
+                    continue
+                ordered.extend(str(doc_id) for doc_id in batch.get("anchors", []) if doc_id)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for doc_id in ordered:
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            deduped.append(doc_id)
+        return deduped
+
     def _run_anchor_workflow_local(self, anchor_doc_id: str, stages: list[str] | None = None) -> None:
         target_stages = stages or self._required_stages()
         for stage in target_stages:
@@ -353,7 +375,7 @@ class OfflineIndexingSupervisor:
 
     def discover_edges(self, docs, briefs: list[DocBrief]) -> list:
         plan = self._build_plan()
-        ordered = [item.get("doc_id") for item in plan.get("anchors", []) if item.get("doc_id")]
+        ordered = self._ordered_anchor_ids_from_plan(plan)
         if not ordered:
             ordered = self.orchestrator.rank_discovery_anchors(briefs)
         brief_map = {brief.doc_id: brief for brief in briefs}

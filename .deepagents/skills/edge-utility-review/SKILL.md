@@ -1,11 +1,6 @@
 ---
 name: edge-utility-review
 description: Review judged edges for retrieval value, diversity, and graph hygiene. Use when selecting which edges should survive into the persisted graph.
-allowed-tools:
-  - read_candidate_bundle
-  - read_judgment_bundle
-  - read_counterevidence_bundle
-  - evaluate_anchor_utility
 ---
 
 # Edge Utility Review
@@ -20,7 +15,7 @@ Review with a retrieval mindset.
 4. In argumentative corpora, keep contrastive bridges only when topic consistency is strong.
 5. Reject edges that are true but not useful.
 
-## Tool discipline
+## Recommended tools
 
 - Use `evaluate_anchor_utility` before final keep/drop decisions.
 - Use `read_counterevidence_bundle` as the authoritative source for drift and duplicate risk.

@@ -1,9 +1,6 @@
 ---
 name: relation-judging
 description: Judge candidate pairs into semantic and canonical relations using grounded signals. Use when deciding whether a pair should remain a durable retrieval edge candidate.
-allowed-tools:
-  - read_anchor_dossier
-  - read_candidate_bundle
 ---
 
 # Relation Judging
@@ -28,3 +25,8 @@ Judge pairs with precision-first reasoning.
 
 - Emit explicit `utility_score`, `uncertainty`, and `risk_flags`.
 - Distinguish “same topic but opposite stance” from “different topic with generic argumentative overlap”.
+
+## Recommended tools
+
+- `read_anchor_dossier`
+- `read_candidate_bundle`

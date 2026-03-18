@@ -1,11 +1,6 @@
 ---
 name: metric-evaluation
 description: Evaluate candidate and review bundles from a retrieval-utility perspective. Use when ranking edges by likely recall, rank gain, novelty, and drift risk instead of semantic plausibility alone.
-allowed-tools:
-  - read_candidate_bundle
-  - read_judgment_bundle
-  - read_counterevidence_bundle
-  - evaluate_anchor_utility
 ---
 
 # Metric Evaluation
@@ -26,3 +21,10 @@ worth keeping for retrieval.
 - Report coverage gain and drift risk in concise terms.
 - Keep decisions tied to retrieval quality, not only semantic correctness.
 - Mention when a candidate is “same-side duplication” versus “same-topic contrast”.
+
+## Recommended tools
+
+- `evaluate_anchor_utility`
+- `read_candidate_bundle`
+- `read_judgment_bundle`
+- `read_counterevidence_bundle`

@@ -1,9 +1,6 @@
 ---
 name: delegation-policy
 description: Constrain supervisor delegation, retry budgets, and stage ordering for offline indexing. Use when the main agent must decide which subagent to call next, how many task rounds remain, and when to stop and fall back.
-allowed-tools:
-  - read_execution_manifest
-  - audit_anchor_execution
 ---
 
 # Delegation Policy
@@ -24,3 +21,8 @@ Use this skill to keep task delegation bounded and auditable.
 - Never continue once the retry budget is exhausted.
 - Prefer a deterministic fallback over speculative extra delegation.
 - Never assume a stage succeeded until `audit_anchor_execution` confirms it.
+
+## Recommended tools
+
+- `read_execution_manifest`
+- `audit_anchor_execution`

@@ -1,12 +1,6 @@
 ---
 name: counterevidence-check
 description: Search for negative signals, duplication, weak direction, and low-value overlap before an edge survives. Use after tentative judgments and before final edge review.
-allowed-tools:
-  - read_candidate_bundle
-  - read_judgment_bundle
-  - read_failure_patterns
-  - read_execution_manifest
-  - audit_anchor_execution
 ---
 
 # Counterevidence Check
@@ -21,7 +15,7 @@ This stage is adversarial.
 4. Emit risk flags and counterevidence summaries.
 4. Prefer dropping marginal edges rather than keeping noisy bridges.
 
-## Tool discipline
+## Recommended tools
 
 - Audit the anchor workflow before assuming the judgment bundle is complete.
 - Use `read_failure_patterns` to check whether the pair matches a known noise pattern.
