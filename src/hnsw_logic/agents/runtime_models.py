@@ -5,6 +5,53 @@ from typing import Any
 
 
 @dataclass(slots=True)
+class SignalReport:
+    topic_consistency: float
+    duplicate_risk: float
+    bridge_information_gain: float
+    contrast_evidence: float
+    query_surface_match: float
+    uncertainty_hint: float
+    drift_risk: float
+    notes: list[str] = field(default_factory=list)
+    signals: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class EdgeActivationProfile:
+    topic_signature: list[str] = field(default_factory=list)
+    query_surface_terms: list[str] = field(default_factory=list)
+    edge_use_cases: list[str] = field(default_factory=list)
+    drift_risk: float = 0.0
+    activation_prior: float = 0.0
+    negative_patterns: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class AgentVerdict:
+    accepted: bool
+    semantic_relation_label: str
+    canonical_relation: str
+    utility_score: float
+    uncertainty: float
+    risk_flags: list[str] = field(default_factory=list)
+    decision_reason: str = ""
+
+
+@dataclass(slots=True)
+class AssessmentDecision:
+    candidate_doc_id: str
+    accepted: bool
+    reject_reason: str
+    relation_type: str
+    confidence: float
+    utility_score: float
+    local_support: float
+    evidence_quality: float
+    activation_profile: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class AnchorPlan:
     doc_id: str
     priority: float
@@ -94,6 +141,7 @@ class ReviewBundleItem:
     decision_reason: str
     final_verdict: dict[str, Any]
     risk_flags: list[str] = field(default_factory=list)
+    activation_profile: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

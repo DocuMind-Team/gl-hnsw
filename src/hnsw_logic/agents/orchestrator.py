@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+from hnsw_logic.agents.tools.skill_signals import SkillSignalRuntime
 from hnsw_logic.config.schema import RelationQualityConfig, RetrievalConfig
 from hnsw_logic.core.constants import DEFAULT_TIMESTAMP, RELATION_TYPES
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
@@ -65,24 +66,6 @@ DISCOVERY_TERMS = {
 }
 ARGUMENT_STAGE_TOKENS = {"argument", "debate", "claim", "claims", "position", "positions", "policy", "counterargument"}
 ARGUMENT_COMPARISON_CUES = {"argument", "debate", "contrast", "versus", "vs", "counter", "counterargument", "opposing", "alternative", "position"}
-ARGUMENT_CONTRAST_VERDICT_CUES = {
-    "alternative position",
-    "compare",
-    "comparison",
-    "contrast",
-    "contrasting",
-    "counterargument",
-    "counter-argument",
-    "debate",
-    "direct contrast",
-    "opposing",
-    "opposed",
-    "opposite",
-    "rebuttal",
-    "stance contrast",
-    "versus",
-    "vs",
-}
 EVAL_METRIC_STAGE_TOKENS = {"ann", "metric", "metrics", "recall", "mrr", "ndcg", "latency", "benchmark", "benchmarking"}
 EVAL_REPORT_STAGE_TOKENS = {"report", "reporting", "compare", "comparison", "edge", "precision", "include", "includes"}
 SCIENTIFIC_BRIDGE_TERMS = {
@@ -126,12 +109,15 @@ class LogicOrchestrator:
     deepagent: object | None = None
     retrieval_config: RetrievalConfig | None = None
     _embedding_cache: dict[str, Any] | None = None
+    _signal_runtime: SkillSignalRuntime | None = None
 
     def __post_init__(self):
         if self._embedding_cache is None:
             self._embedding_cache = {}
         if self.retrieval_config is None:
             self.retrieval_config = RetrievalConfig()
+        if self._signal_runtime is None:
+            self._signal_runtime = SkillSignalRuntime()
 
     def _provider(self):
         return getattr(self.doc_profiler, "provider", None) or getattr(self.relation_judge, "provider", None)
@@ -928,6 +914,17 @@ class LogicOrchestrator:
             and contrastive_bridge_score >= 0.56
         ):
             risk_flags.append("near_duplicate")
+        signal_report = self._signal_runtime.build_signal_report(
+            anchor,
+            candidate,
+            local_signals={
+                **metrics,
+                "utility_score": self._utility_score(anchor, candidate, metrics, fit_scores, relation_type),
+                "bridge_gain": self._bridge_information_gain(anchor, candidate),
+                "duplicate_penalty": duplicate_penalty,
+                "contrastive_bridge_score": contrastive_bridge_score,
+            },
+        )
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -947,9 +944,14 @@ class LogicOrchestrator:
             topic_family_match=metrics["topic_family_match"],
             topic_cluster_match=metrics["topic_cluster_match"],
             stance_contrast=metrics["stance_contrast"],
-            bridge_gain=self._bridge_information_gain(anchor, candidate),
+            bridge_gain=float(signal_report.get("bridge_information_gain", self._bridge_information_gain(anchor, candidate)) or 0.0),
             duplicate_penalty=duplicate_penalty,
-            contrastive_bridge_score=contrastive_bridge_score,
+            contrastive_bridge_score=max(float(signal_report.get("contrast_evidence", 0.0) or 0.0), contrastive_bridge_score),
+            topic_consistency=float(signal_report.get("topic_consistency", 0.0) or 0.0),
+            duplicate_risk=float(signal_report.get("duplicate_risk", duplicate_penalty) or 0.0),
+            query_surface_match=float(signal_report.get("query_surface_match", 0.0) or 0.0),
+            uncertainty_hint=float(signal_report.get("uncertainty_hint", 0.0) or 0.0),
+            drift_risk=float(signal_report.get("drift_risk", 0.0) or 0.0),
         )
 
     def _pair_rerank(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> tuple[float, str, dict[str, float]]:
@@ -1507,8 +1509,16 @@ class LogicOrchestrator:
                 *result.evidence_spans,
             ]
         ).lower()
+        evidence_terms = set(tokenize(text))
+        anchor_terms = self._content_terms(anchor)
+        candidate_terms = self._content_terms(candidate)
+        shared_evidence_terms = len(evidence_terms & (anchor_terms | candidate_terms))
         if relation_type == "supporting_evidence":
-            return any(cue in text for cue in SUPPORT_CUES)
+            return (
+                any(cue in text for cue in SUPPORT_CUES)
+                or shared_evidence_terms >= 4
+                or len(evidence_terms & candidate_terms) >= 3
+            )
         if relation_type == "implementation_detail":
             return any(cue in text for cue in DETAIL_CUES) or candidate.title.lower() in self._brief_text(anchor)
         if relation_type == "prerequisite":
@@ -1519,197 +1529,26 @@ class LogicOrchestrator:
             return self._is_argumentative_pair(anchor, candidate) or any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs", "counterargument", "opposing"})
         return False
 
-    def _passes_structural_gate(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result) -> bool:
-        relation_type = result.relation_type
-        if relation_type == "implementation_detail":
-            direction_score = self._implementation_direction_score(anchor, candidate, metrics)
-            stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
-            semantic_detail_bridge = (
-                metrics["dense_score"] >= 0.68
-                and metrics["service_surface_score"] < 0.55
-                and metrics["family_bridge_score"] >= 0.75
-                and metrics["shared_dominant_family"] >= 1.0
-                and direction_score >= 0.08
-                and (
-                    metrics["content_overlap_score"] >= 0.18
-                    or metrics["topic_alignment"] >= 1.0
-                    or metrics["mention_score"] >= 0.18
-                )
-            )
-            stage_detail_bridge = (
-                self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-                and (
-                    (
-                        metrics["service_surface_score"] < 0.55
-                        and (
-                            metrics["topic_alignment"] >= 1.0
-                            or metrics["content_overlap_score"] >= 0.14
-                            or metrics["mention_score"] >= 0.16
-                        )
-                    )
-                    or (
-                        stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
-                        and metrics["family_bridge_score"] >= 0.9
-                        and (
-                            metrics["topic_alignment"] >= 1.0
-                            or metrics["content_overlap_score"] >= 0.2
-                            or metrics["mention_score"] >= 0.08
-                        )
-                    )
-                )
-            )
-            return (
-                metrics["mention_score"] >= 0.3
-                or metrics["role_listing_score"] >= 0.55
-                or (metrics["overlap_score"] >= 0.6 and metrics["dense_score"] >= 0.55)
-                or semantic_detail_bridge
-                or stage_detail_bridge
-            )
-        if relation_type == "supporting_evidence":
-            evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
-            stage_supported = (
-                self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-                and metrics["service_surface_score"] < 0.5
-                and (
-                    metrics["content_overlap_score"] >= 0.12
-                    or metrics["mention_score"] >= 0.14
-                    or metrics["topic_alignment"] >= 1.0
-                )
-            )
-            scientific_supported = (
-                self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
-                and self._doc_stage(candidate) == self._doc_stage(anchor)
-                and metrics["service_surface_score"] < 0.45
-                and metrics["dense_score"] >= 0.52
-                and (
-                    metrics["topic_cluster_match"] >= 1.0
-                    or metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.14
-                    or evidence_bridge_strength >= 0.56
-                )
-            )
-            return (
-                metrics["service_surface_score"] < 0.35
-                and metrics["dense_score"] >= 0.58
-                and (
-                    metrics["mention_score"] >= 0.18
-                    or metrics["content_overlap_score"] >= 0.18
-                    or metrics["family_bridge_score"] >= 0.42
-                )
-            ) or stage_supported or scientific_supported
-        if relation_type == "prerequisite":
-            return metrics["specific_role_score"] >= 0.5 and (
-                metrics["role_listing_score"] >= 0.5
-                or (metrics["mention_score"] >= 0.28 and metrics["dense_score"] >= 0.52)
-                or (self._workflow_prerequisite_signal(anchor, candidate, metrics) and metrics["dense_score"] >= 0.5)
-            )
-        if relation_type == "comparison":
-            argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
-            argument_topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
-            return (
-                argument_topic_consistency >= 0.58
-                and (
-                    (
-                        metrics["stance_contrast"] >= 1.0
-                        and (
-                            metrics["dense_score"] >= 0.18
-                            or metrics["content_overlap_score"] >= 0.12
-                            or metrics["overlap_score"] >= 0.18
-                        )
-                    )
-                    or metrics["content_overlap_score"] >= 0.22
-                    or metrics["overlap_score"] >= 0.28
-                )
-            ) or (
-                argument_bridge_strength >= 0.52
-                and argument_topic_consistency >= 0.66
-                and (
-                    metrics["stance_contrast"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.24
-                    or metrics["overlap_score"] >= 0.32
-                )
-                and metrics["dense_score"] >= 0.16
-            )
-        if relation_type == "same_concept":
-            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-            evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
-            scientific_supported = (
-                self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
-                and self._doc_stage(candidate) == self._doc_stage(anchor)
-                and metrics["dense_score"] >= 0.54
-                and (
-                    metrics["family_bridge_score"] >= 0.45
-                    or (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0)
-                )
-                and (
-                    metrics["topic_cluster_match"] >= 1.0
-                    or metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.2
-                )
-                and (
-                    metrics["shared_dominant_family"] >= 1.0
-                    or metrics["title_overlap"] >= 2.0
-                    or metrics["entity_overlap"] >= 1.0
-                    or specific_title_bridge >= 1.0
-                )
-                and (
-                    metrics["title_overlap"] >= 1.0
-                    or metrics["mention_score"] >= 0.12
-                    or metrics["content_overlap_score"] >= 0.24
-                    or specific_title_bridge >= 1.0
-                )
-                and not (
-                    methodology_penalty >= 0.55
-                    and metrics["title_overlap"] < 2.0
-                    and metrics["mention_score"] < 0.18
-                )
-            )
-            return scientific_supported or (
-                metrics["dense_score"] >= 0.55
-                and (
-                    metrics["family_bridge_score"] >= 0.45
-                    or (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0)
-                    or specific_title_bridge >= 1.0
-                )
-                and (
-                    metrics["overlap_score"] >= 0.3
-                    or metrics["topic_cluster_match"] >= 1.0
-                    or specific_title_bridge >= 1.0
-                )
-                and not (
-                    methodology_penalty >= 0.42
-                    and metrics["title_overlap"] < 2.0
-                    and metrics["mention_score"] < 0.22
-                )
-                and evidence_bridge_strength >= 0.46
-            )
-        return True
-
     def _relation_threshold(self, relation_type: str) -> RelationQualityConfig:
         return self._edge_quality().relation_thresholds.get(relation_type, RelationQualityConfig())
 
     def _effective_threshold(self, anchor: DocBrief, candidate: DocBrief, relation_type: str) -> RelationQualityConfig:
         threshold = self._relation_threshold(relation_type)
-        if relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
-            if self._argument_bridge_strength(anchor, candidate, self._candidate_metrics(anchor, candidate)) >= 0.62:
-                return RelationQualityConfig(enabled=True, min_confidence=0.76, min_support=0.22, min_evidence_quality=0.26)
-            return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.26, min_evidence_quality=0.28)
-        if relation_type == "same_concept" and self._is_argumentative_pair(anchor, candidate):
-            return RelationQualityConfig(enabled=True, min_confidence=0.82, min_support=0.3, min_evidence_quality=0.28)
-        if self._supports_same_concept_pair(anchor, candidate):
-            if relation_type == "supporting_evidence":
-                if self._evidence_bridge_strength(anchor, candidate, self._candidate_metrics(anchor, candidate)) >= 0.58:
-                    return RelationQualityConfig(enabled=True, min_confidence=0.74, min_support=0.24, min_evidence_quality=0.26)
-                return RelationQualityConfig(enabled=True, min_confidence=0.78, min_support=0.26, min_evidence_quality=0.28)
-            if relation_type == "same_concept":
-                return RelationQualityConfig(enabled=True, min_confidence=0.8, min_support=0.28, min_evidence_quality=0.26)
-        if (
-            relation_type == "supporting_evidence"
-            and "judge" in set(tokenize(anchor.title))
-            and self._doc_stage(candidate) == "ops_revalidation"
-        ):
-            return RelationQualityConfig(enabled=True, min_confidence=0.68, min_support=0.18, min_evidence_quality=0.34)
+        signal_weight = max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate))
+        if relation_type == "comparison":
+            return RelationQualityConfig(
+                enabled=True,
+                min_confidence=max(0.72, threshold.min_confidence - 0.04 * signal_weight),
+                min_support=max(0.18, threshold.min_support - 0.06 * signal_weight),
+                min_evidence_quality=max(0.2, threshold.min_evidence_quality - 0.04 * signal_weight),
+            )
+        if relation_type == "same_concept":
+            return RelationQualityConfig(
+                enabled=True,
+                min_confidence=max(0.74, threshold.min_confidence - 0.03 * signal_weight),
+                min_support=max(0.22, threshold.min_support - 0.04 * signal_weight),
+                min_evidence_quality=max(0.22, threshold.min_evidence_quality - 0.03 * signal_weight),
+            )
         return threshold
 
     def _is_live_provider(self) -> bool:
@@ -1721,18 +1560,6 @@ class LogicOrchestrator:
         if provider is None:
             return 1.0
         return float(getattr(provider, "relation_priors", {}).get(relation_type, 1.0))
-
-    def _make_fallback_result(self, anchor: DocBrief, candidate: DocBrief, relation_type: str, confidence: float, reason: str, support_score: float):
-        return SimpleNamespace(
-            accepted=True,
-            relation_type=relation_type,
-            confidence=confidence,
-            evidence_spans=[anchor.summary[:160], candidate.summary[:160]],
-            rationale=reason,
-            support_score=support_score,
-            contradiction_flags=[],
-            decision_reason="Accepted by local fallback after strong lexical and structural match.",
-        )
 
     def _merge_spans(self, *groups: list[str]) -> list[str]:
         merged: list[str] = []
@@ -1766,270 +1593,76 @@ class LogicOrchestrator:
         model_relation = result.relation_type if result.relation_type in RELATION_TYPES else signal_bundle.best_relation
         reviewer_relation = review_result.relation_type if review_result.relation_type in RELATION_TYPES else model_relation
         best_relation = signal_bundle.best_relation if signal_bundle.best_relation in RELATION_TYPES else model_relation
-        local_strength = 0.56 * signal_bundle.utility_score + 0.44 * signal_bundle.local_support
-        risk_flags = set(signal_bundle.risk_flags)
-        model_accepts = bool(result.accepted)
-        reviewer_accepts = bool(review_result.accepted)
-        reviewer_uncertain = float(getattr(review_result, "uncertainty", 0.0)) >= 0.55
-        reviewer_veto = (
-            not reviewer_accepts
-            and not reviewer_uncertain
-            and (
-                {"service_surface", "foundational_support"} & risk_flags
-                or ("weak_direction" in risk_flags and model_relation == "implementation_detail")
-            )
+        hard_risks = {"service_surface", "foundational_support"}
+        risk_flags = {str(flag) for flag in signal_bundle.risk_flags}
+        reviewer_priority = bool(review_result.accepted) and (
+            float(getattr(review_result, "utility_score", 0.0)) >= max(0.38, float(getattr(result, "utility_score", 0.0)) - 0.1)
+            or float(review_result.confidence) >= max(0.74, float(result.confidence) - 0.06)
         )
-
-        resolved_relation = model_relation
-        if reviewer_relation in RELATION_TYPES and fit_scores.get(reviewer_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) - 0.04:
-            resolved_relation = reviewer_relation
-        elif best_relation in RELATION_TYPES and fit_scores.get(best_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) + 0.08:
+        chosen = review_result if reviewer_priority else result
+        resolved_relation = reviewer_relation if reviewer_priority else model_relation
+        if (
+            not reviewer_priority
+            and best_relation in RELATION_TYPES
+            and fit_scores.get(best_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) + 0.1
+        ):
             resolved_relation = best_relation
 
-        argumentative_contrast_bridge = (
-            resolved_relation == "comparison"
-            and self._is_argumentative_pair(anchor, candidate)
-            and (
-                metrics.get("topic_family_match", 0.0) >= 1.0
-                or metrics.get("topic_cluster_match", 0.0) >= 1.0
-            )
-            and (
-                metrics.get("stance_contrast", 0.0) >= 1.0
-                or self._has_contrastive_verdict_signal(result, review_result)
-            )
-            and max(
-                signal_bundle.utility_score,
-                float(getattr(result, "utility_score", 0.0)),
-                float(getattr(review_result, "utility_score", 0.0)),
-            )
-            >= 0.72
-            and not ({"service_surface", "foundational_support"} & risk_flags)
+        utility_score = max(
+            signal_bundle.utility_score,
+            float(getattr(result, "utility_score", 0.0)),
+            float(getattr(review_result, "utility_score", 0.0)),
         )
-
-        accepted = model_accepts
-        rescued_by_reviewer = False
-        rescued_by_utility = False
-        if model_accepts and reviewer_accepts:
-            accepted = True
-        elif model_accepts and not reviewer_accepts:
-            accepted = not reviewer_veto and reviewer_uncertain and local_strength >= 0.48 and fit_scores.get(model_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.08
-        elif not model_accepts and reviewer_accepts:
-            accepted = (
-                float(review_result.confidence) >= 0.82
-                and max(signal_bundle.utility_score, float(getattr(review_result, "utility_score", 0.0))) >= 0.42
-                and not ({"service_surface", "foundational_support"} & risk_flags)
-                and fit_scores.get(resolved_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.06
-            )
-            if (
-                not accepted
-                and argumentative_contrast_bridge
-                and float(review_result.confidence) >= 0.76
-                and fit_scores.get(resolved_relation, 0.0) >= max(0.42, max(fit_scores.values(), default=0.0) - 0.14)
-            ):
-                accepted = True
-            rescued_by_reviewer = accepted
-        else:
-            rescue_relation = reviewer_relation if reviewer_relation in RELATION_TYPES else best_relation
-            if (
-                best_relation in RELATION_TYPES
-                and fit_scores.get(best_relation, 0.0) >= fit_scores.get(rescue_relation, 0.0) + 0.08
-            ):
-                rescue_relation = best_relation
-            if (
-                best_relation == "same_concept"
-                and self._supports_same_concept_pair(anchor, candidate)
-                and fit_scores.get("same_concept", 0.0) >= max(0.58, fit_scores.get(rescue_relation, 0.0))
-            ):
-                rescue_relation = "same_concept"
-            rescue_utility = max(
-                signal_bundle.utility_score,
-                float(getattr(result, "utility_score", 0.0)),
-                float(getattr(review_result, "utility_score", 0.0)),
-            )
-            accepted = (
-                rescue_relation in {"same_concept", "comparison", "supporting_evidence"}
-                and fit_scores.get(rescue_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.08
-                and local_strength >= 0.44
-                and rescue_utility >= 0.72
-                and not ({"service_surface", "foundational_support"} & risk_flags)
-                and not (
-                    rescue_relation == "supporting_evidence"
-                    and "weak_direction" in risk_flags
-                )
-            )
-            rescued_by_utility = accepted
-            if rescued_by_utility:
-                resolved_relation = rescue_relation
-
-        if not accepted:
-            return SimpleNamespace(
-                accepted=False,
-                relation_type=resolved_relation,
-                confidence=max(0.0, min(0.78, 0.5 * float(result.confidence) + 0.5 * float(review_result.confidence))),
-                evidence_spans=self._merge_spans(result.evidence_spans, getattr(review_result, "evidence_spans", [])),
-                rationale=(getattr(review_result, "rationale", "") or result.rationale)[:200],
-                support_score=max(float(getattr(result, "support_score", 0.0)), float(getattr(review_result, "support_score", 0.0))),
-                contradiction_flags=self._merge_spans(
-                    [str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
-                    [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
-                ),
-                decision_reason=(
-                    f"Consensus rejection after judge/reviewer cross-check. "
-                    f"judge={model_relation}:{float(result.confidence):.2f}, "
-                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
-                )[:200],
-                semantic_relation_label=str(getattr(review_result, "semantic_relation_label", resolved_relation))[:80],
-                canonical_relation="none",
-                utility_score=max(
-                    signal_bundle.utility_score * 0.6,
-                    0.5 * float(getattr(result, "utility_score", 0.0)) + 0.5 * float(getattr(review_result, "utility_score", 0.0)),
-                ),
-                uncertainty=min(1.0, 0.5 * float(getattr(result, "uncertainty", 0.0)) + 0.5 * float(getattr(review_result, "uncertainty", 0.0)) + 0.15),
-            )
-
-        if rescued_by_reviewer:
-            confidence = (
-                0.72 * float(review_result.confidence)
-                + 0.12 * fit_scores.get(resolved_relation, 0.0)
-                + 0.16 * max(signal_bundle.utility_score, signal_bundle.local_support)
-            )
-            confidence = max(confidence, 0.84 + 0.06 * fit_scores.get(resolved_relation, 0.0))
-            support_score = max(
-                float(getattr(review_result, "support_score", 0.0)),
-                0.65 * float(getattr(review_result, "support_score", 0.0)) + 0.35 * signal_bundle.local_support,
-            )
-            utility_score = max(
-                signal_bundle.utility_score,
-                0.25 * float(getattr(result, "utility_score", 0.0)) + 0.75 * float(getattr(review_result, "utility_score", 0.0)),
-            )
-        elif rescued_by_utility:
-            confidence = max(
-                0.82,
-                0.22 * float(result.confidence)
-                + 0.28 * float(review_result.confidence)
-                + 0.18 * fit_scores.get(resolved_relation, 0.0)
-                + 0.32 * max(signal_bundle.utility_score, signal_bundle.local_support),
-            )
-            support_score = max(
-                signal_bundle.local_support,
-                0.35 * float(getattr(result, "support_score", 0.0)) + 0.65 * float(getattr(review_result, "support_score", 0.0)),
-            )
-            utility_score = max(
-                signal_bundle.utility_score,
-                0.2 * float(getattr(result, "utility_score", 0.0)) + 0.8 * float(getattr(review_result, "utility_score", 0.0)),
-            )
-        else:
-            confidence = (
-                0.44 * float(result.confidence)
-                + 0.38 * float(review_result.confidence)
-                + 0.18 * fit_scores.get(resolved_relation, 0.0)
-                - (0.06 if model_relation != reviewer_relation and reviewer_accepts and model_accepts else 0.0)
-            )
-            support_score = max(
-                float(getattr(result, "support_score", 0.0)),
-                0.5 * float(getattr(result, "support_score", 0.0)) + 0.5 * float(getattr(review_result, "support_score", 0.0)),
-                signal_bundle.local_support,
-            )
-            utility_score = max(
-                signal_bundle.utility_score,
-                0.45 * float(getattr(result, "utility_score", 0.0)) + 0.55 * float(getattr(review_result, "utility_score", 0.0)),
-            )
+        support_score = max(
+            signal_bundle.local_support,
+            float(getattr(result, "support_score", 0.0)),
+            float(getattr(review_result, "support_score", 0.0)),
+        )
+        confidence = max(
+            0.0,
+            min(
+                0.99,
+                0.4 * float(result.confidence)
+                + 0.45 * float(review_result.confidence)
+                + 0.15 * fit_scores.get(resolved_relation, 0.0),
+            ),
+        )
         uncertainty = min(
             1.0,
-            0.45 * float(getattr(result, "uncertainty", max(0.0, 1.0 - float(result.confidence))))
-            + 0.55 * float(getattr(review_result, "uncertainty", max(0.0, 1.0 - float(review_result.confidence))))
-            + (0.06 if model_relation != reviewer_relation else 0.0),
+            0.4 * float(getattr(result, "uncertainty", max(0.0, 1.0 - float(result.confidence))))
+            + 0.45 * float(getattr(review_result, "uncertainty", max(0.0, 1.0 - float(review_result.confidence))))
+            + 0.15 * float(signal_bundle.uncertainty_hint),
         )
+        accepted = bool(chosen.accepted)
+        if reviewer_priority and utility_score >= 0.42 and fit_scores.get(resolved_relation, 0.0) >= 0.2:
+            accepted = True
+        if hard_risks & risk_flags and utility_score < 0.72:
+            accepted = False
+        if signal_bundle.drift_risk >= 0.72 and signal_bundle.topic_consistency < 0.3:
+            accepted = False
+        if fit_scores.get(resolved_relation, 0.0) < 0.18:
+            accepted = False
+
         return SimpleNamespace(
-            accepted=True,
+            accepted=accepted,
             relation_type=resolved_relation,
-            confidence=max(0.0, min(confidence, 0.99)),
+            confidence=confidence,
             evidence_spans=self._merge_spans(result.evidence_spans, getattr(review_result, "evidence_spans", [])),
-            rationale=(getattr(review_result, "rationale", "") or result.rationale)[:200],
+            rationale=(getattr(chosen, "rationale", "") or getattr(review_result, "rationale", "") or result.rationale)[:200],
             support_score=max(0.0, min(1.0, support_score)),
             contradiction_flags=self._merge_spans(
                 [str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
                 [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
             ),
             decision_reason=(
-                (
-                    f"Utility recovery kept {resolved_relation}. "
-                    f"judge={model_relation}:{float(result.confidence):.2f}, "
-                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
-                    if rescued_by_utility
-                    else f"Consensus edge review kept {resolved_relation}. "
-                    f"judge={model_relation}:{float(result.confidence):.2f}, "
-                    f"reviewer={reviewer_relation}:{float(review_result.confidence):.2f}."
-                )
+                "reviewer-led consensus"
+                if reviewer_priority
+                else "judge-led consensus"
             )[:200],
-            semantic_relation_label=str(getattr(review_result, "semantic_relation_label", getattr(result, "semantic_relation_label", resolved_relation)))[:80],
-            canonical_relation=resolved_relation,
+            semantic_relation_label=str(getattr(chosen, "semantic_relation_label", resolved_relation) or resolved_relation)[:80],
+            canonical_relation=resolved_relation if accepted else "none",
             utility_score=max(0.0, min(1.0, utility_score)),
             uncertainty=uncertainty,
-        )
-
-    def _verdict_text(self, *results) -> str:
-        parts: list[str] = []
-        for result in results:
-            if result is None:
-                continue
-            parts.extend(
-                [
-                    str(getattr(result, "relation_type", "")),
-                    str(getattr(result, "semantic_relation_label", "")),
-                    str(getattr(result, "canonical_relation", "")),
-                    str(getattr(result, "decision_reason", "")),
-                    str(getattr(result, "rationale", "")),
-                    *[str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
-                    *[str(span) for span in getattr(result, "evidence_spans", []) or []],
-                ]
-            )
-        return " ".join(part for part in parts if part).lower()
-
-    def _has_contrastive_verdict_signal(self, *results) -> bool:
-        text = self._verdict_text(*results)
-        return any(cue in text for cue in ARGUMENT_CONTRAST_VERDICT_CUES)
-
-    def _preserve_reviewed_comparison_bridge(
-        self,
-        anchor: DocBrief,
-        candidate: DocBrief,
-        result,
-        review_result,
-        final_result,
-        fallback,
-        metrics: dict[str, float],
-        fit_scores: dict[str, float],
-    ) -> bool:
-        if final_result is None:
-            return False
-        if not getattr(final_result, "accepted", False):
-            return False
-        if getattr(final_result, "relation_type", "") != "comparison":
-            return False
-        if not self._is_argumentative_pair(anchor, candidate):
-            return False
-        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
-        contrastive_reuse = self._contrastive_argument_reuse(anchor, candidate, metrics)
-        utility_score = max(
-            float(getattr(result, "utility_score", 0.0)),
-            float(getattr(review_result, "utility_score", 0.0)) if review_result is not None else 0.0,
-            float(getattr(final_result, "utility_score", 0.0)),
-        )
-        contrast_signal = (
-            contrastive_reuse >= 0.56
-            or self._has_contrastive_verdict_signal(result, review_result, final_result)
-        )
-        comparison_fit = fit_scores.get("comparison", 0.0)
-        weaker_relations = max(
-            fit_scores.get("supporting_evidence", 0.0),
-            fit_scores.get("same_concept", 0.0),
-        )
-        return (
-            topic_consistency >= 0.58
-            and contrast_signal
-            and utility_score >= 0.42
-            and comparison_fit >= max(0.52, weaker_relations - 0.06)
         )
 
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
@@ -2412,573 +2045,75 @@ class LogicOrchestrator:
                 selected_clusters.add(cluster)
         return selected_ids
 
-    def _local_relation_override(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], result):
-        anchor_text = self._brief_text(anchor)
-        candidate_text = self._brief_text(candidate)
-        direct_title_link = candidate.title.lower() in anchor_text or anchor.title.lower() in candidate_text
-        _, _, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-        if (
-            self._doc_stage(anchor) == "agent_roles"
-            and self._has_listing_context(anchor) >= 1.0
-            and metrics["specific_role_score"] >= 0.5
-            and fit_scores["prerequisite"] >= 0.72
-            and metrics["role_listing_score"] >= 0.5
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "prerequisite",
-                confidence=max(0.9, float(getattr(result, "confidence", 0.0))),
-                reason="Anchor enumerates specialized roles and candidate is one listed role.",
-                support_score=min(0.95, metrics["local_support"] + 0.18),
-            )
-        if (
-            self._doc_stage(anchor) == "agent_roles"
-            and self._workflow_prerequisite_signal(anchor, candidate, metrics)
-            and fit_scores["prerequisite"] >= 0.74
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "prerequisite",
-                confidence=max(0.9, float(getattr(result, "confidence", 0.0))),
-                reason="Candidate is the next explicit workflow role implied by the anchor's ordering cues.",
-                support_score=min(0.9, metrics["local_support"] + 0.16),
-            )
-        if (
-            self._doc_stage(anchor) == "eval_metrics"
-            and self._doc_stage(candidate) == "eval_report"
-            and metrics["service_surface_score"] < 0.45
-            and (
-                fit_scores["implementation_detail"] >= 0.46
-                or fit_scores["same_concept"] >= 0.56
-            )
-            and (
-                metrics["topic_alignment"] >= 1.0
-                or metrics["content_overlap_score"] >= 0.22
-                or metrics["mention_score"] >= 0.16
-            )
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "implementation_detail",
-                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                reason="The benchmark reporting document is the concrete reporting component that operationalizes the metric summary described by the anchor.",
-                support_score=min(0.9, metrics["local_support"] + 0.1),
-            )
-        if (
-            metrics["service_surface_score"] < 0.55
-            and fit_scores["implementation_detail"] >= 0.6
-            and (
-                (direct_title_link and metrics["mention_score"] >= 0.28 and any(cue in candidate_text or cue in anchor_text for cue in DETAIL_CUES))
-                or (
-                    metrics["dense_score"] >= 0.68
-                    and metrics["family_bridge_score"] >= 0.75
-                    and metrics["shared_dominant_family"] >= 1.0
-                    and self._implementation_direction_score(anchor, candidate, metrics) >= 0.08
-                    and (
-                        metrics["content_overlap_score"] >= 0.18
-                        or metrics["topic_alignment"] >= 1.0
-                        or metrics["mention_score"] >= 0.18
-                    )
-                )
-            )
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "implementation_detail",
-                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
-                reason="Anchor and candidate share a high-confidence mechanism or component-level semantic match.",
-                support_score=min(0.92, metrics["local_support"] + 0.12),
-            )
-        if (
-            self._doc_stage(anchor) == "agent_overview"
-            and self._doc_stage(candidate) == "agent_memory"
-            and metrics["service_surface_score"] < 0.45
-            and fit_scores["implementation_detail"] >= 0.58
-            and (
-                metrics["topic_alignment"] >= 1.0
-                or metrics["content_overlap_score"] >= 0.16
-                or metrics["mention_score"] >= 0.2
-            )
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "implementation_detail",
-                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
-                reason="The overview explicitly covers the persistent memory subsystem used by the agent runtime.",
-                support_score=min(0.9, metrics["local_support"] + 0.1),
-            )
-        if (
-            self._doc_stage(anchor) in {"ops_overview", "ops_service"}
-            and self._doc_stage(candidate) == "ops_registry"
-            and fit_scores["implementation_detail"] >= 0.58
-            and (
-                (
-                    metrics["service_surface_score"] < 0.55
-                    and (
-                        metrics["topic_alignment"] >= 1.0
-                        or metrics["content_overlap_score"] >= 0.16
-                        or metrics["mention_score"] >= 0.18
-                    )
-                )
-                or (
-                    metrics["family_bridge_score"] >= 0.9
-                    and (
-                        metrics["topic_alignment"] >= 1.0
-                        or metrics["content_overlap_score"] >= 0.2
-                        or metrics["mention_score"] >= 0.08
-                    )
-                )
-            )
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "implementation_detail",
-                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
-                reason="The registry is the concrete persistence mechanism used by the jobs or service overview.",
-                support_score=min(0.9, metrics["local_support"] + 0.1),
-            )
-        if (
-            metrics["service_surface_score"] < 0.35
-            and fit_scores["supporting_evidence"] >= 0.45
-            and direct_title_link
-            and metrics["mention_score"] >= 0.28
-            and metrics["content_overlap_score"] >= 0.14
-            and any(cue in candidate_text or cue in anchor_text for cue in SUPPORT_CUES)
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "supporting_evidence",
-                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                reason="Candidate explains or constrains a behavior that the anchor depends on.",
-                support_score=min(0.9, metrics["local_support"] + 0.1),
-            )
-        if (
-            self._doc_stage(anchor) == "logic_graph"
-            and self._doc_stage(candidate) == "retrieval_overview"
-            and fit_scores["supporting_evidence"] >= 0.6
-            and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-            and metrics["dense_score"] >= 0.7
-            and metrics["content_overlap_score"] >= 0.3
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "supporting_evidence",
-                confidence=max(0.86, float(getattr(result, "confidence", 0.0))),
-                reason="The logic overlay graph provides the durable graph layer that the retrieval overview relies on for one-hop logical expansion.",
-                support_score=min(0.9, metrics["local_support"] + 0.1),
-            )
-        if (
-            "judge" in set(tokenize(anchor.title))
-            and self._doc_stage(candidate) == "ops_revalidation"
-            and fit_scores["supporting_evidence"] >= 0.36
-            and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-            and (
-                metrics["content_overlap_score"] >= 0.14
-                or metrics["mention_score"] >= 0.18
-                or metrics["topic_alignment"] >= 1.0
-            )
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "supporting_evidence",
-                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                reason="Revalidation is a downstream verification step that preserves the judge's output quality over time.",
-                support_score=min(0.88, metrics["local_support"] + 0.08),
-            )
-        if (
-            self._is_argumentative_pair(anchor, candidate)
-            and fit_scores["comparison"] >= 0.58
-            and metrics["topic_cluster_match"] >= 1.0
-            and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
-        ):
-            return self._make_fallback_result(
-                anchor,
-                candidate,
-                "comparison",
-                confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                reason="The documents argue about the same topic from contrasting or alternative positions.",
-                support_score=min(0.9, metrics["local_support"] + 0.12),
-            )
-        if (
-            self._supports_same_concept_pair(anchor, candidate)
-            and metrics["dense_score"] >= 0.58
-            and (
-                metrics["topic_cluster_match"] >= 1.0
-                or metrics["topic_alignment"] >= 1.0
-                or metrics["content_overlap_score"] >= 0.18
-            )
-        ):
-            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-            same_concept_signature = self._has_same_concept_signature(anchor, candidate, metrics)
-            if methodology_penalty >= 0.6 and fit_scores["supporting_evidence"] >= 0.55:
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "supporting_evidence",
-                    confidence=max(0.8, float(getattr(result, "confidence", 0.0)) - 0.04),
-                    reason="The candidate is better treated as supporting evidence because it is a methodological or measurement study within the same scientific topic family.",
-                    support_score=min(0.9, metrics["local_support"] + 0.12),
-                )
-            if (
-                not same_concept_signature
-                and fit_scores["supporting_evidence"] >= 0.52
-                and (
-                    metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.18
-                    or metrics["mention_score"] >= 0.18
-                )
-            ):
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "supporting_evidence",
-                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
-                    reason="The candidate strengthens the same clinical or scientific topic with aligned evidence, but lacks a strong concept-level bridge signature.",
-                    support_score=min(0.9, metrics["local_support"] + 0.12),
-                )
-            if fit_scores["same_concept"] >= max(0.62, fit_scores["supporting_evidence"] + 0.12):
-                if same_concept_signature:
-                    return self._make_fallback_result(
-                        anchor,
-                        candidate,
-                        "same_concept",
-                        confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                        reason="The documents describe the same scientific or clinical finding family with highly aligned evidence and bridge terms.",
-                        support_score=min(0.9, metrics["local_support"] + 0.12),
-                    )
-            if (
-                methodology_penalty >= 0.42
-                and fit_scores["supporting_evidence"] >= max(0.42, fit_scores["same_concept"] - 0.08)
-                and (
-                    metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.18
-                    or metrics["mention_score"] >= 0.16
-                )
-            ):
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "supporting_evidence",
-                    confidence=max(0.8, float(getattr(result, "confidence", 0.0)) - 0.04),
-                    reason="The candidate is a methodological or measurement study that supports the same scientific claim family without being the primary concept match.",
-                    support_score=min(0.9, metrics["local_support"] + 0.12),
-                )
-            if (
-                fit_scores["supporting_evidence"] >= 0.58
-                and fit_scores["supporting_evidence"] >= fit_scores["same_concept"] - 0.06
-                and metrics["topic_alignment"] >= 1.0
-                and metrics["content_overlap_score"] >= 0.22
-            ):
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "supporting_evidence",
-                    confidence=max(0.84, float(getattr(result, "confidence", 0.0))),
-                    reason="The candidate supplies closely related scientific or clinical evidence that can strengthen retrieval for the anchor topic.",
-                    support_score=min(0.92, metrics["local_support"] + 0.14),
-                )
-            if fit_scores["supporting_evidence"] >= fit_scores["same_concept"] + 0.04 and fit_scores["supporting_evidence"] >= 0.48:
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "supporting_evidence",
-                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
-                    reason="The candidate provides closely aligned scientific or clinical evidence for the anchor's claim.",
-                    support_score=min(0.9, metrics["local_support"] + 0.12),
-                )
-            if fit_scores["same_concept"] >= 0.5 and same_concept_signature:
-                return self._make_fallback_result(
-                    anchor,
-                    candidate,
-                    "same_concept",
-                    confidence=max(0.82, float(getattr(result, "confidence", 0.0))),
-                    reason="The documents describe the same scientific or clinical finding family with highly aligned evidence.",
-                    support_score=min(0.88, metrics["local_support"] + 0.1),
-                )
-        return None
-
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result, review_result=None) -> CandidateAssessment:
         metrics = self._candidate_metrics(anchor, candidate)
         rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
         signal_bundle = self._signal_bundle(anchor, candidate, metrics, fit_scores, rerank_relation)
         final_result = self._review_consensus_result(anchor, candidate, result, review_result, metrics, fit_scores, signal_bundle)
-        fallback = self._local_relation_override(anchor, candidate, metrics, final_result)
-        preserve_comparison_bridge = self._preserve_reviewed_comparison_bridge(
-            anchor,
-            candidate,
-            result,
-            review_result,
-            final_result,
-            fallback,
-            metrics,
-            fit_scores,
-        )
-        if fallback is not None:
-            force_override = (
-                fallback.relation_type == "prerequisite"
-                and (
-                    (metrics["specific_role_score"] >= 0.5 and fit_scores["prerequisite"] >= 0.72)
-                    or self._workflow_prerequisite_signal(anchor, candidate, metrics)
-                )
-            )
-            detail_override = (
-                fallback.relation_type == "implementation_detail"
-                and metrics["dense_score"] >= 0.68
-                and (
-                    (
-                        metrics["service_surface_score"] < 0.55
-                        and (
-                            metrics["topic_alignment"] >= 1.0
-                            or metrics["content_overlap_score"] >= 0.18
-                            or metrics["mention_score"] >= 0.18
-                        )
-                    )
-                    or (
-                        (self._doc_stage(anchor), self._doc_stage(candidate)) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
-                        and metrics["family_bridge_score"] >= 0.9
-                        and (
-                            metrics["topic_alignment"] >= 1.0
-                            or metrics["content_overlap_score"] >= 0.2
-                            or metrics["mention_score"] >= 0.08
-                        )
-                    )
-                )
-                and (
-                    not result.accepted
-                    or result.relation_type in {"same_concept", "comparison", "prerequisite", "supporting_evidence"}
-                    or float(result.confidence) < 0.88
-                    or bool(getattr(result, "contradiction_flags", None))
-                )
-            )
-            if (
-                force_override
-                or detail_override
-                or not result.accepted
-                or result.relation_type in {"same_concept", "comparison"}
-                or (
-                    fallback.relation_type == "prerequisite"
-                    and float(result.confidence) < 0.9
-                )
-                or float(result.confidence) < 0.84
-            ) and not preserve_comparison_bridge:
-                final_result = fallback
 
         if not final_result.accepted:
             return CandidateAssessment(candidate.doc_id, False, "model_rejected", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
         if final_result.relation_type not in RELATION_TYPES:
             return CandidateAssessment(candidate.doc_id, False, "unsupported_relation", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
-        if (
-            self._is_live_provider()
-            and final_result.relation_type in {"same_concept", "comparison"}
-            and not (
-                (final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate))
-                or (final_result.relation_type == "same_concept" and self._supports_same_concept_pair(anchor, candidate))
-            )
-        ):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
         model_support = max(0.0, min(float(getattr(final_result, "support_score", 0.0)), 1.0))
         reviewer_support = max(0.0, min(float(getattr(review_result, "support_score", model_support)) if review_result is not None else model_support, 1.0))
-        if review_result is not None and review_result.accepted and not result.accepted:
-            blended_support = 0.5 * metrics["local_support"] + 0.5 * max(model_support, reviewer_support)
-        else:
-            blended_support = 0.7 * metrics["local_support"] + 0.3 * max(model_support, reviewer_support)
+        blended_support = 0.55 * metrics["local_support"] + 0.45 * max(model_support, reviewer_support)
         model_utility = max(0.0, min(float(getattr(final_result, "utility_score", 0.0)), 1.0))
         reviewer_utility = max(0.0, min(float(getattr(review_result, "utility_score", model_utility)) if review_result is not None else model_utility, 1.0))
-        if review_result is not None and review_result.accepted and not result.accepted:
-            blended_utility = max(signal_bundle.utility_score, 0.4 * signal_bundle.utility_score + 0.6 * max(model_utility, reviewer_utility))
-        else:
-            blended_utility = max(signal_bundle.utility_score, 0.6 * signal_bundle.utility_score + 0.4 * max(model_utility, reviewer_utility))
+        blended_utility = max(signal_bundle.utility_score, 0.45 * signal_bundle.utility_score + 0.55 * max(model_utility, reviewer_utility))
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
         threshold = self._effective_threshold(anchor, candidate, final_result.relation_type)
-        anchor_stage = self._doc_stage(anchor)
-        candidate_stage = self._doc_stage(candidate)
-
-        if (
-            final_result.relation_type == "implementation_detail"
-            and ({anchor_stage, candidate_stage} & {"eval_metrics", "eval_report"})
-            and (anchor_stage, candidate_stage) != ("eval_metrics", "eval_report")
-        ):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if metrics["topic_drift"] >= 1.0 and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+        hard_risks = {str(flag) for flag in signal_bundle.risk_flags}
+        if signal_bundle.drift_risk >= 0.72 and signal_bundle.topic_consistency < 0.3:
             return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if not threshold.enabled and not self._relation_cues(anchor, candidate, final_result):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if not self._relation_cues(anchor, candidate, final_result):
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type == "implementation_detail"
-            and self._doc_stage(anchor) == "agent_roles"
-            and self._doc_stage(candidate) == "agent_memory"
-            and metrics["specific_role_score"] < 0.5
-            and metrics["mention_score"] < 0.35
-        ):
+        if fit_scores.get(final_result.relation_type, 0.0) < 0.18:
             return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "implementation_detail" and fit_scores["implementation_detail"] + 0.04 < max(fit_scores["supporting_evidence"], fit_scores["prerequisite"]):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type == "supporting_evidence"
-            and self._doc_stage(anchor) == "agent_roles"
-            and self._doc_stage(candidate) == "agent_roles"
-            and set(tokenize(anchor.title)) & SPECIFIC_ROLE_TERMS
-            and self._has_listing_context(candidate) >= 1.0
-        ):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "supporting_evidence" and fit_scores["supporting_evidence"] < 0.25:
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "prerequisite" and fit_scores["prerequisite"] < 0.38:
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "comparison" and fit_scores["comparison"] < 0.4:
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type == "same_concept"
-            and self._supports_same_concept_pair(anchor, candidate)
-            and self._bridge_information_gain(anchor, candidate) < 0.52
-            and not self._high_utility_same_concept_bridge(
-                anchor,
-                candidate,
-                metrics,
-                blended_support=blended_support,
-                blended_utility=blended_utility,
-            )
-        ):
-            return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
-            and self._near_duplicate_penalty(anchor, candidate, metrics) >= 0.38
-            and self._bridge_information_gain(anchor, candidate) < 0.62
-            and not (
-                final_result.relation_type == "comparison"
-                and (
-                    self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.56
-                    or preserve_comparison_bridge
-                )
-            )
-        ):
+        if {"service_surface", "foundational_support"} & hard_risks and blended_utility < 0.72:
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type in {"supporting_evidence", "comparison", "same_concept"}
-            and self._is_effective_duplicate(anchor, candidate, metrics)
-            and not (
-                final_result.relation_type == "comparison"
-                and (
-                    self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6
-                    or preserve_comparison_bridge
-                )
-            )
-        ):
+        if signal_bundle.duplicate_risk >= 0.62 and signal_bundle.bridge_gain < 0.34:
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if not self._passes_structural_gate(anchor, candidate, metrics, final_result):
-            return CandidateAssessment(candidate.doc_id, False, "weak_link", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "implementation_detail":
-            direction_score = self._implementation_direction_score(anchor, candidate, metrics)
-            stage_driven_detail = (
-                (
-                    anchor_stage in {"ops_overview", "ops_service"}
-                    and candidate_stage == "ops_registry"
-                )
-                or (
-                    anchor_stage == "eval_metrics"
-                    and candidate_stage == "eval_report"
-                )
-            ) and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-            if direction_score < 0.08 and not stage_driven_detail:
-                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-            if self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) < -0.08:
-                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if final_result.relation_type == "supporting_evidence":
-            if self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) < -0.08:
-                return CandidateAssessment(candidate.doc_id, False, "wrong_direction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if (
-            final_result.relation_type == "comparison"
-            and self._is_argumentative_pair(anchor, candidate)
-            and (
-                self._argument_bridge_strength(anchor, candidate, metrics) < 0.52
-                or self._argument_topic_consistency(anchor, candidate, metrics) < 0.58
-                or (
-                    metrics["topic_cluster_match"] < 1.0
-                    and self._argument_topic_consistency(anchor, candidate, metrics) < 0.6
-                )
-            )
-        ):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
             return CandidateAssessment(candidate.doc_id, False, "low_support", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if self._is_live_provider() and blended_utility < 0.24:
-            if not (
-                (
-                    final_result.relation_type == "supporting_evidence"
-                    and "judge" in set(tokenize(anchor.title))
-                    and self._doc_stage(candidate) == "ops_revalidation"
-                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-                )
-                or (
-                    final_result.relation_type == "implementation_detail"
-                    and (anchor_stage, candidate_stage) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
-                    and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-                )
-                or (
-                    final_result.relation_type == "supporting_evidence"
-                    and (anchor_stage, candidate_stage) == ("logic_graph", "retrieval_overview")
-                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-                )
-            ):
-                return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if blended_utility < 0.24:
+            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if evidence_quality < threshold.min_evidence_quality:
             return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if getattr(final_result, "contradiction_flags", None):
-            if not (
-                preserve_comparison_bridge
-                or
-                (
-                    final_result.relation_type == "implementation_detail"
-                    and (anchor_stage, candidate_stage) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}
-                    and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-                )
-                or (
-                    final_result.relation_type == "supporting_evidence"
-                    and (anchor_stage, candidate_stage) == ("logic_graph", "retrieval_overview")
-                    and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-                )
-            ):
-                return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if getattr(final_result, "contradiction_flags", None) and not bool(review_result and review_result.accepted):
+            return CandidateAssessment(candidate.doc_id, False, "contradiction", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
 
-        bridge_gain = self._bridge_information_gain(anchor, candidate)
+        bridge_gain = signal_bundle.bridge_gain
         score = final_result.confidence * max(blended_support, 0.01) * max(evidence_quality, 0.01) * self._relation_prior(final_result.relation_type)
-        score *= 1.0 + 0.16 * fit_scores.get(final_result.relation_type, rerank_score)
-        score *= 0.85 + 0.4 * blended_utility
-        score *= 0.9 + 0.25 * bridge_gain
-        if final_result.relation_type == "implementation_detail":
-            score *= 1.0 + max(self._implementation_direction_score(anchor, candidate, metrics), 0.0)
-        if final_result.relation_type == "same_concept" and self._supports_same_concept_pair(anchor, candidate):
-            methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-            score *= 1.0 + 0.18 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.6)
-            score *= max(0.72, 1.0 - 0.28 * methodology_penalty)
-            score *= 0.92 + 0.22 * bridge_gain
-        if final_result.relation_type == "comparison" and self._is_argumentative_pair(anchor, candidate):
-            score *= 1.0 + 0.12 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), 0.5)
-        if (
-            final_result.relation_type == "supporting_evidence"
-            and self._doc_stage(anchor) == "logic_graph"
-            and self._doc_stage(candidate) == "retrieval_overview"
-        ):
-            score *= 1.22
+        score *= 0.84 + 0.32 * fit_scores.get(final_result.relation_type, rerank_score)
+        score *= 0.82 + 0.36 * blended_utility
+        score *= 0.86 + 0.28 * bridge_gain
+        score *= 0.88 + 0.2 * signal_bundle.topic_consistency
+        score *= 0.9 + 0.1 * max(0.0, 1.0 - signal_bundle.duplicate_risk)
         edge_confidence = final_result.confidence
-        if final_result.relation_type == "same_concept" and self._supports_same_concept_pair(anchor, candidate):
-            edge_confidence *= max(0.72, 1.0 - 0.22 * self._same_concept_methodology_penalty(anchor, candidate))
+        activation_profile = self._signal_runtime.compute_query_activation_profile(
+            anchor,
+            candidate,
+            final_result.relation_type,
+            local_signals={
+                **metrics,
+                "topic_consistency": signal_bundle.topic_consistency,
+                "duplicate_risk": signal_bundle.duplicate_risk,
+                "bridge_information_gain": bridge_gain,
+                "query_surface_match": signal_bundle.query_surface_match,
+                "utility_score": blended_utility,
+                "drift_risk": signal_bundle.drift_risk,
+            },
+            verdict={
+                "utility_score": blended_utility,
+                "decision_reason": getattr(final_result, "decision_reason", ""),
+                "rationale": getattr(final_result, "rationale", ""),
+                "contradiction_flags": getattr(final_result, "contradiction_flags", []) or [],
+            },
+        )
         edge = LogicEdge(
             src_doc_id=anchor.doc_id,
             dst_doc_id=candidate.doc_id,
@@ -2990,6 +2125,7 @@ class LogicOrchestrator:
             created_at=DEFAULT_TIMESTAMP,
             last_validated_at=DEFAULT_TIMESTAMP,
             utility_score=max(0.0, min(1.0, blended_utility)),
+            activation_profile=activation_profile,
         )
         return CandidateAssessment(
             candidate_doc_id=candidate.doc_id,
@@ -3157,80 +2293,15 @@ class LogicOrchestrator:
         accepted.sort(key=lambda item: (-item.score, item.candidate_doc_id))
 
         cap = self._edge_quality().max_edges_per_anchor_live if self._is_live_provider() else 4
-        if self._is_live_provider() and any(word in self._brief_text(anchor) for word in LISTING_WORDS):
-            prerequisite_group = [item for item in accepted if item.relation_type == "prerequisite" and item.local_support >= 0.42]
-            if len(prerequisite_group) >= 2:
-                cap = max(cap, min(4, max(3, len(prerequisite_group) + 1)))
-        if self._is_live_provider() and self._doc_stage(anchor) == "agent_overview" and len(accepted) >= 2:
+        if len(accepted) >= 2:
             second = accepted[1]
-            second_candidate = candidate_map.get(second.candidate_doc_id)
             if (
                 accepted[0].score - second.score <= self._edge_quality().second_edge_margin
-                or (
-                    second.relation_type == "implementation_detail"
-                    and second.local_support >= 0.4
-                    and second_candidate is not None
-                    and self._doc_stage(second_candidate) == "agent_memory"
-                )
+                and accepted[0].relation_type != second.relation_type
+                and second.edge is not None
+                and second.edge.utility_score >= 0.5
             ):
-                cap = max(cap, 2)
-        if self._is_live_provider() and self._doc_stage(anchor) == "argument_claim":
-            comparison_group = [item for item in accepted if item.relation_type == "comparison" and item.local_support >= 0.34]
-            if len(comparison_group) >= 2 and comparison_group[0].score - comparison_group[1].score <= self._edge_quality().second_edge_margin + 0.04:
-                cap = max(cap, min(3, len(comparison_group)))
-        if self._is_live_provider() and self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
-            evidence_group = [
-                item
-                for item in accepted
-                if item.relation_type in {"supporting_evidence", "same_concept"} and item.local_support >= 0.3
-            ]
-            same_concept_group = [
-                item
-                for item in evidence_group
-                if item.relation_type == "same_concept"
-                and candidate_map.get(item.candidate_doc_id) is not None
-                and self._same_concept_methodology_penalty(anchor, candidate_map[item.candidate_doc_id]) < 0.45
-            ]
-            support_group = [item for item in evidence_group if item.relation_type == "supporting_evidence"]
-            if same_concept_group:
-                cap = min(cap, 2 + min(1, len(support_group)))
-                top_same = same_concept_group[0]
-                top_candidate = candidate_map.get(top_same.candidate_doc_id)
-                top_specific_terms = self._specific_title_terms(top_candidate) if top_candidate is not None else set()
-                for runner in same_concept_group[1:]:
-                    runner_candidate = candidate_map.get(runner.candidate_doc_id)
-                    runner_specific_terms = self._specific_title_terms(runner_candidate) if runner_candidate is not None else set()
-                    specificity_gap = 1.0
-                    if top_specific_terms and runner_specific_terms:
-                        specificity_gap = 1.0 - (
-                            len(top_specific_terms & runner_specific_terms)
-                            / max(1, len(top_specific_terms | runner_specific_terms))
-                        )
-                    if (
-                        runner.edge is not None
-                        and runner.edge.utility_score >= 0.78
-                        and runner.local_support >= 0.68
-                        and len(runner_specific_terms) >= 3
-                        and specificity_gap >= 0.72
-                    ):
-                        cap = max(cap, 2)
-                        break
-            if len(evidence_group) >= 2 and evidence_group[0].score - evidence_group[1].score <= self._edge_quality().second_edge_margin + 0.05:
-                cap = max(cap, min(3, len(evidence_group)))
-        if self._is_live_provider() and self._doc_stage(anchor) == "logic_graph":
-            support_group = [item for item in accepted if item.relation_type == "supporting_evidence" and item.local_support >= 0.28]
-            if len(support_group) >= 2:
-                cap = max(cap, 2)
-            detail_group = [item for item in accepted if item.relation_type == "implementation_detail" and item.local_support >= 0.38]
-            if detail_group and support_group and (
-                support_group[0].score >= detail_group[0].score - self._edge_quality().second_edge_margin - 0.12
-                or (
-                    support_group[0].evidence_quality >= 0.7
-                    and candidate_map.get(support_group[0].candidate_doc_id) is not None
-                    and self._doc_stage(candidate_map[support_group[0].candidate_doc_id]) == "retrieval_overview"
-                )
-            ):
-                cap = max(cap, 2)
+                cap = max(cap, min(cap + 1, len(accepted)))
 
         kept_ids = {item.candidate_doc_id for item in self._select_diverse_assessments(anchor, accepted, candidate_map, cap)}
         final: list[CandidateAssessment] = []

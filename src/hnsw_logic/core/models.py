@@ -36,6 +36,7 @@ class LogicEdge:
     created_at: str
     last_validated_at: str | None = None
     utility_score: float = 0.0
+    activation_profile: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

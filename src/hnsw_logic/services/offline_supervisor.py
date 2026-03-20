@@ -65,10 +65,6 @@ class OfflineIndexingSupervisor:
             return default
         return value.strip().lower() not in {"0", "false", "no", "off"}
 
-    @staticmethod
-    def _normalize_risk_flag(flag: str) -> str:
-        return str(flag).strip().lower().replace("-", "_").replace(" ", "_")
-
     def _stage_path(self, stage: str, doc_id: str, suffix: str = ".json") -> Path:
         return self.workspace_root / "indexing" / stage / f"{doc_id}{suffix}"
 
@@ -278,68 +274,19 @@ class OfflineIndexingSupervisor:
             check_row = check_rows.get(assessment.candidate_doc_id, {})
             review_keep = bool(review_row.get("keep", True))
             check_keep = bool(check_row.get("keep", True))
-            reviewed_utility = float(review_row.get("reviewed_utility_score", 0.0) or 0.0)
-            risk_penalty = float(check_row.get("risk_penalty", 0.0) or 0.0)
-            risk_flags = {
-                self._normalize_risk_flag(str(flag))
-                for flag in [*review_row.get("risk_flags", []), *check_row.get("risk_flags", [])]
-                if str(flag)
-            }
-            contradiction_like_risks = {
-                flag
-                for flag in risk_flags
-                if flag.startswith("contradict")
-                or flag.startswith("counterargument")
-                or flag.startswith("oppos")
-                or flag.startswith("contrasting")
-                or "contrast" in flag
-                or flag.startswith("alternative_position")
-            }
-            soft_bridge_risks = {"excess_novelty", "weak_family_bridge", "topic_only_overlap", "low_retrieval_utility", "weak_direction"}
-            duplicate_only_comparison_risks = {"near_duplicate", "near_duplicate_bridge"}
-            same_concept_soft_keep = (
-                assessment.edge is not None
-                and assessment.edge.relation_type == "same_concept"
-                and assessment.edge.utility_score >= 0.78
-                and assessment.local_support >= 0.68
-                and assessment.evidence_quality >= 0.84
-                and risk_penalty <= 0.22
-                and risk_flags.issubset(soft_bridge_risks)
-            )
-            comparison_bridge_keep = (
-                assessment.edge is not None
-                and assessment.edge.relation_type == "comparison"
-                and assessment.edge.utility_score >= 0.86
-                and assessment.local_support >= 0.52
-                and assessment.evidence_quality >= 0.76
-                and risk_penalty <= 0.28
-                and risk_flags
-                and (risk_flags - contradiction_like_risks).issubset(duplicate_only_comparison_risks)
-            )
-            rescue_keep = (
-                assessment.accepted
-                and assessment.edge is not None
-                and not ({"service_surface", "foundational_support"} & risk_flags)
-                and (
-                    (
-                        reviewed_utility >= 0.74
-                        and risk_penalty <= 0.18
-                    )
-                    or (
-                        same_concept_soft_keep
-                    )
-                    or (
-                        comparison_bridge_keep
-                    )
-                )
-            )
-            keep = (review_keep and check_keep) or rescue_keep
+            reject_reason = str(
+                review_row.get("decision_reason")
+                or check_row.get("decision_reason")
+                or assessment.reject_reason
+                or "review_rejected"
+            )[:160]
+            keep = review_keep and check_keep
             if not keep:
                 adjusted.append(
                     CandidateAssessment(
                         candidate_doc_id=assessment.candidate_doc_id,
                         accepted=False,
-                        reject_reason=str(review_row.get("decision_reason") or check_row.get("decision_reason") or "review_rejected")[:160],
+                        reject_reason=reject_reason,
                         score=assessment.score,
                         local_support=assessment.local_support,
                         evidence_quality=assessment.evidence_quality,
@@ -353,16 +300,13 @@ class OfflineIndexingSupervisor:
             reviewed_confidence = review_row.get("reviewed_confidence")
             if assessment.edge is not None:
                 if reviewed_utility is not None:
-                    reviewed_utility_value = max(0.0, min(1.0, float(reviewed_utility)))
-                    if rescue_keep and not (review_keep and check_keep) and reviewed_utility_value < max(0.35, next_assessment.edge.utility_score * 0.6):
-                        reviewed_utility_value = next_assessment.edge.utility_score
-                    next_assessment.edge.utility_score = reviewed_utility_value
+                    next_assessment.edge.utility_score = max(0.0, min(1.0, float(reviewed_utility)))
                     next_assessment.score *= 0.85 + 0.35 * next_assessment.edge.utility_score
                 if reviewed_confidence is not None:
                     next_assessment.edge.confidence = max(next_assessment.edge.confidence, float(reviewed_confidence))
-                if rescue_keep and not (review_keep and check_keep):
-                    next_assessment.score *= 0.94
-                    next_assessment.edge.utility_score = max(0.0, min(1.0, next_assessment.edge.utility_score * 0.97))
+                activation_profile = review_row.get("activation_profile")
+                if isinstance(activation_profile, dict) and activation_profile:
+                    next_assessment.edge.activation_profile = dict(activation_profile)
             adjusted.append(next_assessment)
         return self.orchestrator._apply_assessment_cap(anchor, adjusted, {candidate.doc_id: candidate for candidate in candidates})
 

@@ -78,7 +78,6 @@ class LiveReasoningConfig(BaseModel):
     enable_judge_thinking: bool = True
     enable_reviewer_thinking: bool = True
     enable_curator_thinking: bool = True
-    enable_query_strategy_thinking: bool = True
 
 
 class JumpPolicyConfig(BaseModel):

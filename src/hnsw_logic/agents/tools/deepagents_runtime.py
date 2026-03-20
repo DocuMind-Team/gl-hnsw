@@ -21,6 +21,7 @@ from hnsw_logic.agents.runtime_models import (
     ReviewBundle,
     ReviewBundleItem,
 )
+from hnsw_logic.agents.tools.skill_signals import SkillSignalRuntime
 from hnsw_logic.core.models import DocBrief, LogicEdge
 from hnsw_logic.core.utils import read_json, to_jsonable, utc_now, write_json
 
@@ -224,6 +225,7 @@ def build_deepagent_toolsets(
     task_iteration_cap: int,
 ) -> dict[str, dict[str, Callable]]:
     processed_docs_cache: list | None = None
+    signal_runtime = SkillSignalRuntime()
 
     def processed_docs():
         nonlocal processed_docs_cache
@@ -324,6 +326,46 @@ def build_deepagent_toolsets(
                 }
             )[:16],
         }
+
+    def compute_topic_consistency(anchor_doc_id: str, candidate_doc_id: str) -> dict:
+        """Compute a topic-consistency signal report for an anchor/candidate pair via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.compute_topic_consistency(anchor, candidate)
+
+    def compute_duplicate_risk(anchor_doc_id: str, candidate_doc_id: str) -> dict:
+        """Compute duplicate-risk signals for an anchor/candidate pair via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.compute_duplicate_risk(anchor, candidate)
+
+    def compute_bridge_gain(anchor_doc_id: str, candidate_doc_id: str) -> dict:
+        """Compute bridge-gain signals for an anchor/candidate pair via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.compute_bridge_gain(anchor, candidate)
+
+    def compute_contrast_evidence(anchor_doc_id: str, candidate_doc_id: str, verdict: dict | None = None) -> dict:
+        """Compute contrast-evidence signals for an anchor/candidate pair via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.compute_contrast_evidence(anchor, candidate, verdict=verdict)
+
+    def compute_query_activation_profile(anchor_doc_id: str, candidate_doc_id: str, relation_type: str, verdict: dict | None = None) -> dict:
+        """Build an edge activation profile via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.compute_query_activation_profile(anchor, candidate, relation_type, verdict=verdict)
 
     def execute_index_planning(output_path: str = "indexing/plans/indexing_plan.json") -> dict:
         """Generate the offline indexing plan and persist it to the workspace."""
@@ -437,13 +479,28 @@ def build_deepagent_toolsets(
             metrics = orchestrator._candidate_metrics(anchor, candidate)
             _, relation_type, fit_scores = orchestrator._pair_rerank(anchor, candidate, metrics)
             signals = orchestrator._signal_bundle(anchor, candidate, metrics, fit_scores, relation_type)
+            signal_report = signal_runtime.build_signal_report(anchor, candidate, local_signals=to_jsonable(signals))
+            payload_signals = {
+                **to_jsonable(signals),
+                "signal_report": signal_report,
+                "topic_consistency": signal_report.get("topic_consistency", getattr(signals, "topic_consistency", 0.0)),
+                "duplicate_risk": signal_report.get("duplicate_risk", getattr(signals, "duplicate_risk", getattr(signals, "duplicate_penalty", 0.0))),
+                "bridge_gain": signal_report.get("bridge_information_gain", getattr(signals, "bridge_gain", 0.0)),
+                "contrastive_bridge_score": max(
+                    float(signal_report.get("contrast_evidence", 0.0) or 0.0),
+                    float(getattr(signals, "contrastive_bridge_score", 0.0) or 0.0),
+                ),
+                "query_surface_match": signal_report.get("query_surface_match", 0.0),
+                "uncertainty_hint": signal_report.get("uncertainty_hint", 0.0),
+                "drift_risk": signal_report.get("drift_risk", 0.0),
+            }
             items.append(
                 CandidateBundleItem(
                     candidate_doc_id=candidate.doc_id,
                     proposal_reason=proposal.reason,
                     query=proposal.query,
                     score_hint=proposal.score_hint,
-                    signals=to_jsonable(signals),
+                    signals=payload_signals,
                     candidate_brief=to_jsonable(candidate),
                 )
             )
@@ -465,12 +522,15 @@ def build_deepagent_toolsets(
         items = bundle_payload.get("candidates", [])
         from hnsw_logic.embedding.provider import JudgeSignals
 
+        allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
+
         normalized_pairs = []
         for item in items:
             candidate = brief_map().get(item["candidate_doc_id"])
             if candidate is None:
                 continue
-            normalized_pairs.append((candidate, JudgeSignals(**item.get("signals", {}))))
+            signal_payload = {key: value for key, value in item.get("signals", {}).items() if key in allowed_signal_keys}
+            normalized_pairs.append((candidate, JudgeSignals(**signal_payload)))
         verdicts = orchestrator.relation_judge.run_many_with_signals(anchor, normalized_pairs) if normalized_pairs else {}
         bundle = JudgmentBundle(
             anchor_doc_id=anchor_doc_id,
@@ -500,13 +560,15 @@ def build_deepagent_toolsets(
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
         from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
+        allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
 
         prepared: list[tuple[Any, JudgeSignals, JudgeResult]] = []
         for item in judgment_payload.get("judgments", []):
             candidate = brief_map().get(item["candidate_doc_id"])
             if candidate is None:
                 continue
-            signals_obj = JudgeSignals(**item.get("signals", {}))
+            signal_payload = {key: value for key, value in item.get("signals", {}).items() if key in allowed_signal_keys}
+            signals_obj = JudgeSignals(**signal_payload)
             verdict_obj = (
                 orchestrator.relation_judge.provider._verdict_from_payload(item.get("verdict", {}))
                 if hasattr(orchestrator.relation_judge.provider, "_verdict_from_payload")
@@ -522,8 +584,9 @@ def build_deepagent_toolsets(
             signals = item.get("signals", {})
             verdict = item.get("verdict", {})
             metrics = orchestrator._candidate_metrics(anchor, candidate)
-            duplicate_penalty = orchestrator._near_duplicate_penalty(anchor, candidate, metrics)
-            bridge_gain = orchestrator._bridge_information_gain(anchor, candidate)
+            signal_report = signal_runtime.build_signal_report(anchor, candidate, local_signals=signals, verdict=verdict)
+            duplicate_penalty = float(signal_report.get("duplicate_risk", orchestrator._near_duplicate_penalty(anchor, candidate, metrics)) or 0.0)
+            bridge_gain = float(signal_report.get("bridge_information_gain", orchestrator._bridge_information_gain(anchor, candidate)) or 0.0)
             provider_payload = provider_payloads.get(candidate.doc_id, {})
             risk_flags = sorted(set(signals.get("risk_flags", [])) | set(verdict.get("contradiction_flags", [])) | set(provider_payload.get("risk_flags", [])))
             counterevidence: list[str] = [str(item) for item in provider_payload.get("counterevidence", [])]
@@ -572,8 +635,9 @@ def build_deepagent_toolsets(
             if candidate is None:
                 continue
             from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
-
-            signals = JudgeSignals(**item.get("signals", {}))
+            allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
+            signal_payload = {key: value for key, value in item.get("signals", {}).items() if key in allowed_signal_keys}
+            signals = JudgeSignals(**signal_payload)
             verdict = JudgeResult(**item.get("verdict", {}))
             review_pairs.append((candidate, signals, verdict))
         reviewed = orchestrator.edge_reviewer.run_many_with_signals(anchor, review_pairs) if review_pairs else {}
@@ -617,6 +681,17 @@ def build_deepagent_toolsets(
                     contrastive_comparison_bridge and not (effective_risk_flags & hard_blockers)
                 )
             )
+            activation_profile = signal_runtime.compute_query_activation_profile(
+                anchor,
+                candidate,
+                str(getattr(reviewed_verdict, "relation_type", "comparison")),
+                local_signals={
+                    **signal_payload,
+                    "bridge_information_gain": float(signal_payload.get("bridge_information_gain", 0.0) or 0.0),
+                    "utility_score": float(getattr(reviewed_verdict, "utility_score", 0.0) or 0.0),
+                },
+                verdict=to_jsonable(reviewed_verdict),
+            )
             final_utility = max(float(getattr(reviewed_verdict, "utility_score", 0.0)) - risk_penalty, 0.0)
             review_rows.append(
                 ReviewBundleItem(
@@ -628,6 +703,7 @@ def build_deepagent_toolsets(
                     decision_reason=(str(getattr(reviewed_verdict, "decision_reason", "")) or str(check.get("decision_reason", "")))[:220],
                     final_verdict=to_jsonable(reviewed_verdict),
                     risk_flags=sorted(effective_risk_flags),
+                    activation_profile=activation_profile,
                 )
             )
         review_rows.sort(key=lambda item: (-item.reviewed_utility_score, -item.reviewed_confidence, item.candidate_doc_id))
@@ -693,6 +769,11 @@ def build_deepagent_toolsets(
         "read_execution_manifest": read_execution_manifest,
         "audit_anchor_execution": audit_anchor_execution,
         "evaluate_anchor_utility": evaluate_anchor_utility,
+        "compute_topic_consistency": compute_topic_consistency,
+        "compute_duplicate_risk": compute_duplicate_risk,
+        "compute_bridge_gain": compute_bridge_gain,
+        "compute_contrast_evidence": compute_contrast_evidence,
+        "compute_query_activation_profile": compute_query_activation_profile,
     }
 
     project_tools = {

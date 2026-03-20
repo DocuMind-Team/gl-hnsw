@@ -64,6 +64,11 @@ class JudgeSignals:
     bridge_gain: float = 0.0
     duplicate_penalty: float = 0.0
     contrastive_bridge_score: float = 0.0
+    topic_consistency: float = 0.0
+    duplicate_risk: float = 0.0
+    query_surface_match: float = 0.0
+    uncertainty_hint: float = 0.0
+    drift_risk: float = 0.0
 
 
 class ProviderBase:
@@ -75,7 +80,6 @@ class ProviderBase:
             "judge": True,
             "reviewer": True,
             "curator": True,
-            "query_strategy": True,
         }
         self.relation_priors = {
             "supporting_evidence": 1.02,
@@ -86,7 +90,6 @@ class ProviderBase:
         }
         self.judge_few_shot_text = self._build_generic_judge_examples()
         self.review_few_shot_text = self._build_generic_review_examples()
-        self.query_strategy_few_shot_text = self._build_query_strategy_examples()
 
     @staticmethod
     def _normalize_risk_flag(flag: str) -> str:
@@ -191,7 +194,6 @@ class ProviderBase:
             "judge": live_reasoning_config.enable_judge_thinking,
             "reviewer": live_reasoning_config.enable_reviewer_thinking,
             "curator": live_reasoning_config.enable_curator_thinking,
-            "query_strategy": live_reasoning_config.enable_query_strategy_thinking,
         }
 
     def embed_texts(self, texts: Iterable[str]) -> np.ndarray:
@@ -282,9 +284,6 @@ class ProviderBase:
             "failure_patterns": [str(item) for item in rejected[:12]],
             "reference_updates": {},
         }
-
-    def plan_query_strategy(self, payload: dict) -> dict:
-        return {}
 
     def curate_memory(self, anchor: DocBrief, accepted: list[LogicEdge], rejected: list[str]) -> dict:
         raise NotImplementedError
@@ -389,65 +388,6 @@ class ProviderBase:
                 "candidate_text": "The supporting document agrees that transit funding improves urban mobility and should be expanded.",
                 "expected_relation_type": "none",
                 "why": "Shared stance and topic overlap alone are not enough for a durable comparison edge.",
-            },
-        ]
-        return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
-
-    def _build_query_strategy_examples(self) -> str:
-        examples = [
-            {
-                "query": "culture debate about tradition and public policy",
-                "signals": {
-                    "dataset_hint": "arguana",
-                    "agreement_ratio": 0.0,
-                    "query_specificity": 0.16,
-                    "graph_available": False,
-                },
-                "expected": {
-                    "mode": "dense_only",
-                    "sparse_gate": 0.0,
-                    "allow_sparse_only": False,
-                    "graph_gate": 0.0,
-                    "sparse_boost": 0.0,
-                    "novelty_bias": 0.0,
-                    "reason": "Argumentative query with disagreement between dense and sparse signals.",
-                },
-            },
-            {
-                "query": "Which evidence supports the study claim about disease?",
-                "signals": {
-                    "dataset_hint": "scifact",
-                    "agreement_ratio": 0.5,
-                    "query_specificity": 0.48,
-                    "graph_available": False,
-                },
-                "expected": {
-                    "mode": "dense_plus_sparse",
-                    "sparse_gate": 0.9,
-                    "allow_sparse_only": True,
-                    "graph_gate": 0.0,
-                    "sparse_boost": 1.1,
-                    "novelty_bias": 0.95,
-                    "reason": "Scientific claim query with exact terminology support.",
-                },
-            },
-            {
-                "query": "How does jump policy affect hybrid retrieval scoring?",
-                "signals": {
-                    "dataset_hint": "gl_hnsw_demo",
-                    "agreement_ratio": 0.5,
-                    "query_specificity": 0.34,
-                    "graph_available": True,
-                },
-                "expected": {
-                    "mode": "dense_sparse_graph",
-                    "sparse_gate": 0.95,
-                    "allow_sparse_only": True,
-                    "graph_gate": 0.95,
-                    "sparse_boost": 1.0,
-                    "novelty_bias": 1.0,
-                    "reason": "Technical query over a structured corpus with durable graph edges.",
-                },
             },
         ]
         return "\n".join(json.dumps(example, ensure_ascii=False) for example in examples)
@@ -1083,17 +1023,6 @@ class OpenAICompatibleProvider(StubProvider):
             "You may keep the original relation, reject it, or replace it with a safer canonical relation."
         )
 
-    def _query_strategy_instruction(self) -> str:
-        return (
-            "You are a query strategy agent for retrieval. Return JSON only. "
-            "You receive local retrieval signals and must decide whether to use dense only, dense plus sparse, "
-            "or dense plus sparse plus graph expansion. Prefer stable recall gains over aggressive lexical drift. "
-            "When signals look argumentative, opinion-oriented, or dense and sparse strongly disagree, choose dense_only. "
-            "When terminology is exact and supported by both query and candidate evidence, choose dense_plus_sparse. "
-            "Only enable graph expansion for structured technical corpora with durable graph edges. "
-            "You are not ranking documents directly; you are selecting a safe retrieval strategy."
-        )
-
     def _planner_instruction(self) -> str:
         return (
             "You are an offline indexing planner. Return JSON only. "
@@ -1337,42 +1266,6 @@ class OpenAICompatibleProvider(StubProvider):
         )
         brief.metadata.update({key: value for key, value in metadata.items() if value})
         return brief
-
-    def plan_query_strategy(self, payload: dict) -> dict:
-        try:
-            return self._invoke_json(
-                self._query_strategy_instruction(),
-                "\n".join(
-                    part
-                    for part in [
-                        json.dumps(
-                            {
-                                "task": "Choose a retrieval strategy from local signals.",
-                                "payload": payload,
-                                "output_schema": {
-                                    "mode": "string",
-                                    "sparse_gate": "float",
-                                    "allow_sparse_only": "boolean",
-                                    "graph_gate": "float",
-                                    "sparse_boost": "float",
-                                    "novelty_bias": "float",
-                                    "reason": "string",
-                                    "uncertainty": "float",
-                                },
-                            },
-                            ensure_ascii=False,
-                        ),
-                        "Few-shot examples:" if self.query_strategy_few_shot_text else "",
-                        self.query_strategy_few_shot_text,
-                    ]
-                    if part
-                ),
-                thinking=self.live_reasoning["query_strategy"],
-                stage="query_strategy",
-            )
-        except Exception as exc:
-            self._handle_remote_failure("query_strategy", exc)
-            return {}
 
     def plan_indexing_batch(self, payload: dict) -> dict:
         try:

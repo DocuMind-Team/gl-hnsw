@@ -11,7 +11,6 @@ from hnsw_logic.agents.subagents.doc_profiler import DocProfilerAgent
 from hnsw_logic.agents.subagents.edge_reviewer import EdgeReviewerAgent
 from hnsw_logic.agents.subagents.index_planner import IndexPlannerAgent
 from hnsw_logic.agents.subagents.memory_curator import MemoryCuratorAgent
-from hnsw_logic.agents.subagents.query_strategy import QueryStrategyAgent
 from hnsw_logic.agents.subagents.relation_judge import RelationJudgeAgent
 from hnsw_logic.agents.tools.deepagents_runtime import (
     build_deepagent_supervisor_tools,
@@ -168,12 +167,6 @@ class AgentFactory:
 
     def create_memory_curator(self):
         return MemoryCuratorAgent(self.provider)
-
-    def create_query_strategy(self):
-        return QueryStrategyAgent(
-            provider=self.provider,
-            trace_path=self.workspace_root / "query_strategy_traces.jsonl",
-        )
 
     def create_deepagent_specs(self) -> list[dict[str, Any]]:
         subagents: list[dict[str, Any]] = []
