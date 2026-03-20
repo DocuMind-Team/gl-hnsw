@@ -926,6 +926,7 @@ class LogicOrchestrator:
             stage_pair=stage_pair,
             risk_flags=risk_flags,
             relation_fit_scores={key: round(value, 4) for key, value in fit_scores.items()},
+            topic_family_match=metrics["topic_family_match"],
             topic_cluster_match=metrics["topic_cluster_match"],
             stance_contrast=metrics["stance_contrast"],
             bridge_gain=self._bridge_information_gain(anchor, candidate),

@@ -58,6 +58,7 @@ class JudgeSignals:
     stage_pair: str
     risk_flags: list[str]
     relation_fit_scores: dict[str, float]
+    topic_family_match: float = 0.0
     topic_cluster_match: float = 0.0
     stance_contrast: float = 0.0
     bridge_gain: float = 0.0
@@ -117,6 +118,8 @@ class ProviderBase:
         if verdict.relation_type != "comparison":
             return False
         topic_consistent = (
+            signals.topic_family_match >= 1.0
+            or
             signals.topic_cluster_match >= 1.0
             or max(signals.overlap_score, signals.content_overlap_score) >= 0.18
             or signals.mention_score >= 0.18
@@ -323,6 +326,15 @@ class ProviderBase:
                 "candidate_text": "The counterargument claims adding lanes improves mobility more reliably than transit spending.",
                 "expected_relation_type": "comparison",
                 "why": "Both documents discuss the same policy topic from contrasting positions.",
+            },
+            {
+                "label": "negative",
+                "anchor_title": "Artists should be allowed to offend social taboos",
+                "anchor_text": "The argument focuses on provocative art and social disgust in the arts.",
+                "candidate_title": "Gangsta rap should be censored because it causes harm",
+                "candidate_text": "The counterargument focuses on censorship in a broader free-speech debate rather than the same arts dispute.",
+                "expected_relation_type": "none",
+                "why": "Opposing stance in a broad policy area is not enough when the pair does not share the same topic family or bridge surface.",
             },
             {
                 "label": "positive",
@@ -545,6 +557,27 @@ class ProviderBase:
                     "accepted": True,
                     "canonical_relation": "comparison",
                     "why": "High topic overlap is acceptable when the pair supplies a reusable same-topic contrast with opposing stances.",
+                },
+            },
+            {
+                "label": "reject-cross-family-analogy",
+                "anchor_title": "Artists should be allowed to offend social taboos",
+                "candidate_title": "Gangsta rap should be censored because it causes harm",
+                "judge_verdict": {
+                    "accepted": True,
+                    "canonical_relation": "comparison",
+                    "confidence": 0.81,
+                    "utility_score": 0.63,
+                },
+                "signals": {
+                    "best_relation": "comparison",
+                    "utility_score": 0.58,
+                    "risk_flags": ["topic_mismatch"],
+                },
+                "expected": {
+                    "accepted": False,
+                    "canonical_relation": "none",
+                    "why": "Broad free-speech analogy is weaker than a same-topic arts contrast bridge and should not survive as a durable comparison edge.",
                 },
             },
             {
