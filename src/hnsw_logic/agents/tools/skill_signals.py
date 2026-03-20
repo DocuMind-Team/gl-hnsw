@@ -109,6 +109,67 @@ class SkillSignalRuntime:
             },
         )
 
+    def compute_anchor_priority(
+        self,
+        brief: Any,
+        *,
+        features: dict[str, Any] | None = None,
+        corpus_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._execute(
+            "anchor-planning",
+            "rank_anchor_priority",
+            {
+                "brief": self._jsonable(brief),
+                "features": features or {},
+                "corpus_profile": corpus_profile or {},
+            },
+        )
+
+    def compute_candidate_priority(
+        self,
+        *,
+        base_score: float,
+        metrics: dict[str, Any],
+        fit_scores: dict[str, Any],
+        signal_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._execute(
+            "candidate-expansion",
+            "rank_candidate_priority",
+            {
+                "base_score": float(base_score),
+                "metrics": metrics,
+                "fit_scores": fit_scores,
+                "signal_report": signal_report,
+            },
+        )
+
+    def compute_edge_budget_score(
+        self,
+        *,
+        score: float,
+        utility_score: float,
+        activation_prior: float,
+        novelty: float,
+        specific_novelty: float,
+        drift_risk: float = 0.0,
+        duplicate_risk: float = 0.0,
+    ) -> dict[str, Any]:
+        return self._execute(
+            "edge-utility-review",
+            "select_edge_budget",
+            {
+                "score": float(score),
+                "utility_score": float(utility_score),
+                "activation_prior": float(activation_prior),
+                "novelty": float(novelty),
+                "specific_novelty": float(specific_novelty),
+                "drift_risk": float(drift_risk),
+                "duplicate_risk": float(duplicate_risk),
+            },
+        )
+
     def build_signal_report(
         self,
         anchor: Any,

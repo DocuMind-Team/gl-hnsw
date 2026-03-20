@@ -248,7 +248,7 @@ def test_counterevidence_content_filter_falls_back_to_local_checker():
     checks = provider.check_counterevidence_many(anchor, [(candidate, signals, verdict)])
 
     assert checks["candidate"]["keep"] is True
-    assert checks["candidate"]["decision_reason"] == "base checker fallback"
+    assert checks["candidate"]["decision_reason"] == "base checker local decision"
 
 
 def test_counterevidence_normalizes_duplicate_only_comparison_bridge():

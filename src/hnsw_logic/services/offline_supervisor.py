@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -38,17 +37,6 @@ class OfflineIndexingSupervisor:
         self.agents_config = agents_config
         self.self_update_manager = self_update_manager
         self.agents_memory_path = agents_memory_path
-        self.supervisor_task_delegation_enabled = self._flag_from_env(
-            "GL_HNSW_ENABLE_DEEPAGENT_SUPERVISOR",
-            self.agents_config.enable_supervisor_delegation,
-        )
-        self.anchor_task_delegation_enabled = (
-            self.supervisor_task_delegation_enabled
-            and self._flag_from_env(
-                "GL_HNSW_ENABLE_ANCHOR_TASK_DELEGATION",
-                self.agents_config.enable_anchor_task_delegation,
-            )
-        )
         self._stage_runners = {
             "dossiers": ("doc_profiler", "execute_doc_profiling"),
             "candidates": ("corpus_scout", "execute_candidate_expansion"),
@@ -57,13 +45,6 @@ class OfflineIndexingSupervisor:
             "reviews": ("edge_reviewer", "execute_edge_review"),
             "memory": ("memory_curator", "execute_memory_summarization"),
         }
-
-    @staticmethod
-    def _flag_from_env(name: str, default: bool) -> bool:
-        value = os.getenv(name)
-        if value is None:
-            return default
-        return value.strip().lower() not in {"0", "false", "no", "off"}
 
     def _stage_path(self, stage: str, doc_id: str, suffix: str = ".json") -> Path:
         return self.workspace_root / "indexing" / stage / f"{doc_id}{suffix}"
@@ -87,7 +68,7 @@ class OfflineIndexingSupervisor:
             raise RuntimeError("deepagent runtime unavailable")
         self.deepagent.invoke({"messages": [{"role": "user", "content": prompt}]})
 
-    def _run_stage_locally(self, agent_name: str, tool_name: str, **kwargs) -> dict:
+    def _run_stage_test_harness(self, agent_name: str, tool_name: str, **kwargs) -> dict:
         tool = self.runtime_toolsets.get(agent_name, {}).get(tool_name)
         if tool is None:
             return {}
@@ -95,30 +76,24 @@ class OfflineIndexingSupervisor:
 
     def _build_plan(self) -> dict:
         normalize_indexing_workspace(self.workspace_root)
-        using_delegation = (
-            self.deepagent is not None
-            and self.agents_config.planner_enabled
-            and self.supervisor_task_delegation_enabled
-        )
-        if using_delegation:
-            self._invoke_main_agent(
-                "\n".join(
-                    [
-                        "Create the offline indexing plan.",
-                        "Use the delegation-policy skill and keep the plan auditable.",
-                        f"Respect a maximum of {self.agents_config.max_parallel_tasks} active task slots.",
-                        "Use the task tool to delegate to the index_planner subagent.",
-                        "The subagent must call execute_index_planning and materialize the plan at the exact workspace path `indexing/plans/indexing_plan.json`.",
-                        "Never write freeform notes directly to the stage directory path `indexing/plans`.",
-                        "Audit the plan by checking that `indexing/plans/indexing_plan.json` exists before returning.",
-                    ]
-                )
+        if self.deepagent is None:
+            raise RuntimeError("deepagent runtime unavailable for offline indexing planning")
+        self._invoke_main_agent(
+            "\n".join(
+                [
+                    "Create the offline indexing plan.",
+                    "Use the delegation-policy skill and keep the plan auditable.",
+                    f"Respect a maximum of {self.agents_config.max_parallel_tasks} active task slots.",
+                    "Use the task tool to delegate to the index_planner subagent.",
+                    "The subagent must call execute_index_planning and materialize the plan at the exact workspace path `indexing/plans/indexing_plan.json`.",
+                    "Never write freeform notes directly to the stage directory path `indexing/plans`.",
+                    "Audit the plan by checking that `indexing/plans/indexing_plan.json` exists before returning.",
+                ]
             )
-        else:
-            self._run_stage_locally("index_planner", "execute_index_planning")
+        )
         normalize_indexing_workspace(self.workspace_root)
         plan = read_json(self._plan_path(), {}) or {}
-        if using_delegation and not plan:
+        if not plan:
             raise RuntimeError(
                 "deepagents planning did not materialize `indexing/plans/indexing_plan.json`"
             )
@@ -146,14 +121,19 @@ class OfflineIndexingSupervisor:
             deduped.append(doc_id)
         return deduped
 
-    def _run_anchor_workflow_local(self, anchor_doc_id: str, stages: list[str] | None = None) -> None:
+    def run_anchor_workflow_test_harness(self, anchor_doc_id: str, stages: list[str] | None = None) -> None:
         target_stages = stages or self._required_stages()
         for stage in target_stages:
             runner = self._stage_runners.get(stage)
             if runner is None:
                 continue
             agent_name, tool_name = runner
-            self._run_stage_locally(agent_name, tool_name, anchor_doc_id=anchor_doc_id)
+            self._run_stage_test_harness(agent_name, tool_name, anchor_doc_id=anchor_doc_id)
+
+    def run_index_planning_test_harness(self) -> dict:
+        normalize_indexing_workspace(self.workspace_root)
+        self._run_stage_test_harness("index_planner", "execute_index_planning")
+        return read_json(self._plan_path(), {}) or {}
 
     def _deepagent_stage_prompt(self, anchor_doc_id: str, stage: str, audit: ExecutionAudit) -> str:
         runner = self._stage_runners[stage]
@@ -173,6 +153,8 @@ class OfflineIndexingSupervisor:
         )
 
     def _run_anchor_workflow_with_deepagents(self, anchor_doc_id: str) -> None:
+        if self.deepagent is None:
+            raise RuntimeError("deepagent runtime unavailable for anchor delegation")
         rounds = 0
         max_rounds = max(1, self.agents_config.task_iteration_cap) * max(1, len(self._required_stages()))
         while rounds < max_rounds:
@@ -181,7 +163,7 @@ class OfflineIndexingSupervisor:
                 return
             if not audit.next_stage:
                 break
-            if audit.should_fallback:
+            if audit.retry_exhausted:
                 break
             stage = audit.next_stage
             record_manifest_stage_event(
@@ -220,12 +202,15 @@ class OfflineIndexingSupervisor:
             record_manifest_stage_event(
                 self.workspace_root,
                 anchor_doc_id,
-                stage=final_audit.next_stage or final_audit.current_stage or "fallback",
-                status="started",
-                note="switching to local fallback after bounded delegation loop",
-                force_fallback=True,
+                stage=final_audit.next_stage or final_audit.current_stage or "delegation",
+                status="failed",
+                error="deepagent delegation did not materialize the full anchor workflow",
+                force_halt=True,
             )
-            self._run_anchor_workflow_local(anchor_doc_id, stages=final_audit.missing_stages)
+            raise RuntimeError(
+                f"deepagents workflow for `{anchor_doc_id}` did not complete; "
+                f"missing stages={final_audit.missing_stages}, completed={final_audit.completed_stages}"
+            )
 
     def _load_candidate_assets(self, anchor_doc_id: str, briefs: list[DocBrief]) -> tuple[list[DocBrief], dict, dict, dict]:
         brief_map = {brief.doc_id: brief for brief in briefs}
@@ -330,24 +315,18 @@ class OfflineIndexingSupervisor:
         normalize_indexing_workspace(self.workspace_root, anchor_doc_id)
         brief_map = {brief.doc_id: brief for brief in briefs}
         anchor = brief_map[anchor_doc_id]
-        used_delegation = self.deepagent is not None and self.anchor_task_delegation_enabled
-        if used_delegation:
-            self._run_anchor_workflow_with_deepagents(anchor_doc_id)
-        else:
-            self._run_anchor_workflow_local(anchor_doc_id, stages=self._audit_anchor_execution(anchor_doc_id).missing_stages)
+        self._run_anchor_workflow_with_deepagents(anchor_doc_id)
         candidates, verdicts, reviews, bundle_lookup = self._load_candidate_assets(anchor_doc_id, briefs)
         if not candidates:
             self._apply_memory_updates(anchor_doc_id)
             return []
         if not verdicts:
             self._apply_memory_updates(anchor_doc_id)
-            if used_delegation:
-                audit = self._audit_anchor_execution(anchor_doc_id)
-                raise RuntimeError(
-                    f"deepagents workflow for `{anchor_doc_id}` did not materialize judgments; "
-                    f"missing stages={audit.missing_stages}, completed={audit.completed_stages}"
-                )
-            return []
+            audit = self._audit_anchor_execution(anchor_doc_id)
+            raise RuntimeError(
+                f"deepagents workflow for `{anchor_doc_id}` did not materialize judgments; "
+                f"missing stages={audit.missing_stages}, completed={audit.completed_stages}"
+            )
         assessments = self._apply_review_consensus(anchor, candidates, verdicts, reviews, bundle_lookup)
         accepted = self.discovery_service.commit_assessments(anchor, assessments)
         self._apply_memory_updates(anchor_doc_id)
@@ -357,7 +336,7 @@ class OfflineIndexingSupervisor:
         plan = self._build_plan()
         ordered = self._ordered_anchor_ids_from_plan(plan)
         if not ordered:
-            ordered = self.orchestrator.rank_discovery_anchors(briefs)
+            raise RuntimeError("deepagents planning returned no ordered anchors")
         brief_map = {brief.doc_id: brief for brief in briefs}
         accepted = []
         eligible = []

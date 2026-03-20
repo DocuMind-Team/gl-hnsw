@@ -267,24 +267,16 @@ class RetrievalScorer:
             score *= 0.9
         return max(0.0, min(score, 1.0))
 
-    def relation_query_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
-        alignment = max(self.query_alignment(query, brief), self.structure_alignment(query, brief))
-        fallback_prior = {
-            "prerequisite": 0.72,
-            "supporting_evidence": 0.7,
-            "implementation_detail": 0.82,
-            "same_concept": 0.78,
-            "comparison": 0.8,
-        }.get(edge.relation_type, 0.72)
-        return min(1.0, 0.35 + 0.4 * alignment + 0.25 * fallback_prior)
-
     def activation_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
         activation_match = self.activation_match(query, brief, edge)
         activation_prior = self.edge_activation_prior(edge)
         drift_penalty = 1.0 - 0.35 * self.edge_drift_risk(edge)
-        if self._edge_activation_profile(edge):
-            return max(0.15, min(1.1, (0.35 + 0.4 * activation_match + 0.25 * activation_prior) * drift_penalty))
-        return self.relation_query_multiplier(query, brief, edge)
+        if not self._edge_activation_profile(edge):
+            activation_match = max(
+                activation_match,
+                0.55 * self.query_alignment(query, brief) + 0.45 * self.title_claim_alignment(query, brief),
+            )
+        return max(0.15, min(1.1, (0.35 + 0.4 * activation_match + 0.25 * activation_prior) * drift_penalty))
 
     def edge_embedding(self, edge: LogicEdge) -> np.ndarray:
         edge_emb = self._edge_embedding_cache.get(edge.edge_card_text)

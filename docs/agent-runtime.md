@@ -103,7 +103,7 @@ flowchart TD
 所以，当前系统最准确的描述是：
 
 - **离线主链由 DeepAgents runtime 驱动**
-- **本地 orchestrator 负责最终 signal/gate/fallback**
+- **本地 orchestrator 负责最终 signal/gate/commit**
 - **在线查询仍然不接入 agent**
 
 ---
@@ -181,18 +181,6 @@ flowchart TD
 
 - 基于 accepted / rejected 结果生成 memory payload
 - 交给本地 `MemoryCuratorService` 继续合并入持久层
-
-#### QueryStrategyAgent
-
-实现文件：
-[query_strategy.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/agents/subagents/query_strategy.py)
-
-当前状态：
-
-- 代码中存在
-- 但当前默认在线检索主路径**不接入**
-
-因此它不属于当前主生产链路的核心部分。
 
 ```mermaid
 flowchart LR
@@ -794,7 +782,6 @@ flowchart LR
 
 `AgentFactory.try_create_deep_agent()` 会在以下条件都满足时创建 deepagent：
 
-- `runtime_mode == "deepagents"`
 - provider 是 `OpenAICompatibleProvider`
 - API key 存在
 - deepagents / langchain 相关依赖可导入
@@ -811,10 +798,8 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    A["AgentsConfig / 代理配置"] --> B{"runtime_mode == deepagents?"}
-    B -- "否 / No" --> X["不创建 deepagent / No deepagent"]
-    B -- "是 / Yes" --> C{"Provider 可用?\nOpenAI-compatible?"}
-    C -- "否 / No" --> X
+    A["AgentsConfig / 代理配置"] --> C{"Provider 可用?\nOpenAI-compatible?"}
+    C -- "否 / No" --> X["不创建 deepagent / No deepagent"]
     C -- "是 / Yes" --> D{"API key + imports 就绪?\nCredentials and imports ready?"}
     D -- "否 / No" --> X
     D -- "是 / Yes" --> E["create_deep_agent(...)"]
@@ -833,7 +818,7 @@ flowchart TD
 - **离线索引建模** 由 deepagents supervisor 主导
 - **在线查询执行** 仍然是纯本地链路
 - deepagents 负责 planning、task delegation、filesystem context、skills/memory 调度
-- 本地 orchestrator 负责 deterministic gate 与 fallback
+- 本地 orchestrator 负责 deterministic gate 与 commit
 
 ---
 

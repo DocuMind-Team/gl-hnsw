@@ -49,7 +49,7 @@
 - Online querying remains agent-free.
 - Query-time graph use should depend on offline-learned `activation_profile`, not primarily on relation labels.
 - Activation should prefer edges with high activation prior, low drift risk, and strong query-surface or topic-signature match.
-- Relation-specific multipliers are compatibility fallbacks only and should not become the primary activation path again.
+- Relation-name multipliers are compatibility leftovers only and should not become the primary activation path again.
 
 ## Allowed Self-Updates
 

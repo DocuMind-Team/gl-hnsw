@@ -22,4 +22,4 @@ A stage is considered complete only when its bundle file exists in the workspace
 `workflow_complete` means `ready_for_commit` plus the `memory` bundle exists.
 
 If the next missing stage has already exhausted its retry budget, the workflow
-should be marked for fallback.
+should be marked as incomplete for supervisor escalation.

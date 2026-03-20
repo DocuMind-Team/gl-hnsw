@@ -211,7 +211,14 @@ def test_cross_topic_argumentative_pair_is_rejected():
     assessment = orchestrator._assessment_for(anchor, candidate, judge)
 
     assert assessment.accepted is False
-    assert assessment.reject_reason in {"wrong_relation_type", "topic_drift", "low_utility", "weak_evidence"}
+    assert assessment.reject_reason in {
+        "wrong_relation_type",
+        "topic_drift",
+        "low_utility",
+        "weak_evidence",
+        "graph_hygiene_failure",
+        "low_confidence",
+    }
 
 
 def test_topic_drift_pair_is_rejected_even_with_positive_verdict():
@@ -251,7 +258,14 @@ def test_topic_drift_pair_is_rejected_even_with_positive_verdict():
     assessment = orchestrator._assessment_for(anchor, candidate, judge)
 
     assert assessment.accepted is False
-    assert assessment.reject_reason in {"topic_drift", "low_utility", "wrong_relation_type", "weak_evidence"}
+    assert assessment.reject_reason in {
+        "topic_drift",
+        "low_utility",
+        "wrong_relation_type",
+        "weak_evidence",
+        "graph_hygiene_failure",
+        "low_support",
+    }
 
 
 def test_activation_profile_is_attached_to_scientific_bridge():

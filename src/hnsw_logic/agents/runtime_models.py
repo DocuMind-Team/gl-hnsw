@@ -171,7 +171,7 @@ class ExecutionManifest:
     retry_counts: dict[str, int] = field(default_factory=dict)
     delegation_round: int = 0
     last_error: str = ""
-    needs_fallback: bool = False
+    halt_requested: bool = False
     notes: list[str] = field(default_factory=list)
 
 
@@ -187,5 +187,5 @@ class ExecutionAudit:
     next_stage: str = ""
     ready_for_commit: bool = False
     workflow_complete: bool = False
-    should_fallback: bool = False
+    retry_exhausted: bool = False
     notes: list[str] = field(default_factory=list)

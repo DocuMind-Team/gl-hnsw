@@ -1,6 +1,6 @@
 ---
 name: execution-audit
-description: Audit per-anchor execution state, required artifacts, and stage completeness. Use when deciding whether an offline indexing task actually finished, which stage is missing, and whether fallback or recovery is required.
+description: Audit per-anchor execution state, required artifacts, and stage completeness. Use when deciding whether an offline indexing task actually finished, which stage is missing, and whether recovery or escalation is required.
 ---
 
 # Execution Audit
@@ -14,7 +14,7 @@ anchor workflow is complete.
 2. Audit dossier, candidate, judgment, check, review, and memory bundles against
    the stage contract.
 3. Validate that each stage wrote a concrete artifact file, not only a directory note.
-4. Report the next missing stage, retry pressure, and whether fallback is required.
+4. Report the next missing stage, retry pressure, and whether the workflow should stop for escalation.
 5. Prefer explicit audit output over optimistic natural-language assumptions.
 
 ## Tool discipline

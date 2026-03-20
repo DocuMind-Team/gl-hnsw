@@ -1,7 +1,8 @@
 # Activation Profiles
 
-- `topic_signature`: 边所覆盖的主题簇或家族信号。
-- `query_surface_terms`: 在线查询时可直接匹配的术语面。
-- `edge_use_cases`: 该边典型适用的信息需求。
-- `activation_prior`: 离线估计的整体激活先验。
-- `negative_patterns`: 在线激活时应避免的查询模式。
+- `topic_signature`: Topic-cluster or topic-family signals that summarize where the edge is useful.
+- `query_surface_terms`: Surface terms that can be matched directly at query time.
+- `edge_use_cases`: Typical information-need patterns that benefit from activating the edge.
+- `activation_prior`: The offline prior that estimates how often the edge should be activated at all.
+- `negative_patterns`: Query patterns that should suppress activation because they are likely to drift.
+- keep activation profiles generic enough to transfer across corpora, but specific enough to block broad topic drift.

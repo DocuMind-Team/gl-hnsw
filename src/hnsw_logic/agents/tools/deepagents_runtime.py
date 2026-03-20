@@ -138,7 +138,7 @@ def record_manifest_stage_event(
     note: str = "",
     error: str = "",
     increment_round: bool = False,
-    force_fallback: bool = False,
+    force_halt: bool = False,
 ) -> ExecutionManifest:
     manifest = load_execution_manifest(workspace_root, anchor_doc_id)
     manifest.current_stage = stage
@@ -157,8 +157,8 @@ def record_manifest_stage_event(
         manifest.failed_stages.pop(stage, None)
     if note:
         manifest.notes = [*manifest.notes[-11:], note[:240]]
-    if force_fallback:
-        manifest.needs_fallback = True
+    if force_halt:
+        manifest.halt_requested = True
     save_execution_manifest(workspace_root, manifest)
     return manifest
 
@@ -188,10 +188,10 @@ def audit_execution_state(
     required_for_commit = [stage for stage in COMMIT_REQUIRED_STAGES if counterevidence_enabled or stage != "checks"]
     ready_for_commit = all(stage in completed for stage in required_for_commit)
     workflow_complete = all(stage in completed for stage in required)
-    should_fallback = bool(manifest.needs_fallback)
-    if not should_fallback and missing:
+    retry_exhausted = bool(manifest.halt_requested)
+    if not retry_exhausted and missing:
         next_stage = missing[0]
-        should_fallback = int(manifest.retry_counts.get(next_stage, 0)) >= max(task_iteration_cap, 1)
+        retry_exhausted = int(manifest.retry_counts.get(next_stage, 0)) >= max(task_iteration_cap, 1)
     return ExecutionAudit(
         anchor_doc_id=anchor_doc_id,
         generated_at=utc_now(),
@@ -203,7 +203,7 @@ def audit_execution_state(
         next_stage=missing[0] if missing else "",
         ready_for_commit=ready_for_commit,
         workflow_complete=workflow_complete,
-        should_fallback=should_fallback,
+        retry_exhausted=retry_exhausted,
         notes=list(manifest.notes),
     )
 
@@ -839,7 +839,7 @@ def build_deepagent_supervisor_tools(
         return to_jsonable(load_execution_manifest(workspace_root, doc_id))
 
     def audit_anchor_execution(doc_id: str) -> dict:
-        """Audit an anchor workflow and report missing stages, readiness, and fallback state."""
+        """Audit an anchor workflow and report missing stages, readiness, and escalation state."""
         return to_jsonable(
             audit_execution_state(
                 workspace_root,

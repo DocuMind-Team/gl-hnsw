@@ -187,8 +187,6 @@ class AgentFactory:
         return subagents
 
     def try_create_deep_agent(self):
-        if self.agents_config.runtime_mode != "deepagents":
-            return None
         if not isinstance(self.provider, OpenAICompatibleProvider):
             return None
         try:

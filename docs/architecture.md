@@ -45,7 +45,7 @@
 当前版本中，离线索引主链已经切换为 **DeepAgents supervisor 驱动**：
 
 - supervisor 负责 planning、task delegation、filesystem context、skills/memory 调度
-- `LogicOrchestrator` 退居为本地 signal/gate/fallback 层
+- `LogicOrchestrator` 退居为本地 signal/gate/commit 层
 - 在线查询阶段仍然保持“无 agent”
 
 ---
@@ -199,7 +199,7 @@ flowchart TD
 - supervisor 使用 DeepAgents runtime 作为主控制流
 - subagent 通过 `task` delegation 在隔离上下文中执行各阶段
 - provider 负责远端模型调用
-- `LogicOrchestrator` 负责本地 signal 构造、utility/gate 计算与最终 fallback
+- `LogicOrchestrator` 负责本地 signal 构造、utility/gate 计算与最终 commit
 
 ## 4.2 skills 结构
 
@@ -449,13 +449,13 @@ reviewer 不是简单重复判别，而是第二层共识机制：
 
 ## 9.1 查询阶段的重要边界
 
-当前默认 `AppContainer` 没有给 `HybridRetrievalService` 注入 `QueryStrategyAgent`。
+当前默认 `AppContainer` 不会给 `HybridRetrievalService` 注入任何在线 agent。
 
 这意味着：
 
-- `QueryStrategyAgent` 类仍保留在代码中作为实验组件
-- 但默认运行路径中不会使用在线 agent
+- 在线检索路径只使用本地检索与图激活逻辑
 - 当前线上口径是严格的 offline-agent-only
+- 离线索引建模与在线查询的职责边界是明确分离的
 
 ## 9.2 查询流程图
 
@@ -597,7 +597,6 @@ sequenceDiagram
 
 ### agents
 
-- `runtime_mode`
 - `live_reasoning.enable_*`
 - subagent -> skill mapping
 

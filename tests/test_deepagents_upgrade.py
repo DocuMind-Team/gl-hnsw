@@ -24,13 +24,9 @@ def test_settings_enable_deepagents_runtime(test_root: Path):
 
     load_settings.cache_clear()
     settings = load_settings(test_root)
-    assert settings.agents.runtime_mode == "deepagents"
     assert settings.agents.skills_root == Path(".deepagents/skills")
     assert settings.agents.memory_files == [Path(".deepagents/AGENTS.md")]
-    assert settings.agents.planner_enabled is True
     assert settings.agents.counterevidence_enabled is True
-    assert settings.agents.enable_supervisor_delegation is True
-    assert settings.agents.enable_anchor_task_delegation is True
 
 
 def test_skill_packages_have_frontmatter_and_resources(test_root: Path):
@@ -47,6 +43,17 @@ def test_skill_packages_have_frontmatter_and_resources(test_root: Path):
         assert (skill_dir / "scripts").exists(), skill_dir
 
 
+def test_legacy_skill_tree_is_removed(test_root: Path):
+    assert not (test_root / "src" / "hnsw_logic" / "agents" / "skills").exists()
+
+
+def test_supervisor_runtime_has_no_local_runtime_escape_source(test_root: Path):
+    repo_root = Path(__file__).resolve().parents[1]
+    content = (repo_root / "src" / "hnsw_logic" / "services" / "offline_supervisor.py").read_text(encoding="utf-8")
+    assert "_run_anchor_workflow_local" not in content
+    assert "switching to local fallback" not in content
+
+
 def test_key_runtime_skills_document_recommended_tools(test_root: Path):
     skills_root = test_root / ".deepagents" / "skills"
     expected = {
@@ -60,6 +67,13 @@ def test_key_runtime_skills_document_recommended_tools(test_root: Path):
     for skill_name in expected:
         content = (skills_root / skill_name / "SKILL.md").read_text(encoding="utf-8")
         assert "Recommended tools" in content, skill_name
+
+
+def test_runtime_skill_references_are_english(test_root: Path):
+    skills_root = test_root / ".deepagents" / "skills"
+    for reference in skills_root.glob("*/references/*.md"):
+        content = reference.read_text(encoding="utf-8")
+        assert not any("\u4e00" <= char <= "\u9fff" for char in content), reference
 
 
 def test_skill_signal_runtime_returns_structured_signal_report(test_root: Path):
@@ -84,11 +98,28 @@ def test_skill_signal_runtime_returns_structured_signal_report(test_root: Path):
     }
     report = runtime.build_signal_report(anchor, candidate, local_signals={"topic_alignment": 1.0, "dense_score": 0.71})
     profile = runtime.compute_query_activation_profile(anchor, candidate, "comparison", local_signals=report, verdict={"utility_score": 0.78})
+    anchor_priority = runtime.compute_anchor_priority(anchor, features={"claim_score": 1.0, "bridge_potential": 0.7})
+    candidate_priority = runtime.compute_candidate_priority(
+        base_score=0.62,
+        metrics={"local_support": 0.71},
+        fit_scores={"comparison": 0.8},
+        signal_report=report,
+    )
+    edge_budget = runtime.compute_edge_budget_score(
+        score=0.7,
+        utility_score=0.8,
+        activation_prior=0.75,
+        novelty=0.6,
+        specific_novelty=0.4,
+    )
 
     assert report["topic_consistency"] >= 0.5
     assert "topic_report" in report and "duplicate_report" in report
     assert profile["activation_prior"] > 0.0
     assert "query_surface_terms" in profile
+    assert anchor_priority["priority_score"] > 0.0
+    assert candidate_priority["priority_score"] > 0.0
+    assert edge_budget["selection_score"] > 0.0
 
 
 def test_controlled_self_update_only_touches_allowlisted_targets(tmp_path: Path):
@@ -160,12 +191,12 @@ def test_registry_tools_serialize_slotted_models(app_container):
     assert isinstance(tools["load_anchor_memory"](doc_id), dict)
 
 
-def test_offline_supervisor_local_workflow_writes_bundles(app_container):
+def test_offline_supervisor_test_harness_writes_bundles(app_container):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
     anchor_doc_id = briefs[0].doc_id
-    app_container.offline_supervisor._run_anchor_workflow_local(anchor_doc_id)
+    app_container.offline_supervisor.run_anchor_workflow_test_harness(anchor_doc_id)
     workspace = app_container.settings.root_dir / app_container.settings.app.paths.workspace_dir / "indexing"
     assert (workspace / "dossiers" / f"{anchor_doc_id}.json").exists()
     assert (workspace / "candidates" / f"{anchor_doc_id}.json").exists()
@@ -257,7 +288,7 @@ def test_normalize_indexing_workspace_preserves_non_json_stage_notes(tmp_path: P
     assert note.read_text(encoding="utf-8").startswith("# Judgments")
 
 
-def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
+def test_delegation_loop_raises_when_workflow_incomplete(app_container):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
@@ -271,18 +302,21 @@ def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
             self.calls.append(payload)
 
     app_container.offline_supervisor.deepagent = DummyDeepAgent()
-    app_container.offline_supervisor.anchor_task_delegation_enabled = True
     app_container.offline_supervisor.agents_config.task_iteration_cap = 1
 
-    app_container.offline_supervisor._run_anchor_workflow_with_deepagents(anchor_doc_id)
+    try:
+        app_container.offline_supervisor._run_anchor_workflow_with_deepagents(anchor_doc_id)
+    except RuntimeError as exc:
+        assert "did not complete" in str(exc)
+    else:
+        raise AssertionError("expected incomplete delegation workflow to raise")
 
     manifest = load_execution_manifest(app_container.offline_supervisor.workspace_root, anchor_doc_id)
-    assert manifest.needs_fallback is True
-    assert "reviews" in manifest.completed_stages
-    assert (app_container.offline_supervisor.workspace_root / "indexing" / "reviews" / f"{anchor_doc_id}.json").exists()
+    assert manifest.halt_requested is True
+    assert manifest.failed_stages
 
 
-def test_discover_for_anchor_does_not_silent_fallback_to_direct_discovery(app_container, monkeypatch):
+def test_discover_for_anchor_does_not_call_direct_discovery_runtime_path(app_container, monkeypatch):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
@@ -290,13 +324,13 @@ def test_discover_for_anchor_does_not_silent_fallback_to_direct_discovery(app_co
 
     monkeypatch.setattr(
         app_container.offline_supervisor,
-        "_run_anchor_workflow_local",
+        "_run_anchor_workflow_with_deepagents",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         app_container.discovery_service,
         "discover_for_anchor",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct discovery fallback should not run")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("direct discovery runtime path should not run")),
     )
 
     workspace = app_container.offline_supervisor.workspace_root / "indexing"
@@ -313,8 +347,6 @@ def test_build_plan_requires_materialized_plan_under_full_delegation(app_contain
             return {}
 
     app_container.offline_supervisor.deepagent = DummyDeepAgent()
-    app_container.offline_supervisor.supervisor_task_delegation_enabled = True
-    app_container.offline_supervisor.agents_config.planner_enabled = True
 
     try:
         app_container.offline_supervisor._build_plan()

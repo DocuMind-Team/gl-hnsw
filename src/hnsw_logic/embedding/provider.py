@@ -258,7 +258,7 @@ class ProviderBase:
             "keep": penalty < 0.42,
             "risk_flags": sorted(set(risk_flags)),
             "counterevidence": [],
-            "decision_reason": "base checker fallback",
+            "decision_reason": "base checker local decision",
             "risk_penalty": round(penalty, 6),
         }
         return self._normalize_counterevidence_result(anchor, candidate, signals, verdict, result)
@@ -799,7 +799,7 @@ class OpenAICompatibleProvider(StubProvider):
         )
 
     def _handle_remote_failure(self, stage: str, exc: Exception) -> None:
-        self._trace_remote(stage, "fallback", str(exc))
+        self._trace_remote(stage, "remote_failure", str(exc))
         if self.require_remote:
             raise RuntimeError(f"Remote provider call failed during {stage}: {exc}") from exc
 
@@ -1204,8 +1204,8 @@ class OpenAICompatibleProvider(StubProvider):
 
     def _postprocess_profile(self, doc: DocRecord, payload: dict | None) -> DocBrief:
         payload = payload or {}
-        fallback_claims = self._first_sentences(doc.text, limit=3)
-        claims = self._merge_unique([str(item) for item in payload.get("claims", [])], fallback_claims, limit=4)
+        default_claims = self._first_sentences(doc.text, limit=3)
+        claims = self._merge_unique([str(item) for item in payload.get("claims", [])], default_claims, limit=4)
         title = self._derive_title(doc, claims)
         summary = str(payload.get("summary", "")).strip()[:320]
         if not summary:
@@ -1319,7 +1319,7 @@ class OpenAICompatibleProvider(StubProvider):
                 self._trace_remote("check_counterevidence", "blocked_local", candidate.doc_id)
                 return super().check_counterevidence(anchor, candidate, signals, verdict)
             if self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
-                self._trace_remote("check_counterevidence", "fallback_local", candidate.doc_id)
+                self._trace_remote("check_counterevidence", "local_decision", candidate.doc_id)
                 return super().check_counterevidence(anchor, candidate, signals, verdict)
             self._handle_remote_failure("check_counterevidence", exc)
             return super().check_counterevidence(anchor, candidate, signals, verdict)
@@ -1399,7 +1399,7 @@ class OpenAICompatibleProvider(StubProvider):
                         results.update(self.check_counterevidence_many(anchor, partial))
                     continue
                 if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
-                    status = "blocked_local" if self._is_content_filter_error(exc) else "fallback_local"
+                    status = "blocked_local" if self._is_content_filter_error(exc) else "local_decision"
                     for candidate, signals, verdict in batch:
                         self._trace_remote("check_counterevidence_batch", status, candidate.doc_id)
                         results[candidate.doc_id] = super().check_counterevidence(anchor, candidate, signals, verdict)
@@ -1494,7 +1494,7 @@ class OpenAICompatibleProvider(StubProvider):
             return self._postprocess_profile(doc, payload)
         except Exception as exc:
             if self._is_content_filter_error(exc) or self._is_response_parse_error(exc) or self._is_output_limit_error(exc):
-                status = "blocked_local" if self._is_content_filter_error(exc) else "fallback_local"
+                status = "blocked_local" if self._is_content_filter_error(exc) else "local_decision"
                 self._trace_remote("profile_doc", status, doc.doc_id)
                 return self._postprocess_profile(doc, None)
             self._handle_remote_failure("profile_doc", exc)

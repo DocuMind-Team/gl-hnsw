@@ -12,7 +12,7 @@ Use this skill when an anchor workflow has partial outputs and must resume safel
 1. Audit the current execution state before taking any action.
 2. Resume from the first missing stage only.
 3. Reuse existing bundles whenever they satisfy the stage contract.
-4. Escalate to fallback only after the retry budget is exhausted or audit shows no progress.
+4. Escalate to the supervisor only after the retry budget is exhausted or audit shows no progress.
 
 ## Guard rails
 

@@ -20,7 +20,7 @@ def main() -> int:
                 "completed_stage_count": len(completed),
                 "completed_stages": completed,
                 "retry_counts": retries,
-                "needs_fallback": bool(payload.get("needs_fallback")),
+                "halt_requested": bool(payload.get("halt_requested")),
             },
             indent=2,
             sort_keys=True,

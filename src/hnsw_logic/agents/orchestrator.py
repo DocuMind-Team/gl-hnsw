@@ -818,102 +818,44 @@ class LogicOrchestrator:
         }
 
     def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
-        stage_pair = (self._doc_stage(anchor), self._doc_stage(candidate))
-        methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
         bridge_gain = self._bridge_information_gain(anchor, candidate)
         duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
         specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
-        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
+        contrastive_bridge_score = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        query_surface_match = float(
+            metrics.get(
+                "query_surface_match",
+                0.5 * metrics.get("topic_alignment", 0.0)
+                + 0.5 * max(metrics.get("overlap_score", 0.0), metrics.get("content_overlap_score", 0.0)),
+            )
+            or 0.0
+        )
         score = (
-            0.28 * metrics["dense_score"]
-            + 0.22 * metrics["local_support"]
-            + 0.14 * metrics["mention_score"]
+            0.26 * metrics["dense_score"]
+            + 0.2 * metrics["local_support"]
+            + 0.1 * metrics["mention_score"]
             + 0.14 * fit_scores.get(relation_type, 0.0)
             + 0.08 * metrics["forward_reference_score"]
             + 0.06 * metrics["content_overlap_score"]
             + 0.08 * metrics["topic_alignment"]
             + 0.12 * bridge_gain
             + 0.08 * specific_title_bridge
-            + max(self._relation_stage_bonus(anchor, candidate, relation_type, metrics), 0.0) * 0.1
+            + 0.08 * metrics["novelty_bridge_score"]
+            + 0.08 * contrastive_bridge_score
+            + 0.06 * query_surface_match
         )
-        if relation_type == "implementation_detail" and stage_pair in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}:
-            score += 0.1 * metrics["family_bridge_score"] + 0.05 * metrics["topic_alignment"]
-            score -= 0.04 * metrics["service_surface_score"]
-        else:
-            score -= 0.16 * metrics["service_surface_score"]
-        if metrics["topic_drift"] >= 1.0:
-            score -= 0.24
-        if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
-            score -= 0.22
-        if relation_type == "supporting_evidence" and stage_pair == ("logic_graph", "retrieval_overview"):
-            score += 0.1 * metrics["family_bridge_score"] + 0.04 * metrics["topic_alignment"]
-        if relation_type == "comparison":
-            score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
-            score += 0.14 * metrics["topic_family_match"]
-            score += 0.08 * metrics["novelty_bridge_score"]
-            score += 0.18 * argument_bridge_strength
-            score += 0.06 * specific_title_bridge
-            if (
-                metrics["topic_family_match"] < 1.0
-                and metrics["topic_cluster_match"] < 1.0
-                and specific_title_bridge < 0.5
-            ):
-                score -= 0.16
-        if relation_type == "same_concept":
-            score -= 0.3 * methodology_penalty
-            score += 0.16 * metrics["novelty_bridge_score"]
-            score += 0.1 * metrics["shared_dominant_family"]
-            score += 0.16 * bridge_gain
-            score += 0.16 * specific_title_bridge
-            score += 0.14 * evidence_bridge_strength
-            score -= 0.1 * max(0.0, 0.42 - metrics["family_bridge_score"])
-            score -= 0.14 * max(0.0, 0.14 - metrics["novel_term_ratio"])
-            score -= 0.08 * max(0.0, metrics["novel_term_ratio"] - 0.82)
-        if relation_type == "supporting_evidence" and methodology_penalty > 0.0:
-            score += 0.06 * methodology_penalty
-        if relation_type == "supporting_evidence" and self._supports_same_concept_pair(anchor, candidate):
-            score += 0.12 * evidence_bridge_strength
-            score += 0.06 * specific_title_bridge
-        if relation_type in {"supporting_evidence", "same_concept", "comparison"}:
-            score -= 0.28 * duplicate_penalty
+        score += 0.06 * metrics["topic_cluster_match"]
+        score += 0.06 * metrics["topic_family_match"]
+        score += 0.04 * metrics["stance_contrast"]
+        score -= 0.18 * metrics["service_surface_score"]
+        score -= 0.18 * min(metrics["topic_drift"], 1.0)
+        score -= 0.24 * duplicate_penalty
         return max(0.0, min(score, 1.0))
 
     def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
         stage_pair = f"{self._doc_stage(anchor)}->{self._doc_stage(candidate)}".strip("->")
-        risk_flags: list[str] = []
-        if metrics["topic_drift"] >= 1.0:
-            risk_flags.append("topic_drift")
-        if metrics["service_surface_score"] >= 0.5:
-            risk_flags.append("service_surface")
-        if relation_type == "supporting_evidence" and self._is_foundational_candidate(candidate):
-            risk_flags.append("foundational_support")
-        if relation_type == "implementation_detail" and self._implementation_direction_score(anchor, candidate, metrics) < 0.08:
-            risk_flags.append("weak_direction")
-        if relation_type == "comparison" and self._argument_bridge_strength(anchor, candidate, metrics) < 0.52:
-            risk_flags.append("weak_topic_match")
-        if relation_type == "same_concept" and self._same_concept_methodology_penalty(anchor, candidate) >= 0.45:
-            risk_flags.append("methodology_gap")
-        if relation_type == "same_concept" and metrics["novel_term_ratio"] < 0.14:
-            risk_flags.append("low_novelty")
-        if relation_type == "same_concept" and metrics["novel_term_ratio"] > 0.82:
-            risk_flags.append("excess_novelty")
-        if relation_type == "same_concept" and (
-            (metrics["family_bridge_score"] < 0.45 and not (metrics["entity_overlap"] >= 1.0 and metrics["title_overlap"] >= 1.0))
-            or (metrics["shared_dominant_family"] < 1.0 and metrics["entity_overlap"] < 1.0)
-        ) and self._evidence_bridge_strength(anchor, candidate, metrics) < 0.6:
-            risk_flags.append("weak_family_bridge")
-        if relation_type in {"same_concept", "supporting_evidence"} and self._bridge_information_gain(anchor, candidate) < 0.34:
-            risk_flags.append("low_bridge_gain")
-        if relation_type == "same_concept" and self._specific_title_bridge_score(anchor, candidate) < 0.2 and metrics["title_overlap"] < 2.0:
-            risk_flags.append("low_specific_title_bridge")
         duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
         contrastive_bridge_score = self._contrastive_argument_reuse(anchor, candidate, metrics)
-        if duplicate_penalty >= 0.34 and not (
-            relation_type == "comparison"
-            and contrastive_bridge_score >= 0.56
-        ):
-            risk_flags.append("near_duplicate")
         signal_report = self._signal_runtime.build_signal_report(
             anchor,
             candidate,
@@ -925,6 +867,19 @@ class LogicOrchestrator:
                 "contrastive_bridge_score": contrastive_bridge_score,
             },
         )
+        risk_flags: list[str] = []
+        if metrics["topic_drift"] >= 1.0 or float(signal_report.get("drift_risk", 0.0) or 0.0) >= 0.75:
+            risk_flags.append("topic_drift")
+        if metrics["service_surface_score"] >= 0.5:
+            risk_flags.append("service_surface")
+        if float(signal_report.get("bridge_information_gain", 0.0) or 0.0) < 0.34:
+            risk_flags.append("low_bridge_gain")
+        if float(signal_report.get("topic_consistency", 0.0) or 0.0) < 0.24 and float(signal_report.get("drift_risk", 0.0) or 0.0) >= 0.55:
+            risk_flags.append("weak_topic_consistency")
+        if duplicate_penalty >= 0.34 and float(signal_report.get("contrast_evidence", contrastive_bridge_score) or 0.0) < 0.56:
+            risk_flags.append("near_duplicate")
+        if metrics["local_support"] < 0.22 and float(signal_report.get("query_surface_match", 0.0) or 0.0) < 0.12:
+            risk_flags.append("low_query_alignment")
         return JudgeSignals(
             dense_score=metrics["dense_score"],
             sparse_score=max(metrics["overlap_score"], metrics["content_overlap_score"]),
@@ -959,235 +914,50 @@ class LogicOrchestrator:
         relation_type, score = max(fit_scores.items(), key=lambda item: (item[1], item[0]))
         return score, relation_type, fit_scores
 
-    def _is_foundational_candidate(self, candidate: DocBrief) -> bool:
-        title_tokens = set(tokenize(candidate.title))
-        content_terms = set(tokenize(" ".join([candidate.title, candidate.summary, *candidate.claims, *candidate.keywords])))
-        topic = str(candidate.metadata.get("topic", "")).lower()
-        return (
-            topic == "retrieval"
-            and ("similarity" in title_tokens or len(content_terms & FOUNDATIONAL_TERMS) >= 2)
-            and not (content_terms & {"hybrid", "overlay", "logic", "jump", "fusion"})
+    def _candidate_signal_report(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        metrics: dict[str, float],
+        fit_scores: dict[str, float],
+        relation_type: str,
+    ) -> dict[str, float]:
+        return self._signal_runtime.build_signal_report(
+            anchor,
+            candidate,
+            local_signals={
+                **metrics,
+                "best_relation": relation_type,
+                "relation_fit": fit_scores.get(relation_type, 0.0),
+                "same_concept_fit": fit_scores.get("same_concept", 0.0),
+                "comparison_fit": fit_scores.get("comparison", 0.0),
+                "supporting_evidence_fit": fit_scores.get("supporting_evidence", 0.0),
+            },
         )
 
-    def _workflow_prerequisite_signal(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> bool:
-        combined = f"{anchor.title} {anchor.summary} {' '.join(anchor.claims)} {candidate.title} {candidate.summary} {' '.join(candidate.claims)}".lower()
-        anchor_tokens = set(tokenize(anchor.title))
-        candidate_tokens = set(tokenize(candidate.title))
-        if "scout" in anchor_tokens and "judge" in candidate_tokens:
-            return True
-        if any(cue in combined for cue in ORDER_CUES):
-            return metrics["specific_role_score"] >= 0.5 or self._doc_stage(candidate) == "agent_roles"
-        return False
+    @staticmethod
+    def _graph_hygiene_failure(signal_report: dict[str, float]) -> bool:
+        return (
+            float(signal_report.get("drift_risk", 0.0) or 0.0) >= 0.82
+            and float(signal_report.get("topic_consistency", 0.0) or 0.0) < 0.2
+            and float(signal_report.get("bridge_information_gain", 0.0) or 0.0) < 0.28
+        )
 
-    def _topic_drift_exception(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float]) -> bool:
-        if metrics["topic_drift"] < 1.0:
-            return True
-        if fit_scores["prerequisite"] >= 0.72 and (
-            metrics["specific_role_score"] >= 0.5
-            or self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics) >= 0.22
-            or self._workflow_prerequisite_signal(anchor, candidate, metrics)
-        ):
-            return True
-        if (
-            fit_scores["supporting_evidence"] >= 0.28
-            and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22
-            and not self._is_foundational_candidate(candidate)
-        ):
-            return True
-        if (
-            self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}
-            and self._doc_stage(candidate) == self._doc_stage(anchor)
-            and (
-                (
-                    fit_scores["supporting_evidence"] >= 0.4
-                    and metrics["topic_alignment"] >= 1.0
-                    and (metrics["content_overlap_score"] >= 0.14 or metrics["dense_score"] >= 0.58)
-                )
-                or (
-                    fit_scores["same_concept"] >= 0.46
-                    and (
-                        metrics["topic_cluster_match"] >= 1.0
-                        or metrics["topic_alignment"] >= 1.0
-                        or metrics["content_overlap_score"] >= 0.18
-                    )
-                    and metrics["dense_score"] >= 0.56
-                )
-            )
-        ):
-            return True
-        if (
-            fit_scores["implementation_detail"] >= 0.72
-            and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-        ):
-            return True
-        if (
-            self._is_argumentative_pair(anchor, candidate)
-            and fit_scores["comparison"] >= 0.52
-            and (
-                metrics["topic_family_match"] >= 1.0
-                or metrics["topic_cluster_match"] >= 1.0
-                or self._specific_title_bridge_score(anchor, candidate) >= 0.5
-            )
-            and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
-        ):
-            return True
-        return False
-
-    def _targeted_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[tuple[float, CandidateProposal]]:
-        anchor_stage = self._doc_stage(anchor)
-        proposals: list[tuple[float, CandidateProposal]] = []
-        for candidate in corpus:
-            if candidate.doc_id == anchor.doc_id:
-                continue
-            metrics = self._candidate_metrics(anchor, candidate)
-            _, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-            if not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
-                continue
-            stage_bonus = max(
-                self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics),
-                self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics),
-                self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics),
-                self._relation_stage_bonus(anchor, candidate, "comparison", metrics),
-            )
-            score = max(fit_scores.values()) + 0.22 * stage_bonus
-            if anchor_stage == "agent_roles" and fit_scores["prerequisite"] >= 0.72 and (
-                self._has_listing_context(anchor) >= 1.0 or self._workflow_prerequisite_signal(anchor, candidate, metrics)
-            ):
-                proposals.append(
-                    (
-                        score + 0.16,
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted role/workflow prerequisite candidate",
-                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
-                            score_hint=min(score + 0.16, 0.99),
-                        ),
-                    )
-                )
-            if fit_scores["supporting_evidence"] >= 0.28 and self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics) >= 0.22:
-                proposals.append(
-                    (
-                        score + 0.1,
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted stage-supporting evidence candidate",
-                            query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
-                            score_hint=min(score + 0.1, 0.99),
-                        ),
-                    )
-                )
-            if (
-                anchor_stage == "logic_graph"
-                and self._doc_stage(candidate) == "logic_policy"
-                and fit_scores["implementation_detail"] >= 0.72
-                and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22
-            ):
-                proposals.append(
-                    (
-                        score + 0.14,
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted logic graph to policy implementation candidate",
-                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
-                            score_hint=min(score + 0.14, 0.99),
-                        ),
-                    )
-                )
-            if anchor_stage == "agent_overview" and fit_scores["implementation_detail"] >= 0.78 and self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics) >= 0.22:
-                proposals.append(
-                    (
-                        score + 0.08,
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted overview implementation-detail candidate",
-                            query=" ".join((candidate.keywords + [candidate.title])[:4]),
-                            score_hint=min(score + 0.08, 0.99),
-                        ),
-                    )
-                )
-            if (
-                self._is_argumentative_pair(anchor, candidate)
-                and (
-                    metrics["topic_family_match"] >= 1.0
-                    or metrics["topic_cluster_match"] >= 1.0
-                    or self._specific_title_bridge_score(anchor, candidate) >= 0.5
-                )
-                and fit_scores["comparison"] >= 0.58
-                and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
-            ):
-                proposals.append(
-                    (
-                        score + 0.18 + 0.08 * metrics["stance_contrast"] + 0.12 * metrics["topic_family_match"],
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted argumentative comparison candidate",
-                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
-                            score_hint=min(score + 0.18, 0.99),
-                        ),
-                    )
-                )
-            if (
-                anchor_stage in {"scientific_evidence", "clinical_passage"}
-                and self._doc_stage(candidate) == anchor_stage
-                and fit_scores["supporting_evidence"] >= 0.42
-                and metrics["topic_alignment"] >= 1.0
-                and (metrics["content_overlap_score"] >= 0.14 or metrics["dense_score"] >= 0.58)
-            ):
-                proposals.append(
-                    (
-                        score + 0.16 + 0.06 * metrics["topic_cluster_match"],
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted scientific/clinical supporting evidence candidate",
-                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
-                            score_hint=min(score + 0.16, 0.99),
-                        ),
-                    )
-                )
-            if (
-                anchor_stage in {"scientific_evidence", "clinical_passage"}
-                and self._doc_stage(candidate) == anchor_stage
-                and fit_scores["same_concept"] >= 0.62
-                and (
-                    metrics["topic_cluster_match"] >= 1.0
-                    or metrics["topic_alignment"] >= 1.0
-                    or metrics["content_overlap_score"] >= 0.22
-                )
-                and metrics["dense_score"] >= 0.62
-            ):
-                bridge_bonus = 0.14 + 0.08 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate))
-                bridge_bonus *= max(0.6, 1.0 - 0.35 * self._same_concept_methodology_penalty(anchor, candidate))
-                proposals.append(
-                    (
-                        score + bridge_bonus,
-                        CandidateProposal(
-                            doc_id=candidate.doc_id,
-                            reason="targeted scientific/clinical same-concept candidate",
-                            query=" ".join((candidate.keywords + candidate.relation_hints + [candidate.title])[:4]),
-                            score_hint=min(score + bridge_bonus, 0.99),
-                        ),
-                    )
-                )
-        proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
-        dedup: dict[str, tuple[float, CandidateProposal]] = {}
-        for score, proposal in proposals:
-            previous = dedup.get(proposal.doc_id)
-            if previous is None or score > previous[0]:
-                dedup[proposal.doc_id] = (score, proposal)
-        ranked = sorted(dedup.values(), key=lambda item: (-item[0], item[1].doc_id))
-        return ranked[:8]
-
-    def _proposal_bucket_quotas(self, anchor: DocBrief, limit: int) -> dict[str, int]:
-        stage = self._doc_stage(anchor)
-        if stage == "argument_claim":
-            return {"comparison": min(limit, 4), "same_concept": min(limit, 2), "supporting_evidence": min(limit, 1)}
-        if stage in {"scientific_evidence", "clinical_passage"}:
-            return {"supporting_evidence": min(limit, 3), "same_concept": min(limit, 2), "implementation_detail": min(limit, 1)}
-        if stage == "agent_roles":
-            return {"prerequisite": min(limit, 4), "implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 1)}
-        if stage in {"logic_graph", "retrieval_overview", "ops_overview", "ops_service", "agent_overview"}:
-            return {"implementation_detail": min(limit, 3), "supporting_evidence": min(limit, 2), "prerequisite": min(limit, 1)}
-        return {"implementation_detail": min(limit, 2), "supporting_evidence": min(limit, 2), "prerequisite": min(limit, 1)}
+    def _candidate_priority_score(
+        self,
+        *,
+        base_score: float,
+        metrics: dict[str, float],
+        fit_scores: dict[str, float],
+        signal_report: dict[str, float],
+    ) -> float:
+        report = self._signal_runtime.compute_candidate_priority(
+            base_score=base_score,
+            metrics=metrics,
+            fit_scores=fit_scores,
+            signal_report=signal_report,
+        )
+        return float(report.get("priority_score", base_score) or base_score)
 
     def _select_diverse_proposals(
         self,
@@ -1195,25 +965,8 @@ class LogicOrchestrator:
         scored: list[tuple[float, str, CandidateProposal]],
         limit: int,
     ) -> list[CandidateProposal]:
-        quotas = self._proposal_bucket_quotas(anchor, limit)
-        buckets: dict[str, list[tuple[float, CandidateProposal]]] = {key: [] for key in quotas}
-        for score, relation_type, proposal in scored:
-            buckets.setdefault(relation_type, []).append((score, proposal))
-
         selected: list[CandidateProposal] = []
         selected_ids: set[str] = set()
-        for relation_type, quota in quotas.items():
-            for score, proposal in buckets.get(relation_type, []):
-                if len(selected) >= limit:
-                    break
-                if quota <= 0 or proposal.doc_id in selected_ids:
-                    continue
-                selected.append(proposal)
-                selected_ids.add(proposal.doc_id)
-                quota -= 1
-            if len(selected) >= limit:
-                break
-
         for score, relation_type, proposal in sorted(scored, key=lambda item: (-item[0], item[1], item[2].doc_id)):
             if len(selected) >= limit:
                 break
@@ -1233,15 +986,7 @@ class LogicOrchestrator:
         if len(accepted) <= limit:
             return accepted
         remaining = list(accepted)
-        specific_term_frequency: Counter[str] = Counter()
-        for item in accepted:
-            candidate = candidate_map.get(item.candidate_doc_id)
-            if candidate is None:
-                continue
-            specific_term_frequency.update(self._specific_title_terms(candidate))
         selected: list[CandidateAssessment] = []
-        selected_relations: Counter[str] = Counter()
-        selected_stages: Counter[str] = Counter()
         selected_terms: list[set[str]] = []
         selected_specific_terms: list[set[str]] = []
         while remaining and len(selected) < limit:
@@ -1265,53 +1010,25 @@ class LogicOrchestrator:
                         for chosen_terms in selected_specific_terms
                     ]
                     specific_novelty = 1.0 - max(specific_similarities, default=0.0)
-                utility_bonus = 0.08 * max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0))
-                relation_bonus = 0.06 if selected_relations[item.relation_type] == 0 else max(0.0, 0.03 - 0.015 * selected_relations[item.relation_type])
-                candidate_stage = self._doc_stage(candidate) if candidate is not None else ""
-                stage_bonus = 0.04 if candidate_stage and selected_stages[candidate_stage] == 0 else 0.0
-                mirror_bonus = 0.03 if item.relation_type in {"same_concept", "comparison"} else 0.0
-                family_bonus = 0.0
-                if (
-                    item.relation_type == "comparison"
-                    and candidate is not None
-                    and self._topic_family(anchor)
-                    and self._topic_family(anchor) == self._topic_family(candidate)
-                ):
-                    family_bonus = 0.08
-                utility_value = max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0))
-                scientific_same_concept = (
-                    candidate is not None
-                    and item.relation_type == "same_concept"
-                    and self._supports_same_concept_pair(anchor, candidate)
+                activation_profile = getattr(item.edge, "activation_profile", {}) if item.edge is not None else {}
+                score = float(
+                    self._signal_runtime.compute_edge_budget_score(
+                        score=item.score,
+                        utility_score=max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0)),
+                        activation_prior=max(0.0, min(activation_profile.get("activation_prior", 0.0), 1.0)),
+                        novelty=novelty,
+                        specific_novelty=specific_novelty,
+                        drift_risk=max(0.0, min(activation_profile.get("drift_risk", 0.0), 1.0)),
+                        duplicate_risk=max(0.0, min(activation_profile.get("duplicate_risk", 0.0), 1.0)),
+                    ).get("selection_score", item.score)
+                    or item.score
                 )
-                specificity_bonus = 0.0
-                if scientific_same_concept:
-                    specific_rarity = 0.0
-                    if candidate_specific_terms:
-                        rarity_scores = [
-                            1.0 / max(1, specific_term_frequency.get(term, 1))
-                            for term in candidate_specific_terms
-                        ]
-                        specific_rarity = sum(rarity_scores) / len(rarity_scores)
-                    specificity_bonus += 0.16 * specific_novelty
-                    specificity_bonus += 0.1 * min(len(candidate_specific_terms) / 4.0, 1.0)
-                    specificity_bonus += 0.06 * max(0.0, min(self._bridge_information_gain(anchor, candidate), 1.0))
-                    specificity_bonus += 0.18 * specific_rarity
-                base_multiplier = 0.9 + 0.1 * utility_value
-                if scientific_same_concept:
-                    base_multiplier = 0.58 + 0.12 * utility_value
-                score = item.score * base_multiplier
-                score += 0.12 * novelty + utility_bonus + relation_bonus + stage_bonus + mirror_bonus + family_bonus + specificity_bonus
                 if score > best_score:
                     best_score = score
                     best_index = index
             chosen = remaining.pop(best_index)
             selected.append(chosen)
-            selected_relations[chosen.relation_type] += 1
             chosen_candidate = candidate_map.get(chosen.candidate_doc_id)
-            chosen_stage = self._doc_stage(chosen_candidate) if chosen_candidate is not None else ""
-            if chosen_stage:
-                selected_stages[chosen_stage] += 1
             selected_terms.append(self._normalized_tokens(self._content_terms(chosen_candidate)) if chosen_candidate is not None else set())
             selected_specific_terms.append(self._specific_title_terms(chosen_candidate) if chosen_candidate is not None else set())
         return selected
@@ -1334,26 +1051,21 @@ class LogicOrchestrator:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-            if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+            signal_report = self._candidate_signal_report(anchor, candidate, metrics, fit_scores, relation_type)
+            if self._is_live_provider() and self._graph_hygiene_failure(signal_report):
                 continue
-            bridge_bonus = 0.08 * max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate), metrics["novelty_bridge_score"])
-            score = (
-                0.58 * dense_score
-                + 0.2 * rerank_score
-                + 0.12 * metrics["local_support"]
-                + 0.1 * metrics["novelty_bridge_score"]
-                + bridge_bonus
+            score = self._candidate_priority_score(
+                base_score=0.62 * dense_score + 0.18 * rerank_score,
+                metrics=metrics,
+                fit_scores=fit_scores,
+                signal_report=signal_report,
             )
-            if relation_type == "same_concept":
-                score += 0.08 * fit_scores["same_concept"] * max(0.6, 1.0 - 0.4 * self._same_concept_methodology_penalty(anchor, candidate))
-            if relation_type == "comparison":
-                score += 0.06 * fit_scores["comparison"]
             proposals.append(
                 (
                     score,
                     CandidateProposal(
                         doc_id=candidate.doc_id,
-                        reason=f"dense neighbor suggests {relation_type}",
+                        reason=f"dense neighbor aligns with {relation_type}",
                         query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
                         score_hint=min(score, 0.99),
                     ),
@@ -1496,60 +1208,8 @@ class LogicOrchestrator:
         contradiction_penalty = 0.15 if getattr(result, "contradiction_flags", None) else 0.0
         return max(0.0, 0.36 * min(anchor_cov + candidate_cov, 1.0) + 0.38 * span_score + 0.14 + mention_bonus - contradiction_penalty)
 
-    def _relation_cues(self, anchor: DocBrief, candidate: DocBrief, result) -> bool:
-        relation_type = result.relation_type
-        text = " ".join(
-            [
-                anchor.title,
-                anchor.summary,
-                candidate.title,
-                candidate.summary,
-                result.rationale,
-                getattr(result, "decision_reason", ""),
-                *result.evidence_spans,
-            ]
-        ).lower()
-        evidence_terms = set(tokenize(text))
-        anchor_terms = self._content_terms(anchor)
-        candidate_terms = self._content_terms(candidate)
-        shared_evidence_terms = len(evidence_terms & (anchor_terms | candidate_terms))
-        if relation_type == "supporting_evidence":
-            return (
-                any(cue in text for cue in SUPPORT_CUES)
-                or shared_evidence_terms >= 4
-                or len(evidence_terms & candidate_terms) >= 3
-            )
-        if relation_type == "implementation_detail":
-            return any(cue in text for cue in DETAIL_CUES) or candidate.title.lower() in self._brief_text(anchor)
-        if relation_type == "prerequisite":
-            return any(cue in text for cue in ORDER_CUES | LISTING_WORDS)
-        if relation_type == "same_concept":
-            return any(cue in text for cue in {"same", "alias", "equivalent", "become", "becomes"})
-        if relation_type == "comparison":
-            return self._is_argumentative_pair(anchor, candidate) or any(cue in text for cue in {"compare", "comparison", "contrast", "versus", "vs", "counterargument", "opposing"})
-        return False
-
     def _relation_threshold(self, relation_type: str) -> RelationQualityConfig:
         return self._edge_quality().relation_thresholds.get(relation_type, RelationQualityConfig())
-
-    def _effective_threshold(self, anchor: DocBrief, candidate: DocBrief, relation_type: str) -> RelationQualityConfig:
-        threshold = self._relation_threshold(relation_type)
-        signal_weight = max(self._dataset_edge_signal(anchor), self._dataset_edge_signal(candidate))
-        if relation_type == "comparison":
-            return RelationQualityConfig(
-                enabled=True,
-                min_confidence=max(0.72, threshold.min_confidence - 0.04 * signal_weight),
-                min_support=max(0.18, threshold.min_support - 0.06 * signal_weight),
-                min_evidence_quality=max(0.2, threshold.min_evidence_quality - 0.04 * signal_weight),
-            )
-        if relation_type == "same_concept":
-            return RelationQualityConfig(
-                enabled=True,
-                min_confidence=max(0.74, threshold.min_confidence - 0.03 * signal_weight),
-                min_support=max(0.22, threshold.min_support - 0.04 * signal_weight),
-                min_evidence_quality=max(0.22, threshold.min_evidence_quality - 0.03 * signal_weight),
-            )
-        return threshold
 
     def _is_live_provider(self) -> bool:
         provider = self._provider()
@@ -1588,87 +1248,52 @@ class LogicOrchestrator:
         fit_scores: dict[str, float],
         signal_bundle: JudgeSignals,
     ):
-        if review_result is None:
-            return result
-        model_relation = result.relation_type if result.relation_type in RELATION_TYPES else signal_bundle.best_relation
-        reviewer_relation = review_result.relation_type if review_result.relation_type in RELATION_TYPES else model_relation
-        best_relation = signal_bundle.best_relation if signal_bundle.best_relation in RELATION_TYPES else model_relation
-        hard_risks = {"service_surface", "foundational_support"}
-        risk_flags = {str(flag) for flag in signal_bundle.risk_flags}
-        reviewer_priority = bool(review_result.accepted) and (
-            float(getattr(review_result, "utility_score", 0.0)) >= max(0.38, float(getattr(result, "utility_score", 0.0)) - 0.1)
-            or float(review_result.confidence) >= max(0.74, float(result.confidence) - 0.06)
+        chosen = review_result or result
+        resolved_relation = (
+            chosen.relation_type
+            if getattr(chosen, "relation_type", "") in RELATION_TYPES
+            else (
+                result.relation_type
+                if getattr(result, "relation_type", "") in RELATION_TYPES
+                else signal_bundle.best_relation
+            )
         )
-        chosen = review_result if reviewer_priority else result
-        resolved_relation = reviewer_relation if reviewer_priority else model_relation
-        if (
-            not reviewer_priority
-            and best_relation in RELATION_TYPES
-            and fit_scores.get(best_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) + 0.1
-        ):
-            resolved_relation = best_relation
-
-        utility_score = max(
-            signal_bundle.utility_score,
-            float(getattr(result, "utility_score", 0.0)),
-            float(getattr(review_result, "utility_score", 0.0)),
+        utility_score = max(signal_bundle.utility_score, float(getattr(chosen, "utility_score", 0.0)))
+        support_score = max(signal_bundle.local_support, float(getattr(chosen, "support_score", 0.0)))
+        confidence = max(0.0, min(0.99, float(getattr(chosen, "confidence", 0.0))))
+        uncertainty = max(
+            float(getattr(chosen, "uncertainty", 0.0)),
+            float(signal_bundle.uncertainty_hint),
         )
-        support_score = max(
-            signal_bundle.local_support,
-            float(getattr(result, "support_score", 0.0)),
-            float(getattr(review_result, "support_score", 0.0)),
-        )
-        confidence = max(
-            0.0,
-            min(
-                0.99,
-                0.4 * float(result.confidence)
-                + 0.45 * float(review_result.confidence)
-                + 0.15 * fit_scores.get(resolved_relation, 0.0),
-            ),
-        )
-        uncertainty = min(
-            1.0,
-            0.4 * float(getattr(result, "uncertainty", max(0.0, 1.0 - float(result.confidence))))
-            + 0.45 * float(getattr(review_result, "uncertainty", max(0.0, 1.0 - float(review_result.confidence))))
-            + 0.15 * float(signal_bundle.uncertainty_hint),
-        )
-        accepted = bool(chosen.accepted)
-        if reviewer_priority and utility_score >= 0.42 and fit_scores.get(resolved_relation, 0.0) >= 0.2:
-            accepted = True
-        if hard_risks & risk_flags and utility_score < 0.72:
-            accepted = False
-        if signal_bundle.drift_risk >= 0.72 and signal_bundle.topic_consistency < 0.3:
-            accepted = False
-        if fit_scores.get(resolved_relation, 0.0) < 0.18:
-            accepted = False
-
+        accepted = bool(getattr(chosen, "accepted", False))
+        decision_reason = str(
+            getattr(chosen, "decision_reason", "")
+            or ("review_rejected" if review_result is not None and not accepted else "agent_consensus")
+        )[:200]
         return SimpleNamespace(
             accepted=accepted,
             relation_type=resolved_relation,
             confidence=confidence,
-            evidence_spans=self._merge_spans(result.evidence_spans, getattr(review_result, "evidence_spans", [])),
-            rationale=(getattr(chosen, "rationale", "") or getattr(review_result, "rationale", "") or result.rationale)[:200],
+            evidence_spans=self._merge_spans(
+                getattr(result, "evidence_spans", []),
+                getattr(review_result, "evidence_spans", []),
+            ),
+            rationale=(getattr(chosen, "rationale", "") or getattr(result, "rationale", ""))[:200],
             support_score=max(0.0, min(1.0, support_score)),
             contradiction_flags=self._merge_spans(
                 [str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
                 [str(flag) for flag in getattr(review_result, "contradiction_flags", []) or []],
             ),
-            decision_reason=(
-                "reviewer-led consensus"
-                if reviewer_priority
-                else "judge-led consensus"
-            )[:200],
+            decision_reason=decision_reason,
             semantic_relation_label=str(getattr(chosen, "semantic_relation_label", resolved_relation) or resolved_relation)[:80],
             canonical_relation=resolved_relation if accepted else "none",
             utility_score=max(0.0, min(1.0, utility_score)),
             uncertainty=uncertainty,
+            reject_reason=decision_reason,
         )
 
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
-        topic = str(anchor.metadata.get("topic", "")).lower()
         anchor_terms = self._content_terms(anchor)
-        title_tokens = set(tokenize(anchor.title))
         claim_score = min(len([claim for claim in anchor.claims if claim.strip()]) / 2.0, 1.0)
         richness = (
             0.26 * claim_score
@@ -1682,43 +1307,25 @@ class LogicOrchestrator:
             richness += 0.06
         if self._stance(anchor):
             richness += 0.04
-        if topic == "evaluation":
-            evaluation_terms = {"ann", "recall", "mrr", "ndcg", "benchmark", "report", "reporting", "metrics"}
-            return len(anchor_terms & evaluation_terms) >= 2 or "reporting" in title_tokens
-        if topic == "hnsw":
-            return False
-        if "similarity" in title_tokens:
-            return False
-        if topic == "retrieval" and len(anchor_terms & FOUNDATIONAL_TERMS) >= 2 and not (anchor_terms & {"hybrid", "overlay", "logic"}):
-            return False
-        if topic in {"retrieval", "logic", "deepagents", "ops"}:
-            return True
         text_tokens = set(tokenize(self._brief_text(anchor)))
         return richness >= 0.36 or bool(text_tokens & DISCOVERY_TERMS) or len(anchor.relation_hints) >= 4
 
     def discovery_anchor_priority(self, anchor: DocBrief) -> float:
         content_terms = self._content_terms(anchor)
-        keyword_score = min(len(anchor.keywords) / 8.0, 1.0)
-        entity_score = min(len(anchor.entities) / 4.0, 1.0)
-        claim_score = min(len([claim for claim in anchor.claims if claim.strip()]) / 2.0, 1.0)
-        summary_score = min(len(anchor.summary) / 180.0, 1.0)
-        hint_terms = set(anchor.relation_hints)
-        cue_bonus = min(len(hint_terms) / 5.0, 1.0)
-        cluster_bonus = 1.0 if self._topic_cluster(anchor) else 0.0
-        stance_bonus = 1.0 if self._stance(anchor) else 0.0
-        specificity_bonus = max(self._title_specificity_score(anchor), 0.0)
-        return (
-            0.2 * claim_score
-            + 0.18 * keyword_score
-            + 0.14 * entity_score
-            + 0.12 * cue_bonus
-            + 0.1 * summary_score
-            + 0.1 * min(len(content_terms) / 14.0, 1.0)
-            + 0.1 * self._dataset_edge_signal(anchor)
-            + 0.04 * cluster_bonus
-            + 0.02 * stance_bonus
-            + 0.04 * specificity_bonus
+        report = self._signal_runtime.compute_anchor_priority(
+            anchor,
+            features={
+                "claim_score": min(len([claim for claim in anchor.claims if claim.strip()]) / 2.0, 1.0),
+                "keyword_score": min(len(anchor.keywords) / 8.0, 1.0),
+                "entity_score": min(len(anchor.entities) / 4.0, 1.0),
+                "cue_score": min(len(set(anchor.relation_hints)) / 5.0, 1.0),
+                "content_score": min(len(content_terms) / 14.0, 1.0),
+                "dataset_edge_signal": self._dataset_edge_signal(anchor),
+                "title_specificity": max(self._title_specificity_score(anchor), 0.0),
+            },
+            corpus_profile={},
         )
+        return float(report.get("priority_score", 0.0) or 0.0)
 
     def _corpus_graph_profile(self, briefs: list[DocBrief]) -> dict[str, float]:
         if not briefs:
@@ -1789,34 +1396,40 @@ class LogicOrchestrator:
                 ordered.extend(brief.doc_id for brief in group[: min(len(group), 6)])
                 continue
             centrality, neighborhoods = self._dense_anchor_neighborhoods(group)
-            cluster_members: dict[str, list[DocBrief]] = {}
-            family_members: dict[str, list[DocBrief]] = {}
-            for brief in group:
-                cluster = self._topic_cluster(brief)
-                if cluster:
-                    cluster_members.setdefault(cluster, []).append(brief)
-                family = self._topic_family(brief)
-                if family:
-                    family_members.setdefault(family, []).append(brief)
             specific_bridge_potential = {
                 brief.doc_id: self._specific_title_bridge_potential(brief, group)
                 for brief in group
             }
             cap_base = max(6, min(len(group), len(group) // 8 + 4))
             floor = max(0.34, min(0.54, 0.54 - 0.16 * profile["graph_potential"] + 0.04 * profile["argument_ratio"]))
-            priority_map = {
-                brief.doc_id: (
-                    0.64 * self.discovery_anchor_priority(brief)
-                    + 0.24 * centrality.get(brief.doc_id, 0.0)
-                    + 0.12 * specific_bridge_potential.get(brief.doc_id, 0.0)
+            priority_map = {}
+            bridge_pressure = sum(1 for brief in group if specific_bridge_potential.get(brief.doc_id, 0.0) >= 0.75) / max(1, len(group))
+            for brief in group:
+                priority_map[brief.doc_id] = float(
+                    self._signal_runtime.compute_anchor_priority(
+                        brief,
+                        features={
+                            "claim_score": min(len([claim for claim in brief.claims if claim.strip()]) / 2.0, 1.0),
+                            "keyword_score": min(len(brief.keywords) / 8.0, 1.0),
+                            "entity_score": min(len(brief.entities) / 4.0, 1.0),
+                            "cue_score": min(len(set(brief.relation_hints)) / 5.0, 1.0),
+                            "content_score": min(len(self._content_terms(brief)) / 14.0, 1.0),
+                            "dataset_edge_signal": self._dataset_edge_signal(brief),
+                            "centrality": centrality.get(brief.doc_id, 0.0),
+                            "bridge_potential": specific_bridge_potential.get(brief.doc_id, 0.0),
+                            "title_specificity": max(self._title_specificity_score(brief), 0.0),
+                        },
+                        corpus_profile={
+                            **profile,
+                            "bridge_pressure": bridge_pressure,
+                        },
+                    ).get("priority_score", 0.0)
+                    or 0.0
                 )
-                for brief in group
-            }
             eligible = [brief for brief in group if priority_map.get(brief.doc_id, 0.0) >= floor]
             if not eligible:
                 eligible = list(group)
             eligibility_pressure = len(eligible) / max(1, len(group))
-            bridge_pressure = sum(1 for brief in group if specific_bridge_potential.get(brief.doc_id, 0.0) >= 0.75) / max(1, len(group))
             pressure = max(eligibility_pressure, 0.6 * eligibility_pressure + 0.4 * bridge_pressure)
             cap_multiplier = 0.9 + 0.42 * profile["graph_potential"] + 0.8 * pressure
             cap = max(6, min(len(group), int(round(cap_base * cap_multiplier))))
@@ -1824,22 +1437,38 @@ class LogicOrchestrator:
             kept: list[str] = []
             selected_clusters: set[str] = set()
             selected_families: set[str] = set()
-            followup_clusters: set[str] = set()
-            followup_families: set[str] = set()
             while eligible and len(kept) < cap:
                 best_id = ""
                 best_score = float("-inf")
                 best_index = 0
                 for index, brief in enumerate(eligible):
-                    base_score = priority_map.get(brief.doc_id, 0.0)
                     coverage_gain = 0.0
                     for neighbor_id, weight in neighborhoods.get(brief.doc_id, [(brief.doc_id, 1.0)]):
                         coverage_gain += max(0.0, weight - coverage.get(neighbor_id, 0.0))
-                    cluster_bonus = 0.12 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
-                    family_bonus = 0.16 if self._topic_family(brief) and self._topic_family(brief) not in selected_families else 0.0
-                    specificity_bonus = 0.04 * max(self._title_specificity_score(brief), 0.0)
-                    bridge_bonus = 0.08 * specific_bridge_potential.get(brief.doc_id, 0.0)
-                    score = 0.5 * base_score + 0.28 * coverage_gain + cluster_bonus + family_bonus + specificity_bonus + bridge_bonus
+                    score = float(
+                        self._signal_runtime.compute_anchor_priority(
+                            brief,
+                            features={
+                                "claim_score": min(len([claim for claim in brief.claims if claim.strip()]) / 2.0, 1.0),
+                                "keyword_score": min(len(brief.keywords) / 8.0, 1.0),
+                                "entity_score": min(len(brief.entities) / 4.0, 1.0),
+                                "cue_score": min(len(set(brief.relation_hints)) / 5.0, 1.0),
+                                "content_score": min(len(self._content_terms(brief)) / 14.0, 1.0),
+                                "dataset_edge_signal": self._dataset_edge_signal(brief),
+                                "centrality": centrality.get(brief.doc_id, 0.0),
+                                "bridge_potential": specific_bridge_potential.get(brief.doc_id, 0.0),
+                                "title_specificity": max(self._title_specificity_score(brief), 0.0),
+                                "coverage_gain": coverage_gain,
+                                "cluster_novelty": 1.0 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0,
+                                "family_novelty": 1.0 if self._topic_family(brief) and self._topic_family(brief) not in selected_families else 0.0,
+                            },
+                            corpus_profile={
+                                **profile,
+                                "bridge_pressure": bridge_pressure,
+                            },
+                        ).get("priority_score", 0.0)
+                        or 0.0
+                    )
                     if score > best_score:
                         best_score = score
                         best_id = brief.doc_id
@@ -1856,77 +1485,6 @@ class LogicOrchestrator:
                 family = self._topic_family(chosen)
                 if family:
                     selected_families.add(family)
-                if (
-                    family
-                    and family not in followup_families
-                    and len(family_members.get(family, [])) >= 2
-                    and len(kept) < cap
-                    and (
-                        specific_bridge_potential.get(chosen.doc_id, 0.0) >= 0.58
-                        or profile["argument_ratio"] >= 0.3
-                    )
-                ):
-                    family_followups = [
-                        brief
-                        for brief in eligible
-                        if self._topic_family(brief) == family and brief.doc_id not in kept
-                    ]
-                    if family_followups:
-                        family_followups.sort(
-                            key=lambda brief: (
-                                -(
-                                    0.48 * priority_map.get(brief.doc_id, 0.0)
-                                    + 0.3 * specific_bridge_potential.get(brief.doc_id, 0.0)
-                                    + 0.14 * centrality.get(brief.doc_id, 0.0)
-                                    + 0.08 * max(self._title_specificity_score(brief), 0.0)
-                                ),
-                                brief.doc_id,
-                            )
-                        )
-                        followup = family_followups[0]
-                        kept.append(followup.doc_id)
-                        eligible = [brief for brief in eligible if brief.doc_id != followup.doc_id]
-                        for neighbor_id, weight in neighborhoods.get(followup.doc_id, [(followup.doc_id, 1.0)]):
-                            coverage[neighbor_id] = max(coverage.get(neighbor_id, 0.0), weight)
-                        selected_families.add(family)
-                        followup_families.add(family)
-                        cluster = self._topic_cluster(followup)
-                        if cluster:
-                            selected_clusters.add(cluster)
-                        continue
-                if (
-                    cluster
-                    and cluster not in followup_clusters
-                    and len(cluster_members.get(cluster, [])) >= 2
-                    and len(kept) < cap
-                    and (
-                        specific_bridge_potential.get(chosen.doc_id, 0.0) >= 0.62
-                        or profile["argument_ratio"] >= 0.3
-                    )
-                ):
-                    followup_candidates = [
-                        brief
-                        for brief in eligible
-                        if self._topic_cluster(brief) == cluster and brief.doc_id not in kept
-                    ]
-                    if followup_candidates:
-                        followup_candidates.sort(
-                            key=lambda brief: (
-                                -(
-                                    0.5 * priority_map.get(brief.doc_id, 0.0)
-                                    + 0.3 * specific_bridge_potential.get(brief.doc_id, 0.0)
-                                    + 0.2 * centrality.get(brief.doc_id, 0.0)
-                                ),
-                                brief.doc_id,
-                            )
-                        )
-                        followup = followup_candidates[0]
-                        kept.append(followup.doc_id)
-                        eligible = [brief for brief in eligible if brief.doc_id != followup.doc_id]
-                        for neighbor_id, weight in neighborhoods.get(followup.doc_id, [(followup.doc_id, 1.0)]):
-                            coverage[neighbor_id] = max(coverage.get(neighbor_id, 0.0), weight)
-                        selected_clusters.add(cluster)
-                        followup_clusters.add(cluster)
             reserve_cap = max(0, min(len(group) - len(kept), max(4, cap // 2)))
             if reserve_cap > 0:
                 reserve_ranked: list[tuple[float, DocBrief]] = []
@@ -1936,17 +1494,28 @@ class LogicOrchestrator:
                     bridge_potential = specific_bridge_potential.get(brief.doc_id, 0.0)
                     if bridge_potential < 0.5:
                         continue
-                    cluster = self._topic_cluster(brief)
-                    family = self._topic_family(brief)
-                    cluster_bonus = 0.14 if cluster and cluster not in selected_clusters else 0.0
-                    family_bonus = 0.16 if family and family not in selected_families else 0.0
-                    reserve_score = (
-                        0.48 * bridge_potential
-                        + 0.26 * self.discovery_anchor_priority(brief)
-                        + 0.16 * centrality.get(brief.doc_id, 0.0)
-                        + 0.1 * max(self._title_specificity_score(brief), 0.0)
-                        + cluster_bonus
-                        + family_bonus
+                    reserve_score = float(
+                        self._signal_runtime.compute_anchor_priority(
+                            brief,
+                            features={
+                                "claim_score": min(len([claim for claim in brief.claims if claim.strip()]) / 2.0, 1.0),
+                                "keyword_score": min(len(brief.keywords) / 8.0, 1.0),
+                                "entity_score": min(len(brief.entities) / 4.0, 1.0),
+                                "cue_score": min(len(set(brief.relation_hints)) / 5.0, 1.0),
+                                "content_score": min(len(self._content_terms(brief)) / 14.0, 1.0),
+                                "dataset_edge_signal": self._dataset_edge_signal(brief),
+                                "centrality": centrality.get(brief.doc_id, 0.0),
+                                "bridge_potential": bridge_potential,
+                                "title_specificity": max(self._title_specificity_score(brief), 0.0),
+                                "cluster_novelty": 1.0 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0,
+                                "family_novelty": 1.0 if self._topic_family(brief) and self._topic_family(brief) not in selected_families else 0.0,
+                            },
+                            corpus_profile={
+                                **profile,
+                                "bridge_pressure": bridge_pressure,
+                            },
+                        ).get("priority_score", 0.0)
+                        or 0.0
                     )
                     reserve_ranked.append((reserve_score, brief))
                 reserve_ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
@@ -1989,62 +1558,6 @@ class LogicOrchestrator:
     def select_discovery_anchors(self, briefs: list[DocBrief]) -> set[str]:
         return set(self.rank_discovery_anchors(briefs))
 
-    def _select_dataset_hub_anchors(self, group: list[DocBrief], *, cap: int) -> list[str]:
-        if cap <= 0 or not group:
-            return []
-        doc_freq: Counter[str] = Counter()
-        term_map: dict[str, set[str]] = {}
-        for brief in group:
-            terms = self._content_terms(brief)
-            term_map[brief.doc_id] = terms
-            doc_freq.update(terms)
-        ranked: list[tuple[float, str]] = []
-        for brief in group:
-            terms = term_map[brief.doc_id]
-            if not terms:
-                continue
-            freq_score = sum(min(doc_freq[token], 6) for token in terms) / (6.0 * max(1, min(len(terms), 10)))
-            bridge_bonus = 0.18 * self._dataset_edge_signal(brief)
-            broadness_bonus = 0.08 * max(0.0, 0.5 - max(self._title_specificity_score(brief), 0.0))
-            ranked.append((min(freq_score + bridge_bonus + broadness_bonus, 1.0), brief.doc_id))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        return [doc_id for _, doc_id in ranked[:cap]]
-
-    def _select_diverse_dataset_anchors(self, ranked: list[tuple[float, DocBrief]], *, cap: int, floor: float) -> list[str]:
-        candidates = [(score, brief, self._embed_brief(brief)) for score, brief in ranked if score >= floor]
-        if not candidates:
-            return []
-        selected: list[tuple[float, DocBrief, object]] = []
-        selected_ids: list[str] = []
-        selected_clusters: set[str] = set()
-        while candidates and len(selected_ids) < cap:
-            best_index = 0
-            best_score = float("-inf")
-            for index, (priority, brief, vector) in enumerate(candidates):
-                novelty = 1.0
-                if selected:
-                    similarities = [
-                        max(cosine(vector, chosen_vec), 0.0)
-                        for _, _, chosen_vec in selected
-                        if vector is not None and chosen_vec is not None
-                    ]
-                    if similarities:
-                        novelty = 1.0 - max(similarities)
-                cluster_bonus = 0.08 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
-                specificity_bonus = 0.03 * max(self._title_specificity_score(brief), 0.0)
-                dataset_bonus = 0.08 * self._dataset_edge_signal(brief)
-                score = 0.66 * priority + 0.26 * novelty + cluster_bonus + specificity_bonus + dataset_bonus
-                if score > best_score:
-                    best_score = score
-                    best_index = index
-            chosen = candidates.pop(best_index)
-            selected.append(chosen)
-            selected_ids.append(chosen[1].doc_id)
-            cluster = self._topic_cluster(chosen[1])
-            if cluster:
-                selected_clusters.add(cluster)
-        return selected_ids
-
     def _assessment_for(self, anchor: DocBrief, candidate: DocBrief, result, review_result=None) -> CandidateAssessment:
         metrics = self._candidate_metrics(anchor, candidate)
         rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
@@ -2052,7 +1565,16 @@ class LogicOrchestrator:
         final_result = self._review_consensus_result(anchor, candidate, result, review_result, metrics, fit_scores, signal_bundle)
 
         if not final_result.accepted:
-            return CandidateAssessment(candidate.doc_id, False, "model_rejected", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
+            return CandidateAssessment(
+                candidate.doc_id,
+                False,
+                getattr(final_result, "reject_reason", "agent_rejected"),
+                0.0,
+                0.0,
+                0.0,
+                final_result.relation_type,
+                final_result.confidence,
+            )
         if final_result.relation_type not in RELATION_TYPES:
             return CandidateAssessment(candidate.doc_id, False, "unsupported_relation", 0.0, 0.0, 0.0, final_result.relation_type, final_result.confidence)
 
@@ -2063,18 +1585,22 @@ class LogicOrchestrator:
         reviewer_utility = max(0.0, min(float(getattr(review_result, "utility_score", model_utility)) if review_result is not None else model_utility, 1.0))
         blended_utility = max(signal_bundle.utility_score, 0.45 * signal_bundle.utility_score + 0.55 * max(model_utility, reviewer_utility))
         evidence_quality = self._evidence_quality(anchor, candidate, final_result)
-        threshold = self._effective_threshold(anchor, candidate, final_result.relation_type)
-        hard_risks = {str(flag) for flag in signal_bundle.risk_flags}
-        if signal_bundle.drift_risk >= 0.72 and signal_bundle.topic_consistency < 0.3:
-            return CandidateAssessment(candidate.doc_id, False, "topic_drift", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if not self._relation_cues(anchor, candidate, final_result):
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if fit_scores.get(final_result.relation_type, 0.0) < 0.18:
-            return CandidateAssessment(candidate.doc_id, False, "wrong_relation_type", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if {"service_surface", "foundational_support"} & hard_risks and blended_utility < 0.72:
-            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
-        if signal_bundle.duplicate_risk >= 0.62 and signal_bundle.bridge_gain < 0.34:
-            return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        threshold = self._relation_threshold(final_result.relation_type)
+        hard_signal_failure = self._graph_hygiene_failure(
+            {
+                "drift_risk": signal_bundle.drift_risk,
+                "topic_consistency": signal_bundle.topic_consistency,
+                "bridge_information_gain": signal_bundle.bridge_gain,
+            }
+        ) or (
+            signal_bundle.drift_risk >= 0.62
+            and signal_bundle.topic_consistency < 0.32
+            and signal_bundle.bridge_gain < 0.38
+        )
+        if hard_signal_failure:
+            return CandidateAssessment(candidate.doc_id, False, "graph_hygiene_failure", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
+        if signal_bundle.duplicate_risk >= 0.9 and signal_bundle.bridge_gain < 0.25:
+            return CandidateAssessment(candidate.doc_id, False, "duplicate_risk", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if final_result.confidence < threshold.min_confidence:
             return CandidateAssessment(candidate.doc_id, False, "low_confidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if blended_support < threshold.min_support:
@@ -2147,65 +1673,19 @@ class LogicOrchestrator:
             return self.doc_profiler.run_many(docs)
         return [self.profile(doc) for doc in docs]
 
-    def _local_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False) -> list[tuple[float, CandidateProposal]]:
-        proposals: list[tuple[float, CandidateProposal]] = []
-        for candidate in corpus:
-            if candidate.doc_id == anchor.doc_id:
-                continue
-            metrics = self._candidate_metrics(anchor, candidate)
-            rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-            if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
-                continue
-            bridge_gain = self._bridge_information_gain(anchor, candidate)
-            duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
-            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-            same_concept_bonus = 0.0
-            if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
-                methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-                same_concept_bonus = 0.12 * fit_scores["same_concept"] * max(
-                    self._dataset_edge_signal(anchor),
-                    self._dataset_edge_signal(candidate),
-                    0.6,
-                )
-                same_concept_bonus *= max(0.55, 1.0 - 0.4 * methodology_penalty)
-            score = (
-                metrics["local_support"]
-                + 0.42 * rerank_score
-                + 0.16 * bridge_gain
-                + 0.14 * specific_title_bridge
-                + 0.08 * fit_scores["implementation_detail"]
-                + 0.06 * fit_scores["supporting_evidence"]
-                + 0.08 * fit_scores.get("comparison", 0.0)
-                + same_concept_bonus
-                - 0.22 * duplicate_penalty
-            )
-            proposals.append(
-                (
-                    score,
-                    CandidateProposal(
-                        doc_id=candidate.doc_id,
-                        reason=f"local rerank favors {relation_type}",
-                        query=" ".join((candidate.relation_hints + candidate.keywords + [candidate.title])[:4]),
-                        score_hint=min(score, 0.99),
-                    ),
-                )
-            )
-        proposals.sort(key=lambda item: (-item[0], item[1].doc_id))
-        return proposals[: (12 if expanded else 8)]
-
     def _live_candidate_limit(self, anchor: DocBrief, *, expanded: bool = False) -> int:
-        anchor_text = self._brief_text(anchor)
-        if self._is_argumentative_doc(anchor):
-            limit = max(self._edge_quality().max_judge_candidates_live, 8)
-            return limit + 3 if expanded else limit
-        if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
-            limit = max(self._edge_quality().max_judge_candidates_live, 10)
-            return limit + 4 if expanded else limit
-        if any(word in anchor_text for word in LISTING_WORDS):
-            limit = max(self._edge_quality().max_judge_candidates_live, 8)
-            return limit + 2 if expanded else limit
-        limit = max(self._edge_quality().max_judge_candidates_live, 6)
-        return limit + 2 if expanded else limit
+        base_limit = max(self._edge_quality().max_judge_candidates_live, 6)
+        richness = (
+            min(len(anchor.claims) / 3.0, 1.0)
+            + min(len(anchor.relation_hints) / 4.0, 1.0)
+            + self._dataset_edge_signal(anchor)
+            + max(self._title_specificity_score(anchor), 0.0)
+        ) / 4.0
+        if richness >= 0.6:
+            base_limit += 2
+        if expanded:
+            base_limit += 2
+        return base_limit
 
     def scout(self, anchor: DocBrief, corpus: list[DocBrief], *, expanded: bool = False):
         brief_map = {brief.doc_id: brief for brief in corpus}
@@ -2216,47 +1696,20 @@ class LogicOrchestrator:
                 continue
             metrics = self._candidate_metrics(anchor, candidate)
             rerank_score, relation_type, fit_scores = self._pair_rerank(anchor, candidate, metrics)
-            if self._is_live_provider() and not self._topic_drift_exception(anchor, candidate, metrics, fit_scores):
+            signal_report = self._candidate_signal_report(anchor, candidate, metrics, fit_scores, relation_type)
+            if self._is_live_provider() and self._graph_hygiene_failure(signal_report):
                 continue
-            bridge_gain = self._bridge_information_gain(anchor, candidate)
-            duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
-            specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-            same_concept_bonus = 0.0
-            if self._doc_stage(anchor) in {"scientific_evidence", "clinical_passage"}:
-                methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-                same_concept_bonus = 0.12 * fit_scores["same_concept"] * max(
-                    self._dataset_edge_signal(anchor),
-                    self._dataset_edge_signal(candidate),
-                    0.6,
-                )
-                same_concept_bonus *= max(0.55, 1.0 - 0.4 * methodology_penalty)
-            score = (
-                0.55 * proposal.score_hint
-                + metrics["local_support"]
-                + 0.34 * rerank_score
-                + 0.16 * bridge_gain
-                + 0.14 * specific_title_bridge
-                + 0.06 * fit_scores["implementation_detail"]
-                + 0.04 * fit_scores["supporting_evidence"]
-                + 0.08 * fit_scores.get("comparison", 0.0)
-                + same_concept_bonus
-                - 0.22 * duplicate_penalty
+            score = self._candidate_priority_score(
+                base_score=0.58 * proposal.score_hint + 0.24 * rerank_score,
+                metrics=metrics,
+                fit_scores=fit_scores,
+                signal_report=signal_report,
             )
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, CandidateProposal(doc_id=proposal.doc_id, reason=proposal.reason, query=proposal.query, score_hint=min(score, 0.99)))
 
-        for score, proposal in self._local_candidate_proposals(anchor, corpus, expanded=expanded):
-            previous = merged.get(proposal.doc_id)
-            if previous is None or score > previous[0]:
-                merged[proposal.doc_id] = (score, proposal)
-
         for score, proposal in self._dense_neighbor_candidate_proposals(anchor, corpus, expanded=expanded):
-            previous = merged.get(proposal.doc_id)
-            if previous is None or score > previous[0]:
-                merged[proposal.doc_id] = (score, proposal)
-
-        for score, proposal in self._targeted_candidate_proposals(anchor, corpus):
             previous = merged.get(proposal.doc_id)
             if previous is None or score > previous[0]:
                 merged[proposal.doc_id] = (score, proposal)
@@ -2297,7 +1750,6 @@ class LogicOrchestrator:
             second = accepted[1]
             if (
                 accepted[0].score - second.score <= self._edge_quality().second_edge_margin
-                and accepted[0].relation_type != second.relation_type
                 and second.edge is not None
                 and second.edge.utility_score >= 0.5
             ):
