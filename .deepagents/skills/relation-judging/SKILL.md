@@ -19,12 +19,14 @@ Judge pairs with precision-first reasoning.
 1. Read the anchor dossier and the full candidate bundle before judging any pair.
 2. Use local signals as the primary evidence and text spans as supporting evidence.
 3. For `comparison`, verify topic consistency before rewarding stance contrast.
-4. If a pair is plausible but low utility, keep `accepted=false` and explain the retrieval risk.
+4. When a structured topic family or sibling-document family is available, treat it as a stronger same-topic cue than broad policy overlap.
+5. If a pair is plausible but low utility, keep `accepted=false` and explain the retrieval risk.
 
 ## Output expectations
 
 - Emit explicit `utility_score`, `uncertainty`, and `risk_flags`.
 - Distinguish “same topic but opposite stance” from “different topic with generic argumentative overlap”.
+- Prefer same-family contrast pairs over cross-family analogies when both seem plausible.
 
 ## Recommended tools
 

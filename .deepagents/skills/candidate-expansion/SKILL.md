@@ -21,3 +21,4 @@ Use this skill to build candidate bundles for offline discovery.
 - Use `get_hnsw_neighbors` and `search_summaries` as the primary recall sources.
 - Use `lookup_entities` only to add missing but high-value bridge candidates.
 - Use `read_doc_brief` to verify same-topic alignment before promoting argumentative comparisons.
+- If structured family identifiers or sibling-document families are available, treat them as higher-confidence same-topic cues than broad policy vocabulary alone.
