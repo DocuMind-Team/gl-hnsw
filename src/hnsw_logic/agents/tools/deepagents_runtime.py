@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -40,7 +41,58 @@ def stage_artifact_path(workspace_root: Path, stage: str, anchor_doc_id: str, su
     return workspace_root / "indexing" / stage / f"{anchor_doc_id}{suffix}"
 
 
+def _stage_default_filename(stage: str, anchor_doc_id: str | None = None) -> str | None:
+    if stage == "plans":
+        return "indexing_plan.json"
+    if anchor_doc_id:
+        return f"{anchor_doc_id}.json"
+    return None
+
+
+def normalize_stage_container_path(workspace_root: Path, stage: str, anchor_doc_id: str | None = None) -> list[str]:
+    container = workspace_root / "indexing" / stage
+    normalized: list[str] = []
+    if not container.exists() or container.is_dir():
+        container.mkdir(parents=True, exist_ok=True)
+        return normalized
+    raw_bytes = container.read_bytes()
+    target_name = _stage_default_filename(stage, anchor_doc_id)
+    container.unlink()
+    container.mkdir(parents=True, exist_ok=True)
+    if target_name:
+        # Preserve valid JSON stage payloads in the expected default file; keep non-JSON notes separately.
+        try:
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            target = container / target_name
+            target.write_bytes(raw_bytes)
+            normalized.append(str(target))
+        else:
+            note = container / "_stage_note.md"
+            note.write_bytes(raw_bytes)
+            normalized.append(str(note))
+    else:
+        note = container / "_stage_note.md"
+        note.write_bytes(raw_bytes)
+        normalized.append(str(note))
+    return normalized
+
+
+def normalize_indexing_workspace(workspace_root: Path, anchor_doc_id: str | None = None) -> list[str]:
+    normalized: list[str] = []
+    normalized.extend(normalize_stage_container_path(workspace_root, "plans"))
+    for stage in STAGE_SEQUENCE:
+        normalized.extend(normalize_stage_container_path(workspace_root, stage, anchor_doc_id))
+    normalize_stage_container_path(workspace_root, "manifests", anchor_doc_id)
+    return normalized
+
+
 def resolve_workspace_output_path(workspace_root: Path, output_path: str | None, default_path: Path) -> Path:
+    default_stage = default_path.parent.name
+    default_anchor = None if default_stage == "plans" else default_path.stem
+    normalize_stage_container_path(workspace_root, default_stage, default_anchor)
     if not output_path:
         return default_path
     path = Path(output_path)
@@ -117,6 +169,7 @@ def audit_execution_state(
     counterevidence_enabled: bool = True,
     task_iteration_cap: int = 2,
 ) -> ExecutionAudit:
+    normalize_indexing_workspace(workspace_root, anchor_doc_id)
     manifest = load_execution_manifest(workspace_root, anchor_doc_id)
     required = required_indexing_stages(counterevidence_enabled)
     artifact_paths = {stage: str(stage_artifact_path(workspace_root, stage, anchor_doc_id)) for stage in required}
@@ -185,6 +238,7 @@ def build_deepagent_toolsets(
         return {doc.doc_id: doc for doc in processed_docs()}
 
     def stage_dir(name: str) -> Path:
+        normalize_stage_container_path(workspace_root, name)
         path = workspace_root / "indexing" / name
         path.mkdir(parents=True, exist_ok=True)
         return path
@@ -696,6 +750,7 @@ def build_deepagent_supervisor_tools(
 ) -> list[Callable]:
     def read_indexing_plan() -> dict:
         """Read the current offline indexing plan from the workspace."""
+        normalize_indexing_workspace(workspace_root)
         return read_json(workspace_root / "indexing" / "plans" / "indexing_plan.json", {}) or {}
 
     def read_execution_manifest(doc_id: str) -> dict:

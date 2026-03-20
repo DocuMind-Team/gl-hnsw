@@ -5,6 +5,8 @@ from hnsw_logic.agents.orchestrator import CandidateAssessment
 from hnsw_logic.agents.tools.deepagents_runtime import (
     audit_execution_state,
     load_execution_manifest,
+    normalize_indexing_workspace,
+    normalize_stage_container_path,
     record_manifest_stage_event,
     resolve_workspace_output_path,
     stage_artifact_path,
@@ -197,6 +199,34 @@ def test_workspace_output_path_resolution_maps_data_prefixes(tmp_path: Path):
     ) == workspace_root / "indexing/reviews/doc-1.json"
 
 
+def test_normalize_stage_container_path_moves_json_payload_into_default_file(tmp_path: Path):
+    workspace_root = tmp_path / "data" / "workspace"
+    stage_file = workspace_root / "indexing" / "plans"
+    stage_file.parent.mkdir(parents=True, exist_ok=True)
+    stage_file.write_text('{"anchors":[{"doc_id":"doc-1"}]}', encoding="utf-8")
+
+    normalized = normalize_stage_container_path(workspace_root, "plans")
+
+    target = workspace_root / "indexing" / "plans" / "indexing_plan.json"
+    assert str(target) in normalized
+    assert target.exists()
+    assert target.read_text(encoding="utf-8").startswith('{"anchors"')
+
+
+def test_normalize_indexing_workspace_preserves_non_json_stage_notes(tmp_path: Path):
+    workspace_root = tmp_path / "data" / "workspace"
+    stage_file = workspace_root / "indexing" / "judgments"
+    stage_file.parent.mkdir(parents=True, exist_ok=True)
+    stage_file.write_text("# Judgments Directory\n", encoding="utf-8")
+
+    normalized = normalize_indexing_workspace(workspace_root, "doc-1")
+
+    note = workspace_root / "indexing" / "judgments" / "_stage_note.md"
+    assert str(note) in normalized
+    assert note.exists()
+    assert note.read_text(encoding="utf-8").startswith("# Judgments")
+
+
 def test_delegation_loop_marks_fallback_and_recovers_locally(app_container):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
@@ -246,6 +276,22 @@ def test_discover_for_anchor_does_not_silent_fallback_to_direct_discovery(app_co
     accepted = app_container.offline_supervisor.discover_for_anchor(anchor_doc_id, briefs)
     assert accepted == []
 
+
+def test_build_plan_requires_materialized_plan_under_full_delegation(app_container):
+    class DummyDeepAgent:
+        def invoke(self, _payload):
+            return {}
+
+    app_container.offline_supervisor.deepagent = DummyDeepAgent()
+    app_container.offline_supervisor.supervisor_task_delegation_enabled = True
+    app_container.offline_supervisor.agents_config.planner_enabled = True
+
+    try:
+        app_container.offline_supervisor._build_plan()
+    except RuntimeError as exc:
+        assert "indexing/plans/indexing_plan.json" in str(exc)
+    else:
+        raise AssertionError("expected full delegation planning to require a materialized plan file")
 
 
 def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container, monkeypatch):

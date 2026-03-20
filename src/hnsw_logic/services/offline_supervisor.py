@@ -8,6 +8,7 @@ from hnsw_logic.agents.orchestrator import CandidateAssessment
 from hnsw_logic.agents.runtime_models import ExecutionAudit, MemoryLearningBundle
 from hnsw_logic.agents.tools.deepagents_runtime import (
     audit_execution_state,
+    normalize_indexing_workspace,
     record_manifest_stage_event,
     required_indexing_stages,
 )
@@ -97,25 +98,35 @@ class OfflineIndexingSupervisor:
         return tool(**kwargs)
 
     def _build_plan(self) -> dict:
-        if self.deepagent is not None and self.agents_config.planner_enabled and self.supervisor_task_delegation_enabled:
-            try:
-                self._invoke_main_agent(
-                    "\n".join(
-                        [
-                            "Create the offline indexing plan.",
-                            "Use the delegation-policy skill and keep the plan auditable.",
-                            f"Respect a maximum of {self.agents_config.max_parallel_tasks} active task slots.",
-                            "Use the task tool to delegate to the index_planner subagent.",
-                            "The subagent must call execute_index_planning and materialize the plan in the current workspace indexing/plans directory.",
-                            "Audit the plan by checking the file exists before returning.",
-                        ]
-                    )
+        normalize_indexing_workspace(self.workspace_root)
+        using_delegation = (
+            self.deepagent is not None
+            and self.agents_config.planner_enabled
+            and self.supervisor_task_delegation_enabled
+        )
+        if using_delegation:
+            self._invoke_main_agent(
+                "\n".join(
+                    [
+                        "Create the offline indexing plan.",
+                        "Use the delegation-policy skill and keep the plan auditable.",
+                        f"Respect a maximum of {self.agents_config.max_parallel_tasks} active task slots.",
+                        "Use the task tool to delegate to the index_planner subagent.",
+                        "The subagent must call execute_index_planning and materialize the plan at the exact workspace path `indexing/plans/indexing_plan.json`.",
+                        "Never write freeform notes directly to the stage directory path `indexing/plans`.",
+                        "Audit the plan by checking that `indexing/plans/indexing_plan.json` exists before returning.",
+                    ]
                 )
-            except Exception:
-                self._run_stage_locally("index_planner", "execute_index_planning")
+            )
         else:
             self._run_stage_locally("index_planner", "execute_index_planning")
-        return read_json(self._plan_path(), {}) or {}
+        normalize_indexing_workspace(self.workspace_root)
+        plan = read_json(self._plan_path(), {}) or {}
+        if using_delegation and not plan:
+            raise RuntimeError(
+                "deepagents planning did not materialize `indexing/plans/indexing_plan.json`"
+            )
+        return plan
 
     @staticmethod
     def _ordered_anchor_ids_from_plan(plan: dict[str, Any]) -> list[str]:
@@ -372,6 +383,7 @@ class OfflineIndexingSupervisor:
         self.self_update_manager.apply(bundle, self.agents_memory_path)
 
     def discover_for_anchor(self, anchor_doc_id: str, briefs: list[DocBrief]) -> list:
+        normalize_indexing_workspace(self.workspace_root, anchor_doc_id)
         brief_map = {brief.doc_id: brief for brief in briefs}
         anchor = brief_map[anchor_doc_id]
         used_delegation = self.deepagent is not None and self.anchor_task_delegation_enabled
