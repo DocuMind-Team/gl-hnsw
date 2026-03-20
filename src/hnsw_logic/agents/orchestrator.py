@@ -65,6 +65,24 @@ DISCOVERY_TERMS = {
 }
 ARGUMENT_STAGE_TOKENS = {"argument", "debate", "claim", "claims", "position", "positions", "policy", "counterargument"}
 ARGUMENT_COMPARISON_CUES = {"argument", "debate", "contrast", "versus", "vs", "counter", "counterargument", "opposing", "alternative", "position"}
+ARGUMENT_CONTRAST_VERDICT_CUES = {
+    "alternative position",
+    "compare",
+    "comparison",
+    "contrast",
+    "contrasting",
+    "counterargument",
+    "counter-argument",
+    "debate",
+    "direct contrast",
+    "opposing",
+    "opposed",
+    "opposite",
+    "rebuttal",
+    "stance contrast",
+    "versus",
+    "vs",
+}
 EVAL_METRIC_STAGE_TOKENS = {"ann", "metric", "metrics", "recall", "mrr", "ndcg", "latency", "benchmark", "benchmarking"}
 EVAL_REPORT_STAGE_TOKENS = {"report", "reporting", "compare", "comparison", "edge", "precision", "include", "includes"}
 SCIENTIFIC_BRIDGE_TERMS = {
@@ -1923,6 +1941,70 @@ class LogicOrchestrator:
             uncertainty=uncertainty,
         )
 
+    def _verdict_text(self, *results) -> str:
+        parts: list[str] = []
+        for result in results:
+            if result is None:
+                continue
+            parts.extend(
+                [
+                    str(getattr(result, "relation_type", "")),
+                    str(getattr(result, "semantic_relation_label", "")),
+                    str(getattr(result, "canonical_relation", "")),
+                    str(getattr(result, "decision_reason", "")),
+                    str(getattr(result, "rationale", "")),
+                    *[str(flag) for flag in getattr(result, "contradiction_flags", []) or []],
+                    *[str(span) for span in getattr(result, "evidence_spans", []) or []],
+                ]
+            )
+        return " ".join(part for part in parts if part).lower()
+
+    def _has_contrastive_verdict_signal(self, *results) -> bool:
+        text = self._verdict_text(*results)
+        return any(cue in text for cue in ARGUMENT_CONTRAST_VERDICT_CUES)
+
+    def _preserve_reviewed_comparison_bridge(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        result,
+        review_result,
+        final_result,
+        fallback,
+        metrics: dict[str, float],
+        fit_scores: dict[str, float],
+    ) -> bool:
+        if final_result is None:
+            return False
+        if not getattr(final_result, "accepted", False):
+            return False
+        if getattr(final_result, "relation_type", "") != "comparison":
+            return False
+        if not self._is_argumentative_pair(anchor, candidate):
+            return False
+        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
+        contrastive_reuse = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        utility_score = max(
+            float(getattr(result, "utility_score", 0.0)),
+            float(getattr(review_result, "utility_score", 0.0)) if review_result is not None else 0.0,
+            float(getattr(final_result, "utility_score", 0.0)),
+        )
+        contrast_signal = (
+            contrastive_reuse >= 0.56
+            or self._has_contrastive_verdict_signal(result, review_result, final_result)
+        )
+        comparison_fit = fit_scores.get("comparison", 0.0)
+        weaker_relations = max(
+            fit_scores.get("supporting_evidence", 0.0),
+            fit_scores.get("same_concept", 0.0),
+        )
+        return (
+            topic_consistency >= 0.58
+            and contrast_signal
+            and utility_score >= 0.42
+            and comparison_fit >= max(0.52, weaker_relations - 0.06)
+        )
+
     def should_attempt_discovery(self, anchor: DocBrief) -> bool:
         topic = str(anchor.metadata.get("topic", "")).lower()
         anchor_terms = self._content_terms(anchor)
@@ -2603,6 +2685,16 @@ class LogicOrchestrator:
         signal_bundle = self._signal_bundle(anchor, candidate, metrics, fit_scores, rerank_relation)
         final_result = self._review_consensus_result(anchor, candidate, result, review_result, metrics, fit_scores, signal_bundle)
         fallback = self._local_relation_override(anchor, candidate, metrics, final_result)
+        preserve_comparison_bridge = self._preserve_reviewed_comparison_bridge(
+            anchor,
+            candidate,
+            result,
+            review_result,
+            final_result,
+            fallback,
+            metrics,
+            fit_scores,
+        )
         if fallback is not None:
             force_override = (
                 fallback.relation_type == "prerequisite"
@@ -2650,7 +2742,7 @@ class LogicOrchestrator:
                     and float(result.confidence) < 0.9
                 )
                 or float(result.confidence) < 0.84
-            ):
+            ) and not preserve_comparison_bridge:
                 final_result = fallback
 
         if not final_result.accepted:
@@ -2741,7 +2833,10 @@ class LogicOrchestrator:
             and self._bridge_information_gain(anchor, candidate) < 0.62
             and not (
                 final_result.relation_type == "comparison"
-                and self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.56
+                and (
+                    self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.56
+                    or preserve_comparison_bridge
+                )
             )
         ):
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -2750,7 +2845,10 @@ class LogicOrchestrator:
             and self._is_effective_duplicate(anchor, candidate, metrics)
             and not (
                 final_result.relation_type == "comparison"
-                and self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6
+                and (
+                    self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6
+                    or preserve_comparison_bridge
+                )
             )
         ):
             return CandidateAssessment(candidate.doc_id, False, "low_utility", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
@@ -2816,6 +2914,8 @@ class LogicOrchestrator:
             return CandidateAssessment(candidate.doc_id, False, "weak_evidence", 0.0, blended_support, evidence_quality, final_result.relation_type, final_result.confidence)
         if getattr(final_result, "contradiction_flags", None):
             if not (
+                preserve_comparison_bridge
+                or
                 (
                     final_result.relation_type == "implementation_detail"
                     and (anchor_stage, candidate_stage) in {("ops_overview", "ops_registry"), ("ops_service", "ops_registry")}

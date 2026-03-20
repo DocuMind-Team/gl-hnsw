@@ -280,6 +280,86 @@ def test_argumentative_family_match_improves_comparison_utility():
     assert same_rerank > cross_rerank
 
 
+def test_reviewed_argumentative_comparison_is_not_downgraded_by_support_fallback():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "test-culture-ahrtsdlgra-con03a",
+        "arts human rights thbt social disgust legitimate grounds restriction artistic",
+        "This document contends that restricting art based on social disgust disproportionately targets socially liberal ideas, as art often challenges taboos and the status quo, which is necessary for social progress.",
+        ["art", "disgust", "liberal", "taboo", "status quo", "artistic", "arts", "grounds", "social", "based"],
+        ["Social disgust", "Sarah Lucas", "Tracey Emin", "Status quo"],
+        [
+            "Supports the argument against restricting art based on disgust.",
+            "Contrasts with documents that justify restrictions for protection.",
+            "stance_con",
+            "debate",
+            "argument",
+            "comparison",
+            "liberal",
+            "socially",
+        ],
+        {"source_dataset": "arguana", "topic": "argument", "topic_cluster": "artistic-arts-disgust", "topic_family": "test-culture-ahrtsdlgra", "stance": "con", "doc_kind": "argument"},
+    )
+    candidate = _brief(
+        "test-culture-ahrtsdlgra-con01b",
+        "arts human rights thbt social disgust legitimate grounds restriction artistic",
+        "This document challenges the idea that shocking art is necessary to convey ideas, arguing that ideas can be expressed in other ways. It asserts that societal taboos reflect inviolable values and that art crossing these lines is inherently unacceptable.",
+        ["shocking art", "societal taboos", "inviolable values", "emotional responses", "acceptable society", "artistic", "arts", "disgust", "grounds", "that"],
+        [],
+        [
+            "Contrasts with arguments for artistic freedom and challenging norms.",
+            "Relates to debates on censorship and moral boundaries in art.",
+            "Supports the view that some artistic expressions should be restricted.",
+            "stance_con",
+            "debate",
+            "argument",
+            "comparison",
+            "shocking",
+        ],
+        {"source_dataset": "arguana", "topic": "argument", "topic_cluster": "artistic-arts-disgust", "topic_family": "test-culture-ahrtsdlgra", "stance": "con", "doc_kind": "argument"},
+    )
+    judge_verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.9,
+        evidence_spans=["Shared topic family and normative disagreement on the acceptability of shocking art."],
+        rationale="Strong contrasting stance on art restriction, suitable for comparison relation in argumentative corpus.",
+        support_score=0.82,
+        contradiction_flags=["contrastive_argument", "alternative_position"],
+        decision_reason="Strong contrasting stance on art restriction, suitable for comparison relation in argumentative corpus.",
+        utility_score=0.84,
+        uncertainty=0.1,
+        canonical_relation="comparison",
+        semantic_relation_label="contrastive_bridge",
+    )
+    review_verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.9,
+        evidence_spans=["Strong stance contrast creates a durable comparison edge for retrieval across many queries."],
+        rationale="Strong stance contrast creates a durable comparison edge for retrieval across many queries, despite near_duplicate risk, and aligns with argumentative corpus guidelines.",
+        support_score=0.84,
+        contradiction_flags=["contrastive_argument", "opposing_position"],
+        decision_reason="Strong stance contrast creates a durable comparison edge for retrieval across many queries, despite near_duplicate risk, and aligns with argumentative corpus guidelines.",
+        utility_score=0.9,
+        uncertainty=0.08,
+        canonical_relation="comparison",
+        semantic_relation_label="contrastive_bridge",
+    )
+
+    assessment = orchestrator._assessment_for(anchor, candidate, judge_verdict, review_verdict)
+    assert assessment.accepted is True
+    assert assessment.relation_type == "comparison"
+    assert assessment.score > 0.0
+
+
 def test_edge_reviewer_rejects_generic_service_surface_edge():
     provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
     anchor = _brief(
