@@ -93,6 +93,32 @@ def test_openai_profile_postprocess_adds_scientific_risk_facets():
     assert brief.metadata["topic"] == "scientific_claims"
 
 
+def test_profile_source_payload_uses_excerpt_and_top_terms():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    doc = DocRecord(
+        doc_id="arg-1",
+        title="Debate over provocative art",
+        text=(
+            "Art that provokes disgust can still drive social change. "
+            "Some readers find the language offensive. "
+            "The document argues that taboo-breaking expression matters. "
+            "A later sentence adds retrieval utility terms for comparison. "
+            "This fifth sentence should be dropped from the excerpt."
+        ),
+        metadata={"source_dataset": "arguana", "topic": "argument"},
+    )
+
+    payload = provider._profile_source_payload(doc)
+
+    assert payload["doc_id"] == "arg-1"
+    assert payload["title"] == "Debate over provocative art"
+    assert "This fifth sentence should be dropped" not in payload["text_excerpt"]
+    assert payload["source_dataset"] == "arguana"
+    assert payload["topic_hint"] == "argument"
+    assert "comparison" in payload["top_terms"]
+
+
 def test_profile_docs_content_filter_falls_back_to_local_profiles():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
@@ -315,8 +341,9 @@ def test_profile_docs_malformed_batch_retries_single_remote_calls():
         calls.append((stage, user_prompt))
         if stage == "profile_docs_batch":
             raise json.JSONDecodeError("Expecting ',' delimiter", '{"broken": true', 14)
-        title_line = next(line for line in user_prompt.splitlines() if line.startswith("title: "))
-        doc_id = "a" if title_line.endswith("Alpha") else "b"
+        payload = json.loads(user_prompt)
+        title = payload["document"]["title"]
+        doc_id = "a" if title == "Alpha" else "b"
         return {
             "summary": f"summary for {doc_id}",
             "entities": [],

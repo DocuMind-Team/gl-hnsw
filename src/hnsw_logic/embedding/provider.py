@@ -1142,6 +1142,22 @@ class OpenAICompatibleProvider(StubProvider):
     def _first_sentences(self, text: str, limit: int = 3) -> list[str]:
         return [piece.strip() for piece in re.split(r"(?<=[.!?])\s+|\n+", text) if piece.strip()][:limit]
 
+    def _profile_source_payload(self, doc: DocRecord) -> dict:
+        excerpt_sentences = self._first_sentences(doc.text, limit=4)
+        excerpt = " ".join(excerpt_sentences).strip()
+        if not excerpt:
+            excerpt = doc.text.strip()
+        excerpt = excerpt[:1200]
+        return {
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "text_excerpt": excerpt,
+            "top_terms": top_terms(doc.text, limit=12),
+            "source_dataset": str(doc.metadata.get("source_dataset", "")),
+            "topic_hint": str(doc.metadata.get("topic", "")),
+            "text_length": len(doc.text),
+        }
+
     def _merge_unique(self, *groups: list[str], limit: int) -> list[str]:
         merged: list[str] = []
         seen: set[str] = set()
@@ -1556,13 +1572,28 @@ class OpenAICompatibleProvider(StubProvider):
     def profile_doc(self, doc: DocRecord) -> DocBrief:
         try:
             payload = self._invoke_json(
-                "You are a document profiler. Return JSON only.",
-                "\n".join(
-                    [
-                        "Return a JSON object with keys: summary, entities, keywords, claims, relation_hints.",
-                        f"title: {doc.title}",
-                        f"text: {doc.text}",
-                    ]
+                (
+                    "You are a document profiler. Return JSON only. "
+                    "Profile the document in neutral analytical language. "
+                    "When the excerpt contains provocative, harmful, or highly emotional phrasing, "
+                    "paraphrase it instead of quoting directly unless an exact phrase is essential."
+                ),
+                json.dumps(
+                    {
+                        "task": (
+                            "Return a JSON object with keys: summary, entities, keywords, claims, relation_hints. "
+                            "Use the excerpt and top terms as the primary grounding context."
+                        ),
+                        "document": self._profile_source_payload(doc),
+                        "output_schema": {
+                            "summary": "string",
+                            "entities": ["string"],
+                            "keywords": ["string"],
+                            "claims": ["string"],
+                            "relation_hints": ["string"],
+                        },
+                    },
+                    ensure_ascii=False,
                 ),
                 thinking=False,
                 stage="profile_doc",
@@ -1590,12 +1621,16 @@ class OpenAICompatibleProvider(StubProvider):
         for batch in self._chunk(docs, 4):
             try:
                 payload = self._invoke_json(
-                    "You are a document profiler. Return JSON only.",
+                    (
+                        "You are a document profiler. Return JSON only. "
+                        "Profile each document in neutral analytical language. "
+                        "Paraphrase provocative or harmful wording when a neutral summary can preserve the stance, topic, and retrieval utility."
+                    ),
                     json.dumps(
                         {
                             "task": "Profile each document and return a JSON array.",
                             "documents": [
-                                {"doc_id": doc.doc_id, "title": doc.title, "text": doc.text}
+                                self._profile_source_payload(doc)
                                 for doc in batch
                             ],
                             "output_schema": [
