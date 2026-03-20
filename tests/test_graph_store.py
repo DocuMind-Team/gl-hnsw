@@ -17,9 +17,12 @@ def test_graph_store_roundtrip(test_root):
         edge_card_text="edge",
         created_at="2026-03-10T00:00:00Z",
         last_validated_at="2026-03-10T00:00:00Z",
+        activation_profile={"activation_prior": 0.72, "topic_signature": ["bridge"]},
     )
     store.add_edges([edge])
-    assert store.get_out_edges("a")[0].dst_doc_id == "b"
+    persisted = store.get_out_edges("a")[0]
+    assert persisted.dst_doc_id == "b"
+    assert persisted.activation_profile["activation_prior"] == 0.72
 
 
 def test_graph_store_deduplicates_edges_by_relation_key(test_root):

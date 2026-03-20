@@ -570,21 +570,13 @@ def test_graph_neighborhood_bonus_allows_high_utility_same_concept_bridge(tmp_pa
     assert by_id["doc-a"].final_score > 0.68
 
 
-def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
+def test_search_matches_baseline_when_local_strategy_abstains(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()
     briefs = [
         _brief("doc-a", "Dense Winner", "Dense winner summary.", metadata={"topic": "general"}),
         _brief("doc-b", "Sparse Distraction", "Sparse distraction summary.", metadata={"topic": "general"}),
     ]
-
-    class AbstainStrategy:
-        def run(self, **kwargs):
-            return type(
-                "Strategy",
-                (),
-                {"sparse_gate": 0.0, "allow_sparse_only": False, "graph_gate": 0.0, "rationale": "abstain"},
-            )()
 
     service = HybridRetrievalService(
         searcher=FakeSearcher([Neighbor(doc_id="doc-a", score=0.72, rank=1)]),
@@ -599,8 +591,12 @@ def test_search_matches_baseline_when_strategy_abstains(tmp_path: Path):
                 DocRecord(doc_id="doc-b", title="Sparse Distraction", text="sparse distraction keyword keyword keyword"),
             ]
         ),
-        query_strategy_agent=AbstainStrategy(),
     )
+    service._default_strategy = lambda **_kwargs: type(
+        "Strategy",
+        (),
+        {"sparse_gate": 0.0, "allow_sparse_only": False, "graph_gate": 0.0, "sparse_boost": 0.0, "novelty_bias": 0.0, "rationale": "abstain"},
+    )()
 
     baseline = service.search_baseline("keyword", top_k=2)
     hybrid = service.search("keyword", top_k=2, use_memory_bias=False)
@@ -722,3 +718,73 @@ def test_search_uses_graph_budget_for_late_high_utility_seed(tmp_path: Path):
 
     assert "doc-target" in by_id
     assert by_id["doc-target"].source_kind in {"logic", "hybrid"}
+
+
+def test_search_prefers_activation_profile_match_for_graph_edge(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief(
+            "doc-a",
+            "Agent Memory Overview",
+            "The system keeps persistent memory for agents.",
+            claims=["Persistent agent memory is used for long-running retrieval tasks."],
+            keywords=["agent", "memory", "persistent"],
+            relation_hints=["memory", "persistent"],
+            metadata={"topic": "deepagents"},
+        ),
+        _brief(
+            "doc-b",
+            "Persistent Memory Backend",
+            "The persistent memory backend stores learned patterns.",
+            claims=["The backend stores learned patterns for the agent system."],
+            keywords=["persistent", "memory", "backend"],
+            relation_hints=["memory", "backend"],
+            metadata={"topic": "deepagents"},
+        ),
+    ]
+    graph_store = GraphStore(tmp_path / "accepted_edges.jsonl")
+    graph_store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="doc-a",
+                dst_doc_id="doc-b",
+                relation_type="same_concept",
+                confidence=0.88,
+                evidence_spans=["persistent memory backend"],
+                discovery_path=["judge", "review", "gate"],
+                edge_card_text="Agent memory uses a persistent memory backend.",
+                created_at="2026-03-10T00:00:00Z",
+                last_validated_at="2026-03-10T00:00:00Z",
+                utility_score=0.86,
+                activation_profile={
+                    "topic_signature": ["agent", "memory", "persistent", "backend"],
+                    "query_surface_terms": ["persistent", "memory", "backend", "agent"],
+                    "edge_use_cases": ["concept-bridge"],
+                    "drift_risk": 0.08,
+                    "activation_prior": 0.84,
+                    "negative_patterns": [],
+                },
+            )
+        ]
+    )
+    graph_store.reload()
+    service = HybridRetrievalService(
+        searcher=FakeSearcher([Neighbor(doc_id="doc-a", score=0.67, rank=1)]),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=graph_store,
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Agent Memory Overview", text="The system keeps persistent memory for agents."),
+                DocRecord(doc_id="doc-b", title="Persistent Memory Backend", text="The persistent memory backend stores learned patterns."),
+            ]
+        ),
+    )
+
+    response = service.search("How does persistent memory backend work for the agent?", top_k=2, use_memory_bias=False)
+
+    assert response.hits[0].doc_id == "doc-b"
+    assert response.hits[0].source_kind in {"logic", "hybrid"}

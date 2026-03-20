@@ -11,6 +11,7 @@ from hnsw_logic.agents.tools.deepagents_runtime import (
     resolve_workspace_output_path,
     stage_artifact_path,
 )
+from hnsw_logic.agents.tools.skill_signals import SkillSignalRuntime
 from hnsw_logic.memory.self_update import ControlledSelfUpdateManager
 from hnsw_logic.core.models import LogicEdge
 from hnsw_logic.core.utils import write_json
@@ -59,6 +60,35 @@ def test_key_runtime_skills_document_recommended_tools(test_root: Path):
     for skill_name in expected:
         content = (skills_root / skill_name / "SKILL.md").read_text(encoding="utf-8")
         assert "Recommended tools" in content, skill_name
+
+
+def test_skill_signal_runtime_returns_structured_signal_report(test_root: Path):
+    runtime = SkillSignalRuntime(repo_root=test_root)
+    anchor = {
+        "doc_id": "a",
+        "title": "Public transit should replace highway expansion",
+        "summary": "The argument says transit investment is better than highway expansion.",
+        "claims": ["Transit investment is preferable to highway expansion."],
+        "keywords": ["transit", "mobility"],
+        "relation_hints": ["comparison"],
+        "metadata": {"topic_family": "culture-policy", "topic_cluster": "transit-mobility", "stance": "pro"},
+    }
+    candidate = {
+        "doc_id": "b",
+        "title": "Highway expansion is better than transit investment",
+        "summary": "The argument says highway expansion is preferable for mobility.",
+        "claims": ["Highway expansion is preferable to transit investment."],
+        "keywords": ["highway", "mobility"],
+        "relation_hints": ["comparison"],
+        "metadata": {"topic_family": "culture-policy", "topic_cluster": "transit-mobility", "stance": "con"},
+    }
+    report = runtime.build_signal_report(anchor, candidate, local_signals={"topic_alignment": 1.0, "dense_score": 0.71})
+    profile = runtime.compute_query_activation_profile(anchor, candidate, "comparison", local_signals=report, verdict={"utility_score": 0.78})
+
+    assert report["topic_consistency"] >= 0.5
+    assert "topic_report" in report and "duplicate_report" in report
+    assert profile["activation_prior"] > 0.0
+    assert "query_surface_terms" in profile
 
 
 def test_controlled_self_update_only_touches_allowlisted_targets(tmp_path: Path):
@@ -294,7 +324,7 @@ def test_build_plan_requires_materialized_plan_under_full_delegation(app_contain
         raise AssertionError("expected full delegation planning to require a materialized plan file")
 
 
-def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container, monkeypatch):
+def test_offline_supervisor_respects_explicit_review_rejection(app_container, monkeypatch):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
@@ -385,10 +415,11 @@ def test_offline_supervisor_normalizes_soft_risk_flags_for_rescue(app_container,
     )
 
     assert assessments
-    assert assessments[0].accepted is True
+    assert assessments[0].accepted is False
+    assert assessments[0].reject_reason == "review_rejected"
 
 
-def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_duplicate_only_risk(app_container, monkeypatch):
+def test_offline_supervisor_applies_reviewed_activation_profile(app_container, monkeypatch):
     app_container.pipeline.build_embeddings()
     app_container.pipeline.build_hnsw()
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
@@ -406,7 +437,7 @@ def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_dupli
         edge=LogicEdge(
             src_doc_id=anchor.doc_id,
             dst_doc_id=candidate.doc_id,
-            relation_type="comparison",
+            relation_type="same_concept",
             confidence=0.84,
             evidence_spans=[anchor.summary, candidate.summary],
             discovery_path=["judge", "review", "gate"],
@@ -426,34 +457,42 @@ def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_dupli
     verdicts = {
         candidate.doc_id: JudgeResult(
             accepted=True,
-            relation_type="comparison",
+            relation_type="same_concept",
             confidence=0.84,
             evidence_spans=[],
-            rationale="durable comparison bridge",
+            rationale="durable concept bridge",
             support_score=0.0,
-            contradiction_flags=["near_duplicate"],
-            decision_reason="duplicate-only risk",
+            contradiction_flags=[],
+            decision_reason="review accepted",
             utility_score=0.93,
             uncertainty=0.22,
-            canonical_relation="comparison",
-            semantic_relation_label="comparison",
+            canonical_relation="same_concept",
+            semantic_relation_label="same_concept",
         )
     }
     reviews = dict(verdicts)
     bundle_lookup = {
         "reviews": {
             candidate.doc_id: {
-                "keep": False,
-                "reviewed_utility_score": 0.2,
-                "reviewed_confidence": 0.84,
-                "risk_flags": ["near_duplicate", "near_duplicate_bridge", "contradicts_anchor_claim"],
+                "keep": True,
+                "reviewed_utility_score": 0.74,
+                "reviewed_confidence": 0.9,
+                "activation_profile": {
+                    "topic_signature": ["memory", "agent"],
+                    "query_surface_terms": ["memory", "agent", "persistent"],
+                    "edge_use_cases": ["concept-bridge"],
+                    "drift_risk": 0.12,
+                    "activation_prior": 0.78,
+                    "negative_patterns": [],
+                },
+                "risk_flags": [],
             }
         },
         "checks": {
             candidate.doc_id: {
-                "keep": False,
-                "risk_penalty": 0.16,
-                "risk_flags": ["near_duplicate", "near_duplicate_bridge", "contradicts_anchor_claim"],
+                "keep": True,
+                "risk_penalty": 0.0,
+                "risk_flags": [],
             }
         },
     }
@@ -468,3 +507,6 @@ def test_offline_supervisor_preserves_high_utility_comparison_bridge_under_dupli
 
     assert assessments
     assert assessments[0].accepted is True
+    assert assessments[0].edge is not None
+    assert assessments[0].edge.utility_score == 0.74
+    assert assessments[0].edge.activation_profile["activation_prior"] == 0.78
