@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "topic_signature": {"type": "array", "items": {"type": "string"}},
+    "query_surface_terms": {"type": "array", "items": {"type": "string"}},
+    "edge_use_cases": {"type": "array", "items": {"type": "string"}},
+    "drift_risk": {"type": "number"},
+    "activation_prior": {"type": "number"},
+    "negative_patterns": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": [
+    "topic_signature",
+    "query_surface_terms",
+    "edge_use_cases",
+    "drift_risk",
+    "activation_prior",
+    "negative_patterns"
+  ]
+}

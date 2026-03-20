@@ -28,3 +28,9 @@ worth keeping for retrieval.
 - `read_candidate_bundle`
 - `read_judgment_bundle`
 - `read_counterevidence_bundle`
+- `compute_query_activation_profile`
+
+## Tool discipline
+
+- Use `compute_query_activation_profile` to describe how an accepted edge should be activated online.
+- Keep activation profiles generic: describe topic signature, query-facing terms, use cases, and negative patterns rather than dataset-specific instructions.

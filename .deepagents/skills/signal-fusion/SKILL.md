@@ -7,8 +7,16 @@ description: Interpret dense, sparse, overlap, direction, and risk signals as gr
 
 Use local signals as first-class evidence.
 
-## Rules
+## Workflow
 
-- Never ignore strong local contradictions.
-- Risk flags must reduce confidence unless counterevidence is explicitly resolved.
-- Prefer uncertainty over overconfident acceptance.
+1. Start from script-produced signals, not ad hoc intuition.
+2. Read `topic_consistency`, `duplicate_risk`, `bridge_information_gain`, `contrast_evidence`, `query_surface_match`, and `drift_risk` together.
+3. Treat low topic consistency plus high drift risk as a strong warning.
+4. Treat duplicate risk as a soft warning when bridge gain and contrast evidence remain high.
+5. Prefer explicit uncertainty over overconfident acceptance.
+
+## Recommended tools
+
+- Use `compute_topic_consistency` before reasoning about reusable bridge quality.
+- Use `compute_bridge_gain` to separate true bridges from topic-local restatements.
+- Use `compute_contrast_evidence` when metadata and content disagree about whether a pair is a meaningful comparison.

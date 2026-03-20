@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "topic_consistency": {"type": "number"},
+    "duplicate_risk": {"type": "number"},
+    "bridge_information_gain": {"type": "number"},
+    "contrast_evidence": {"type": "number"},
+    "query_surface_match": {"type": "number"},
+    "uncertainty_hint": {"type": "number"},
+    "drift_risk": {"type": "number"},
+    "notes": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": [
+    "topic_consistency",
+    "duplicate_risk",
+    "bridge_information_gain",
+    "contrast_evidence",
+    "query_surface_match",
+    "uncertainty_hint",
+    "drift_risk"
+  ]
+}

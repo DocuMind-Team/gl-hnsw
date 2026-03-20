@@ -14,6 +14,15 @@
 - Keep the graph sparse, diverse, and auditable.
 - Use staged outputs in `data/workspace/indexing/` as the canonical scratch space for current work.
 
+## Accepted Signal Semantics
+
+- `topic_consistency` measures whether the pair stays inside the same reusable topic surface, not just whether both mention generic domain terms.
+- `duplicate_risk` is a soft warning unless the pair also lacks bridge gain or topic consistency.
+- `bridge_information_gain` measures whether the candidate adds new retrieval surface, bridge vocabulary, or access to otherwise hidden subclusters.
+- `contrast_evidence` should come from explicit stance, contradiction, or alternative-position cues in the content or verdict text, not only from metadata.
+- `query_surface_match` is an offline estimate of whether the edge exposes query-facing terms that are likely to help future retrieval.
+- `drift_risk` should stay low for any edge that survives into the persisted graph.
+
 ## Retrieval Utility Heuristics
 
 - High-value edges usually add mechanism, dependency, bridge terms, or strong disambiguation.
@@ -28,6 +37,19 @@
 ## Learned Patterns
 
 - No learned patterns recorded yet.
+
+## Reviewer Override Principles
+
+- Reviewer and checker verdicts should dominate local soft heuristics.
+- Local code may only reject for hard boundaries such as invalid schema, missing evidence, budget caps, duplicate persistence keys, or explicit hard-risk blockers.
+- Do not override a reviewer-approved edge purely because a metadata field is missing, noisy, or weakly inferred.
+
+## Query Activation Principles
+
+- Online querying remains agent-free.
+- Query-time graph use should depend on offline-learned `activation_profile`, not primarily on relation labels.
+- Activation should prefer edges with high activation prior, low drift risk, and strong query-surface or topic-signature match.
+- Relation-specific multipliers are compatibility fallbacks only and should not become the primary activation path again.
 
 ## Allowed Self-Updates
 

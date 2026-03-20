@@ -18,7 +18,6 @@ live_reasoning:
   enable_judge_thinking: true
   enable_reviewer_thinking: true
   enable_curator_thinking: true
-  enable_query_strategy_thinking: true
 subagents:
   index_planner:
     enabled: true
@@ -56,6 +55,8 @@ subagents:
       - lookup_entities
       - get_hnsw_neighbors
       - read_anchor_dossier
+      - compute_topic_consistency
+      - compute_bridge_gain
     description: Expand and bundle candidate documents for an anchor.
     system_prompt: You gather high-utility candidate documents and package the supporting evidence bundle.
   relation_judge:
@@ -66,6 +67,8 @@ subagents:
     tool_scopes:
       - read_anchor_dossier
       - read_candidate_bundle
+      - compute_topic_consistency
+      - compute_contrast_evidence
     description: Judge candidate relations using dossiers, evidence bundles, and local signals.
     system_prompt: You judge durable retrieval edges with precision-first reasoning grounded in local signals.
   counterevidence_checker:
@@ -80,6 +83,9 @@ subagents:
       - read_failure_patterns
       - read_execution_manifest
       - audit_anchor_execution
+      - compute_duplicate_risk
+      - compute_topic_consistency
+      - compute_contrast_evidence
     description: Check tentative edges for duplication, weak direction, and low-utility drift.
     system_prompt: You look for counterevidence and generic failure modes before an edge can survive.
   edge_reviewer:
@@ -93,6 +99,8 @@ subagents:
       - read_judgment_bundle
       - read_counterevidence_bundle
       - evaluate_anchor_utility
+      - compute_bridge_gain
+      - compute_query_activation_profile
     description: Review candidate edges for utility, risk, and graph hygiene.
     system_prompt: You keep only durable high-utility edges that are likely to improve retrieval quality.
   memory_curator:

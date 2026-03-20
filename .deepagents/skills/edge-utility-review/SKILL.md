@@ -20,6 +20,7 @@ Review with a retrieval mindset.
 
 - Use `evaluate_anchor_utility` before final keep/drop decisions.
 - Use `read_counterevidence_bundle` as the authoritative source for drift and duplicate risk.
+- Use `compute_bridge_gain` when the pair is topically related but bridge value is unclear.
 - Favor one strong comparison bridge over several same-theme but noisy comparisons.
 - If the checker reports only duplicate-style risk and the pair is a same-topic contrast bridge, bias toward keeping it and lowering the penalty instead of dropping it.
 - When structured topic-family signals exist, rank same-family contrast bridges ahead of broader cross-family analogies unless the analogy has stronger explicit evidence support.
