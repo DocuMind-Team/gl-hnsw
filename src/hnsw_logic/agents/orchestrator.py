@@ -1786,6 +1786,26 @@ class LogicOrchestrator:
         elif best_relation in RELATION_TYPES and fit_scores.get(best_relation, 0.0) >= fit_scores.get(resolved_relation, 0.0) + 0.08:
             resolved_relation = best_relation
 
+        argumentative_contrast_bridge = (
+            resolved_relation == "comparison"
+            and self._is_argumentative_pair(anchor, candidate)
+            and (
+                metrics.get("topic_family_match", 0.0) >= 1.0
+                or metrics.get("topic_cluster_match", 0.0) >= 1.0
+            )
+            and (
+                metrics.get("stance_contrast", 0.0) >= 1.0
+                or self._has_contrastive_verdict_signal(result, review_result)
+            )
+            and max(
+                signal_bundle.utility_score,
+                float(getattr(result, "utility_score", 0.0)),
+                float(getattr(review_result, "utility_score", 0.0)),
+            )
+            >= 0.72
+            and not ({"service_surface", "foundational_support"} & risk_flags)
+        )
+
         accepted = model_accepts
         rescued_by_reviewer = False
         rescued_by_utility = False
@@ -1800,6 +1820,13 @@ class LogicOrchestrator:
                 and not ({"service_surface", "foundational_support"} & risk_flags)
                 and fit_scores.get(resolved_relation, 0.0) >= max(fit_scores.values(), default=0.0) - 0.06
             )
+            if (
+                not accepted
+                and argumentative_contrast_bridge
+                and float(review_result.confidence) >= 0.76
+                and fit_scores.get(resolved_relation, 0.0) >= max(0.42, max(fit_scores.values(), default=0.0) - 0.14)
+            ):
+                accepted = True
             rescued_by_reviewer = accepted
         else:
             rescue_relation = reviewer_relation if reviewer_relation in RELATION_TYPES else best_relation

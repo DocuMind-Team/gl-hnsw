@@ -360,6 +360,72 @@ def test_reviewed_argumentative_comparison_is_not_downgraded_by_support_fallback
     assert assessment.score > 0.0
 
 
+def test_reviewer_can_rescue_same_topic_argumentative_comparison():
+    provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "test-culture-ahrtsdlgra-con01a",
+        "Social disgust can be central to artwork",
+        "Some art relies on shocking disgust responses to expose taboo topics.",
+        ["social", "disgust", "artwork", "taboo", "art"],
+        ["artwork"],
+        ["debate", "comparison"],
+        {"source_dataset": "arguana", "topic": "argument", "topic_cluster": "speech-disgust-art", "topic_family": "test-culture-ahrtsdlgra", "stance": "con", "doc_kind": "argument"},
+    )
+    candidate = _brief(
+        "test-culture-ahrtsdlgra-con01b",
+        "Ideas can be communicated without disgust",
+        "Provocative art need not rely on disgust when making its point.",
+        ["disgust", "art", "provocative", "ideas", "taboo"],
+        ["art"],
+        ["debate", "comparison"],
+        {"source_dataset": "arguana", "topic": "argument", "topic_cluster": "speech-disgust-art", "topic_family": "test-culture-ahrtsdlgra", "stance": "pro", "doc_kind": "argument"},
+    )
+    judge_verdict = JudgeResult(
+        accepted=False,
+        relation_type="comparison",
+        confidence=0.61,
+        evidence_spans=["Both documents discuss art and disgust."],
+        rationale="The judge is conservative despite topical alignment.",
+        support_score=0.74,
+        contradiction_flags=["near_duplicate"],
+        decision_reason="Judge remained conservative despite topical alignment.",
+        utility_score=0.72,
+        uncertainty=0.55,
+        canonical_relation="none",
+        semantic_relation_label="comparison",
+    )
+    review_verdict = JudgeResult(
+        accepted=True,
+        relation_type="comparison",
+        confidence=0.80,
+        evidence_spans=[
+            "The anchor claims disgust can be central to conceptual art.",
+            "The candidate argues ideas can be conveyed without disgust.",
+        ],
+        rationale="The documents present same-topic opposing positions, making them a reusable comparison bridge.",
+        support_score=0.82,
+        contradiction_flags=["near_duplicate"],
+        decision_reason="Same-topic contrast bridge should be preserved for argumentative retrieval.",
+        utility_score=0.78,
+        uncertainty=0.22,
+        canonical_relation="comparison",
+        semantic_relation_label="comparison",
+    )
+
+    assessment = orchestrator._assessment_for(anchor, candidate, judge_verdict, review_verdict)
+    assert assessment.accepted is True
+    assert assessment.relation_type == "comparison"
+    assert assessment.edge is not None
+    assert assessment.edge.utility_score >= 0.78
+
+
 def test_edge_reviewer_rejects_generic_service_surface_edge():
     provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
     anchor = _brief(
