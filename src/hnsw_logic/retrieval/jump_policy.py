@@ -15,13 +15,33 @@ class JumpPolicy:
         self.max_seeds = config.seed_top_b
         self.max_expansions_per_seed = config.max_expansions_per_seed
 
-    def allow_jump(self, query_emb: np.ndarray, edge_emb: np.ndarray, edge: LogicEdge, target_rel_score: float) -> bool:
+    def allow_jump(
+        self,
+        query_emb: np.ndarray,
+        edge_emb: np.ndarray,
+        edge: LogicEdge,
+        target_rel_score: float,
+        *,
+        activation_match: float = 0.0,
+    ) -> bool:
         edge_match = float(np.dot(query_emb, edge_emb))
-        effective_conf = 0.7 * edge.confidence + 0.3 * getattr(edge, "utility_score", edge.confidence)
+        profile = getattr(edge, "activation_profile", {}) or {}
+        activation_prior = max(0.0, min(float(profile.get("activation_prior", getattr(edge, "utility_score", edge.confidence)) or 0.0), 1.0))
+        drift_risk = max(0.0, min(float(profile.get("drift_risk", 0.0) or 0.0), 1.0))
+        effective_conf = (
+            0.5 * edge.confidence
+            + 0.25 * getattr(edge, "utility_score", edge.confidence)
+            + 0.15 * activation_prior
+            + 0.1 * max(0.0, min(activation_match, 1.0))
+        )
         if effective_conf < self.tau_conf:
             return False
-        if edge_match < self.tau_edge:
+        edge_threshold = max(0.05, self.tau_edge - 0.06 * activation_prior - 0.04 * max(0.0, min(activation_match, 1.0)))
+        if edge_match < edge_threshold:
             return False
-        if target_rel_score < self.tau_target:
+        target_threshold = max(0.05, self.tau_target - 0.05 * activation_prior)
+        if target_rel_score < target_threshold:
+            return False
+        if drift_risk >= 0.8 and activation_prior < 0.6 and activation_match < 0.45:
             return False
         return True

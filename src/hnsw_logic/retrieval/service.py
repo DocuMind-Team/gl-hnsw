@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 from hnsw_logic.core.models import SearchHit, SearchResponse
 from hnsw_logic.docs.brief_store import BriefStore
@@ -24,7 +25,6 @@ class HybridRetrievalService:
         jump_policy: JumpPolicy,
         semantic_memory_store: SemanticMemoryStore | None = None,
         corpus_store: CorpusStore | None = None,
-        query_strategy_agent=None,
     ):
         self.searcher = searcher
         self.brief_store = brief_store
@@ -33,7 +33,6 @@ class HybridRetrievalService:
         self.jump_policy = jump_policy
         self.semantic_memory_store = semantic_memory_store
         self.corpus_store = corpus_store
-        self.query_strategy_agent = query_strategy_agent
         self.initial_top_k = jump_policy.config.initial_top_k
         self.supplemental_seed_top_k = jump_policy.config.supplemental_seed_top_k
         self.supplemental_seed_min_score = jump_policy.config.supplemental_seed_min_score
@@ -168,6 +167,25 @@ class HybridRetrievalService:
             for row in ranked[:top_k]
         ]
         return SearchResponse(query=query, hits=hits)
+
+    def _default_strategy(self, *, graph_available: bool):
+        if graph_available and self._dataset_hint in {"gl_hnsw_demo", "demo", "project_docs"}:
+            return SimpleNamespace(
+                sparse_gate=0.8,
+                allow_sparse_only=False,
+                graph_gate=1.0,
+                sparse_boost=1.0,
+                novelty_bias=1.0,
+                rationale="local_graph_first",
+            )
+        return SimpleNamespace(
+            sparse_gate=1.0,
+            allow_sparse_only=True,
+            graph_gate=1.0 if graph_available else 0.0,
+            sparse_boost=1.0,
+            novelty_bias=1.0,
+            rationale="local_default",
+        )
 
     def _apply_memory_bias(self, query: str, rows: list[dict]) -> list[dict]:
         if self.semantic_memory_store is None:
@@ -417,8 +435,8 @@ class HybridRetrievalService:
             best_bonus = 0.0
             for edge in self.graph_store.get_out_edges(row["doc_id"])[: self.jump_policy.max_expansions_per_seed]:
                 edge_utility = max(0.0, min(getattr(edge, "utility_score", edge.confidence), 1.0))
-                same_concept_bridge = edge.relation_type == "same_concept"
-                if same_concept_bridge and edge_utility < 0.62:
+                concept_bridge = self.scorer.is_concept_bridge(edge)
+                if concept_bridge and edge_utility < 0.62:
                     continue
                 target_brief = briefs.get(edge.dst_doc_id)
                 if target_brief is None:
@@ -426,18 +444,18 @@ class HybridRetrievalService:
                 edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
                 specific_overlap = self.scorer.specific_query_overlap(query, target_brief, edge)
                 target_rel = self.scorer.score_target(query, query_emb, target_brief)
-                if target_rel < (0.42 if same_concept_bridge else 0.35):
+                if target_rel < (0.42 if concept_bridge else 0.35):
                     continue
                 target_alignment = self.scorer.query_alignment(query, target_brief)
-                if target_alignment < (0.3 if same_concept_bridge else 0.24):
+                if target_alignment < (0.3 if concept_bridge else 0.24):
                     continue
-                if same_concept_bridge and edge_alignment < (0.14 + 0.1 * query_specificity):
+                if concept_bridge and edge_alignment < (0.14 + 0.1 * query_specificity):
                     continue
-                if same_concept_bridge and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
+                if concept_bridge and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
                     continue
-                relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
+                relation_multiplier = self.scorer.activation_multiplier(query, target_brief, edge)
                 utility_multiplier = 0.5 + 0.5 * edge_utility
-                base_bonus = 0.16 if not same_concept_bridge else 0.12
+                base_bonus = 0.16 if not concept_bridge else 0.12
                 bonus = (
                     base_bonus
                     * edge.confidence
@@ -456,36 +474,6 @@ class HybridRetrievalService:
         for rank, row in enumerate(ranked, start=1):
             row["rank"] = rank
         return ranked
-
-    def _query_strategy(self, query: str, dense_rows: list[tuple[str, float, str]], sparse_hits, briefs: dict[str, object]):
-        graph_available = bool(self.graph_store.all_edges())
-        if self.query_strategy_agent is None:
-            if graph_available and self._dataset_hint in {"gl_hnsw_demo", "demo", "project_docs"}:
-                return type(
-                    "Strategy",
-                    (),
-                    {
-                        "sparse_gate": 0.8,
-                        "allow_sparse_only": False,
-                        "graph_gate": 1.0,
-                        "rationale": "default_graph_first",
-                    },
-                )()
-            return type(
-                "Strategy",
-                (),
-                {"sparse_gate": 1.0, "allow_sparse_only": True, "graph_gate": 1.0 if graph_available else 0.0, "rationale": "default"},
-            )()
-        return self.query_strategy_agent.run(
-            query=query,
-            dense_rows=dense_rows,
-            sparse_hits=sparse_hits,
-            briefs=briefs,
-            dataset_hint=self._dataset_hint,
-            graph_available=graph_available,
-            scorer=self.scorer,
-            raw_tokens_by_id=self._record_tokens_by_id,
-        )
 
     def _graph_budget(self, query: str, query_emb, seed_rows: list[tuple[str, float, str]], briefs: dict[str, object], strategy) -> tuple[int, int]:
         graph_gate = max(0.0, getattr(strategy, "graph_gate", 0.0))
@@ -528,11 +516,11 @@ class HybridRetrievalService:
                 target_alignment = max(self.scorer.query_alignment(query, target_brief), self.scorer.structure_alignment(query, target_brief))
                 edge_alignment = self.scorer.edge_query_alignment(query, edge, target_brief)
                 specific_overlap = self.scorer.specific_query_overlap(query, target_brief, edge)
-                relation_multiplier = self.scorer.relation_query_multiplier(query, target_brief, edge)
+                relation_multiplier = self.scorer.activation_multiplier(query, target_brief, edge)
                 edge_utility = max(0.0, min(1.0, getattr(edge, "utility_score", edge.confidence)))
-                if edge.relation_type == "same_concept" and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
+                if self.scorer.is_concept_bridge(edge) and self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
                     continue
-                if edge.relation_type == "same_concept" and specific_overlap <= source_specific_overlap + 0.05:
+                if self.scorer.is_concept_bridge(edge) and specific_overlap <= source_specific_overlap + 0.05:
                     continue
                 edge_promise = (
                     0.34 * edge_utility
@@ -541,7 +529,7 @@ class HybridRetrievalService:
                     + 0.1 * target_alignment
                     + 0.06 * specific_overlap
                 ) * relation_multiplier * (0.3 + 0.5 * edge_alignment + 0.2 * specific_overlap)
-                if edge.relation_type == "same_concept":
+                if self.scorer.is_concept_bridge(edge):
                     edge_promise *= 0.9 + 0.08 * max(0.0, 1.0 - query_specificity)
                 best_edge_promise = max(best_edge_promise, edge_promise)
                 if edge_promise >= self.adaptive_graph_min_promise:
@@ -566,7 +554,7 @@ class HybridRetrievalService:
             self._sparse.build(list(briefs.values()), self._records_by_id)
             self._sparse_doc_count = len(briefs)
         sparse_hits = self._sparse.search(query, top_k=self.sparse_top_k)
-        strategy = self._query_strategy(query, dense_rows, sparse_hits, briefs)
+        strategy = self._default_strategy(graph_available=bool(self.graph_store.all_edges()))
         merged: dict[str, tuple[float, str]] = {
             doc_id: (score, source_kind) for doc_id, score, source_kind in dense_rows
         }
@@ -658,9 +646,10 @@ class HybridRetrievalService:
                 edge_emb = self.scorer.edge_embedding(edge)
                 target_rel_score = self.scorer.score_target(query, query_emb, brief)
                 edge_query_alignment = self.scorer.edge_query_alignment(query, edge, brief)
+                activation_match = self.scorer.activation_match(query, brief, edge)
                 specific_overlap = self.scorer.specific_query_overlap(query, brief, edge)
-                if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score):
-                    if edge.relation_type == "same_concept":
+                if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score, activation_match=activation_match):
+                    if self.scorer.is_concept_bridge(edge):
                         threshold = 0.12 + 0.12 * self.scorer.query_specificity(query)
                         if edge_query_alignment < threshold:
                             continue
@@ -677,6 +666,7 @@ class HybridRetrievalService:
                             edge_match=float(query_emb.dot(edge_emb)),
                             target_rel_score=target_rel_score,
                             edge_query_alignment=edge_query_alignment,
+                            activation_match=activation_match,
                         )
                     )
         ranked = self.scorer.rank(query, query_emb, seeds, expanded, briefs, top_k)

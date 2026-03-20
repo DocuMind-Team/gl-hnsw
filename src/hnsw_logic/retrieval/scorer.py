@@ -20,6 +20,7 @@ class ExpandedCandidate:
     edge_match: float
     target_rel_score: float
     edge_query_alignment: float
+    activation_match: float
 
 
 class RetrievalScorer:
@@ -198,26 +199,92 @@ class RetrievalScorer:
         structure_alignment = self.structure_alignment(query, brief)
         return 0.68 * dense_score + 0.22 * lexical_alignment + 0.1 * structure_alignment
 
+    @staticmethod
+    def _edge_activation_profile(edge: LogicEdge) -> dict[str, object]:
+        profile = getattr(edge, "activation_profile", {}) or {}
+        return profile if isinstance(profile, dict) else {}
+
+    def edge_use_cases(self, edge: LogicEdge) -> set[str]:
+        profile = self._edge_activation_profile(edge)
+        use_cases = {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
+        if not use_cases and edge.relation_type == "same_concept":
+            use_cases.add("concept-bridge")
+        if not use_cases and edge.relation_type == "comparison":
+            use_cases.add("same-topic-contrast")
+        return use_cases
+
+    def is_concept_bridge(self, edge: LogicEdge) -> bool:
+        return "concept-bridge" in self.edge_use_cases(edge)
+
+    def edge_activation_prior(self, edge: LogicEdge) -> float:
+        profile = self._edge_activation_profile(edge)
+        prior = profile.get("activation_prior")
+        if prior is None:
+            return max(0.0, min(getattr(edge, "utility_score", edge.confidence), 1.0))
+        return max(0.0, min(float(prior), 1.0))
+
+    def edge_drift_risk(self, edge: LogicEdge) -> float:
+        profile = self._edge_activation_profile(edge)
+        drift = profile.get("drift_risk")
+        if drift is None:
+            return 0.0
+        return max(0.0, min(float(drift), 1.0))
+
+    def activation_match(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
+        profile = self._edge_activation_profile(edge)
+        if not profile:
+            return 0.0
+        query_tokens = self._query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        surface_terms = {token for token in tokenize(" ".join(profile.get("query_surface_terms", []) or [])) if len(token) > 2}
+        topic_terms = {token for token in tokenize(" ".join(profile.get("topic_signature", []) or [])) if len(token) > 2}
+        use_cases = {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
+        negative_patterns = {str(item).strip().lower() for item in profile.get("negative_patterns", []) or [] if str(item).strip()}
+        surface_overlap = min(len(query_tokens & surface_terms) / max(1, min(len(query_tokens), 4)), 1.0) if surface_terms else 0.0
+        topic_overlap = min(len(query_tokens & topic_terms) / max(1, min(len(query_tokens), 3)), 1.0) if topic_terms else 0.0
+        lexical_alignment = self.query_alignment(query, brief)
+        title_claim = self.title_claim_alignment(query, brief)
+        use_case_bonus = 0.0
+        if "same-topic-contrast" in use_cases and query_tokens & {"contrast", "compare", "comparison", "versus", "against", "debate"}:
+            use_case_bonus = 0.16
+        elif "claim-support" in use_cases and query_tokens & {"evidence", "support", "claim", "study", "finding"}:
+            use_case_bonus = 0.12
+        elif "concept-bridge" in use_cases and query_tokens & {"concept", "overview", "family", "related"}:
+            use_case_bonus = 0.1
+        elif "mechanism-detail" in use_cases and query_tokens & {"how", "mechanism", "detail", "implementation", "score", "fusion"}:
+            use_case_bonus = 0.12
+        score = (
+            0.3 * surface_overlap
+            + 0.2 * topic_overlap
+            + 0.3 * lexical_alignment
+            + 0.2 * title_claim
+            + use_case_bonus
+        )
+        if "topic_drift" in negative_patterns:
+            score *= 0.82
+        if "near_duplicate" in negative_patterns and surface_overlap < 0.3:
+            score *= 0.9
+        return max(0.0, min(score, 1.0))
+
     def relation_query_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
-        alignment = self.query_alignment(query, brief)
-        dataset = str(brief.metadata.get("source_dataset", "")).lower()
-        if edge.relation_type == "prerequisite":
-            return 0.2 + 0.8 * alignment
-        if edge.relation_type == "supporting_evidence":
-            if dataset in {"scifact", "nfcorpus"}:
-                return 0.35 + 0.65 * alignment
-            return 0.1 + 0.6 * alignment
-        if edge.relation_type == "implementation_detail":
-            return 0.55 + 0.45 * alignment
-        if edge.relation_type == "same_concept":
-            if dataset in {"scifact", "nfcorpus"}:
-                return 0.45 + 0.55 * alignment
-            return 0.4 + 0.45 * alignment
-        if edge.relation_type == "comparison":
-            if str(brief.metadata.get("source_dataset", "")).lower() == "arguana":
-                return 0.58 + 0.42 * alignment
-            return 0.45 + 0.45 * alignment
-        return 0.4 + 0.6 * alignment
+        alignment = max(self.query_alignment(query, brief), self.structure_alignment(query, brief))
+        fallback_prior = {
+            "prerequisite": 0.72,
+            "supporting_evidence": 0.7,
+            "implementation_detail": 0.82,
+            "same_concept": 0.78,
+            "comparison": 0.8,
+        }.get(edge.relation_type, 0.72)
+        return min(1.0, 0.35 + 0.4 * alignment + 0.25 * fallback_prior)
+
+    def activation_multiplier(self, query: str, brief: DocBrief, edge: LogicEdge) -> float:
+        activation_match = self.activation_match(query, brief, edge)
+        activation_prior = self.edge_activation_prior(edge)
+        drift_penalty = 1.0 - 0.35 * self.edge_drift_risk(edge)
+        if self._edge_activation_profile(edge):
+            return max(0.15, min(1.1, (0.35 + 0.4 * activation_match + 0.25 * activation_prior) * drift_penalty))
+        return self.relation_query_multiplier(query, brief, edge)
 
     def edge_embedding(self, edge: LogicEdge) -> np.ndarray:
         edge_emb = self._edge_embedding_cache.get(edge.edge_card_text)
@@ -298,21 +365,28 @@ class RetrievalScorer:
                 "summary": briefs[doc_id].summary,
                 "edge_relation": None,
                 "edge_utility": 0.0,
+                "edge": None,
+                "edge_activation_match": 0.0,
             }
         for candidate in expanded:
             target_brief = briefs[candidate.doc_id]
-            relation_multiplier = self.relation_query_multiplier(query, target_brief, candidate.edge)
+            relation_multiplier = self.activation_multiplier(query, target_brief, candidate.edge)
             edge_utility = max(0.0, min(getattr(candidate.edge, "utility_score", candidate.edge.confidence), 1.0))
+            activation_prior = self.edge_activation_prior(candidate.edge)
+            drift_penalty = 1.0 - 0.3 * self.edge_drift_risk(candidate.edge)
             utility_multiplier = 0.5 + 0.5 * edge_utility
-            edge_alignment = max(candidate.edge_query_alignment, self.query_alignment(query, target_brief))
+            edge_activation_match = max(candidate.activation_match, self.activation_match(query, target_brief, candidate.edge))
+            edge_alignment = max(candidate.edge_query_alignment, self.query_alignment(query, target_brief), edge_activation_match)
             logic_score = (
                 candidate.seed_score
                 * candidate.edge.confidence
-                * utility_multiplier
-                * candidate.edge_match
-                * candidate.target_rel_score
-                * relation_multiplier
-                * (0.3 + 0.7 * edge_alignment)
+                * (0.42 + 0.58 * utility_multiplier)
+                * (0.38 + 0.62 * min(candidate.edge_match, 1.0))
+                * (0.38 + 0.62 * min(candidate.target_rel_score, 1.0))
+                * (0.35 + 0.65 * relation_multiplier)
+                * (0.35 + 0.65 * edge_alignment)
+                * (0.45 + 0.55 * activation_prior)
+                * drift_penalty
             )
             row = merged.setdefault(
                 candidate.doc_id,
@@ -326,6 +400,8 @@ class RetrievalScorer:
                     "summary": target_brief.summary,
                     "edge_relation": None,
                     "edge_utility": 0.0,
+                    "edge": None,
+                    "edge_activation_match": 0.0,
                 },
             )
             if logic_score > row["logical_score"]:
@@ -333,6 +409,8 @@ class RetrievalScorer:
                 row["via_edge"] = f"{candidate.source_doc_id}->{candidate.doc_id}"
                 row["edge_relation"] = candidate.edge.relation_type
                 row["edge_utility"] = edge_utility
+                row["edge"] = candidate.edge
+                row["edge_activation_match"] = edge_activation_match
                 if row["source_kind"] == "geometric":
                     row["source_kind"] = "hybrid"
 
@@ -340,16 +418,21 @@ class RetrievalScorer:
         for row in merged.values():
             logic_weight = self.beta
             edge_utility = max(0.0, min(float(row.get("edge_utility", 0.0)), 1.0))
-            relation_type = row.get("edge_relation")
+            edge = row.get("edge")
+            activation_prior = self.edge_activation_prior(edge) if edge is not None else 0.0
+            edge_activation_match = max(0.0, min(float(row.get("edge_activation_match", 0.0)), 1.0))
+            drift_penalty = 1.0 - 0.25 * self.edge_drift_risk(edge) if edge is not None else 1.0
             if row["source_kind"] == "logic":
-                logic_weight *= 0.18 + 0.26 * edge_utility
+                logic_weight *= 0.55 + 0.6 * edge_utility + 0.45 * activation_prior + 0.65 * edge_activation_match
             elif row["source_kind"] == "hybrid":
-                logic_weight *= 0.32 + 0.32 * edge_utility
-            if relation_type == "same_concept":
-                logic_weight *= 1.15
-            elif relation_type == "comparison":
-                logic_weight *= 0.92
-            row["final_score"] = self.alpha * row["geometric_score"] + logic_weight * row["logical_score"]
+                logic_weight *= 0.42 + 0.48 * edge_utility + 0.32 * activation_prior + 0.28 * edge_activation_match
+            logic_weight *= drift_penalty
+            activation_bonus = 0.0
+            if edge is not None:
+                activation_bonus = 0.3 * activation_prior * edge_activation_match * (0.6 + 0.4 * edge_utility)
+                if row["source_kind"] == "logic":
+                    activation_bonus += 0.22 * max(0.0, edge_activation_match - 0.55)
+            row["final_score"] = self.alpha * row["geometric_score"] + logic_weight * row["logical_score"] + activation_bonus
             ranked.append(row)
         ranked.sort(key=lambda item: (-item["final_score"], item["doc_id"]))
         for rank, row in enumerate(ranked[:top_k], start=1):
