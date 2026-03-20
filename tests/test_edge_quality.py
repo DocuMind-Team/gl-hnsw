@@ -229,6 +229,57 @@ def test_local_gate_rejects_topic_drift_or_low_support():
     assert assessment.reject_reason in {"topic_drift", "low_support"}
 
 
+def test_argumentative_family_match_improves_comparison_utility():
+    provider = FakeProvider()
+    orchestrator = LogicOrchestrator(
+        doc_profiler=SimpleNamespace(provider=provider),
+        corpus_scout=SimpleNamespace(provider=provider),
+        relation_judge=FakeJudge(provider, {}),
+        memory_curator=SimpleNamespace(provider=provider),
+        retrieval_config=RetrievalConfig(),
+    )
+    anchor = _brief(
+        "test-culture-ahrtsdlgra-con02a",
+        "Freedom of speech",
+        "Artists should be free to provoke disgust when challenging taboos.",
+        ["freedom", "speech", "artists", "disgust", "taboos"],
+        ["speech"],
+        ["debate", "comparison"],
+        {"source_dataset": "arguana", "topic_cluster": "speech-disgust-art", "topic_family": "test-culture-ahrtsdlgra", "stance": "con"},
+    )
+    same_family = _brief(
+        "test-culture-ahrtsdlgra-con02b",
+        "Speech restrictions are justified",
+        "Freedom of speech can be restricted when harms outweigh expressive value.",
+        ["speech", "restrictions", "freedom", "harms", "disgust"],
+        ["speech"],
+        ["debate", "comparison"],
+        {"source_dataset": "arguana", "topic_cluster": "speech-disgust-art", "topic_family": "test-culture-ahrtsdlgra", "stance": "pro"},
+    )
+    cross_family = _brief(
+        "test-free-speech-debate-ldhwbmclg-pro02a",
+        "Gangsta rap should be censored",
+        "Speech should be censored because of social harms associated with gangsta rap.",
+        ["speech", "censored", "harms", "rap"],
+        ["speech"],
+        ["debate", "comparison"],
+        {"source_dataset": "arguana", "topic_cluster": "speech-disgust-art", "topic_family": "test-free-speech-debate-ldhwbmclg", "stance": "pro"},
+    )
+
+    same_metrics = orchestrator._candidate_metrics(anchor, same_family)
+    cross_metrics = orchestrator._candidate_metrics(anchor, cross_family)
+    same_rerank, same_relation, same_fit = orchestrator._pair_rerank(anchor, same_family, same_metrics)
+    cross_rerank, cross_relation, cross_fit = orchestrator._pair_rerank(anchor, cross_family, cross_metrics)
+    same_utility = orchestrator._utility_score(anchor, same_family, same_metrics, same_fit, same_relation)
+    cross_utility = orchestrator._utility_score(anchor, cross_family, cross_metrics, cross_fit, cross_relation)
+
+    assert same_metrics["topic_family_match"] == 1.0
+    assert cross_metrics["topic_family_match"] == 0.0
+    assert same_fit["comparison"] > cross_fit["comparison"]
+    assert same_utility > cross_utility
+    assert same_rerank > cross_rerank
+
+
 def test_edge_reviewer_rejects_generic_service_surface_edge():
     provider = type("OpenAICompatibleProvider", (FakeProvider,), {})()
     anchor = _brief(

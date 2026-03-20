@@ -269,6 +269,9 @@ class LogicOrchestrator:
     def _topic_cluster(self, brief: DocBrief) -> str:
         return str(brief.metadata.get("topic_cluster", "")).lower()
 
+    def _topic_family(self, brief: DocBrief) -> str:
+        return str(brief.metadata.get("topic_family", "")).lower()
+
     def _stance(self, brief: DocBrief) -> str:
         return str(brief.metadata.get("stance", "")).lower()
 
@@ -468,18 +471,23 @@ class LogicOrchestrator:
         if not self._is_argumentative_pair(anchor, candidate):
             return 0.0
         specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
+        topic_family_match = metrics.get("topic_family_match", 0.0)
         normalized_title_overlap = min(metrics["title_overlap"] / 3.0, 1.0)
         normalized_content_overlap = min(metrics["content_overlap_score"] / 0.3, 1.0)
         normalized_mention = min(metrics["mention_score"] / 0.24, 1.0)
+        family_weight = 0.34 if self._topic_family(anchor) and self._topic_family(candidate) else 0.0
+        base_consistency = (
+            0.34 * metrics["topic_cluster_match"]
+            + 0.26 * specific_title_bridge
+            + 0.16 * normalized_title_overlap
+            + 0.14 * normalized_content_overlap
+            + 0.10 * normalized_mention
+        )
         return max(
             0.0,
             min(
                 1.0,
-                0.34 * metrics["topic_cluster_match"]
-                + 0.26 * specific_title_bridge
-                + 0.16 * normalized_title_overlap
-                + 0.14 * normalized_content_overlap
-                + 0.10 * normalized_mention,
+                family_weight * topic_family_match + (1.0 - family_weight) * base_consistency,
             ),
         )
 
@@ -497,6 +505,7 @@ class LogicOrchestrator:
                 0.46 * argument_bridge_strength
                 + 0.24 * topic_consistency
                 + 0.18 * metrics["content_overlap_score"]
+                + 0.08 * metrics.get("topic_family_match", 0.0)
                 + 0.12 * min(metrics["title_overlap"] / 3.0, 1.0),
             ),
         )
@@ -767,6 +776,7 @@ class LogicOrchestrator:
             + 0.18 * metrics["overlap_score"]
             + 0.14 * metrics["content_overlap_score"]
             + 0.16 * metrics["topic_alignment"]
+            + 0.14 * metrics["topic_family_match"]
             + 0.14 * metrics["topic_cluster_match"]
             + 0.18 * metrics["stance_contrast"]
             + 0.08 * metrics["novelty_bridge_score"]
@@ -836,9 +846,16 @@ class LogicOrchestrator:
             score += 0.1 * metrics["family_bridge_score"] + 0.04 * metrics["topic_alignment"]
         if relation_type == "comparison":
             score += 0.08 * metrics["topic_cluster_match"] + 0.08 * metrics["stance_contrast"]
+            score += 0.14 * metrics["topic_family_match"]
             score += 0.08 * metrics["novelty_bridge_score"]
             score += 0.18 * argument_bridge_strength
             score += 0.06 * specific_title_bridge
+            if (
+                metrics["topic_family_match"] < 1.0
+                and metrics["topic_cluster_match"] < 1.0
+                and specific_title_bridge < 0.5
+            ):
+                score -= 0.16
         if relation_type == "same_concept":
             score -= 0.3 * methodology_penalty
             score += 0.16 * metrics["novelty_bridge_score"]
@@ -985,7 +1002,11 @@ class LogicOrchestrator:
         if (
             self._is_argumentative_pair(anchor, candidate)
             and fit_scores["comparison"] >= 0.52
-            and metrics["topic_cluster_match"] >= 1.0
+            and (
+                metrics["topic_family_match"] >= 1.0
+                or metrics["topic_cluster_match"] >= 1.0
+                or self._specific_title_bridge_score(anchor, candidate) >= 0.5
+            )
             and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
         ):
             return True
@@ -1065,13 +1086,17 @@ class LogicOrchestrator:
                 )
             if (
                 self._is_argumentative_pair(anchor, candidate)
-                and metrics["topic_cluster_match"] >= 1.0
+                and (
+                    metrics["topic_family_match"] >= 1.0
+                    or metrics["topic_cluster_match"] >= 1.0
+                    or self._specific_title_bridge_score(anchor, candidate) >= 0.5
+                )
                 and fit_scores["comparison"] >= 0.58
                 and (metrics["stance_contrast"] >= 1.0 or metrics["content_overlap_score"] >= 0.18)
             ):
                 proposals.append(
                     (
-                        score + 0.18 + 0.08 * metrics["stance_contrast"],
+                        score + 0.18 + 0.08 * metrics["stance_contrast"] + 0.12 * metrics["topic_family_match"],
                         CandidateProposal(
                             doc_id=candidate.doc_id,
                             reason="targeted argumentative comparison candidate",
@@ -1224,6 +1249,14 @@ class LogicOrchestrator:
                 candidate_stage = self._doc_stage(candidate) if candidate is not None else ""
                 stage_bonus = 0.04 if candidate_stage and selected_stages[candidate_stage] == 0 else 0.0
                 mirror_bonus = 0.03 if item.relation_type in {"same_concept", "comparison"} else 0.0
+                family_bonus = 0.0
+                if (
+                    item.relation_type == "comparison"
+                    and candidate is not None
+                    and self._topic_family(anchor)
+                    and self._topic_family(anchor) == self._topic_family(candidate)
+                ):
+                    family_bonus = 0.08
                 utility_value = max(0.0, min(getattr(item.edge, "utility_score", 0.0), 1.0))
                 scientific_same_concept = (
                     candidate is not None
@@ -1247,7 +1280,7 @@ class LogicOrchestrator:
                 if scientific_same_concept:
                     base_multiplier = 0.58 + 0.12 * utility_value
                 score = item.score * base_multiplier
-                score += 0.12 * novelty + utility_bonus + relation_bonus + stage_bonus + mirror_bonus + specificity_bonus
+                score += 0.12 * novelty + utility_bonus + relation_bonus + stage_bonus + mirror_bonus + family_bonus + specificity_bonus
                 if score > best_score:
                     best_score = score
                     best_index = index
@@ -1375,10 +1408,12 @@ class LogicOrchestrator:
         family_bridge_score = self._family_bridge_score(anchor_content_terms, candidate_content_terms)
         anchor_family = self._dominant_family(anchor_content_terms)
         candidate_family = self._dominant_family(candidate_content_terms)
+        topic_family_match = 1.0 if self._topic_family(anchor) and self._topic_family(anchor) == self._topic_family(candidate) else 0.0
         topic_cluster_match = 1.0 if self._topic_cluster(anchor) and self._topic_cluster(anchor) == self._topic_cluster(candidate) else 0.0
         stance_contrast = 1.0 if self._stance(anchor) and self._stance(candidate) and self._stance(anchor) != self._stance(candidate) else 0.0
         topic_alignment = 1.0 if (
             (anchor.metadata.get("topic") and anchor.metadata.get("topic") == candidate.metadata.get("topic"))
+            or topic_family_match >= 1.0
             or topic_cluster_match >= 1.0
         ) else 0.0
         service_surface_score = min(len(candidate_content_terms & SERVICE_SURFACE_TERMS) / 3.0, 1.0)
@@ -1411,6 +1446,7 @@ class LogicOrchestrator:
             "reverse_reference_score": reverse_reference_score,
             "family_bridge_score": family_bridge_score,
             "shared_dominant_family": 1.0 if anchor_family and anchor_family == candidate_family else 0.0,
+            "topic_family_match": topic_family_match,
             "topic_alignment": topic_alignment,
             "topic_cluster_match": topic_cluster_match,
             "stance_contrast": stance_contrast,
@@ -2011,10 +2047,14 @@ class LogicOrchestrator:
                 continue
             centrality, neighborhoods = self._dense_anchor_neighborhoods(group)
             cluster_members: dict[str, list[DocBrief]] = {}
+            family_members: dict[str, list[DocBrief]] = {}
             for brief in group:
                 cluster = self._topic_cluster(brief)
                 if cluster:
                     cluster_members.setdefault(cluster, []).append(brief)
+                family = self._topic_family(brief)
+                if family:
+                    family_members.setdefault(family, []).append(brief)
             specific_bridge_potential = {
                 brief.doc_id: self._specific_title_bridge_potential(brief, group)
                 for brief in group
@@ -2040,7 +2080,9 @@ class LogicOrchestrator:
             coverage: dict[str, float] = {}
             kept: list[str] = []
             selected_clusters: set[str] = set()
+            selected_families: set[str] = set()
             followup_clusters: set[str] = set()
+            followup_families: set[str] = set()
             while eligible and len(kept) < cap:
                 best_id = ""
                 best_score = float("-inf")
@@ -2051,9 +2093,10 @@ class LogicOrchestrator:
                     for neighbor_id, weight in neighborhoods.get(brief.doc_id, [(brief.doc_id, 1.0)]):
                         coverage_gain += max(0.0, weight - coverage.get(neighbor_id, 0.0))
                     cluster_bonus = 0.12 if self._topic_cluster(brief) and self._topic_cluster(brief) not in selected_clusters else 0.0
+                    family_bonus = 0.16 if self._topic_family(brief) and self._topic_family(brief) not in selected_families else 0.0
                     specificity_bonus = 0.04 * max(self._title_specificity_score(brief), 0.0)
                     bridge_bonus = 0.08 * specific_bridge_potential.get(brief.doc_id, 0.0)
-                    score = 0.54 * base_score + 0.3 * coverage_gain + cluster_bonus + specificity_bonus + bridge_bonus
+                    score = 0.5 * base_score + 0.28 * coverage_gain + cluster_bonus + family_bonus + specificity_bonus + bridge_bonus
                     if score > best_score:
                         best_score = score
                         best_id = brief.doc_id
@@ -2067,6 +2110,47 @@ class LogicOrchestrator:
                 cluster = self._topic_cluster(chosen)
                 if cluster:
                     selected_clusters.add(cluster)
+                family = self._topic_family(chosen)
+                if family:
+                    selected_families.add(family)
+                if (
+                    family
+                    and family not in followup_families
+                    and len(family_members.get(family, [])) >= 2
+                    and len(kept) < cap
+                    and (
+                        specific_bridge_potential.get(chosen.doc_id, 0.0) >= 0.58
+                        or profile["argument_ratio"] >= 0.3
+                    )
+                ):
+                    family_followups = [
+                        brief
+                        for brief in eligible
+                        if self._topic_family(brief) == family and brief.doc_id not in kept
+                    ]
+                    if family_followups:
+                        family_followups.sort(
+                            key=lambda brief: (
+                                -(
+                                    0.48 * priority_map.get(brief.doc_id, 0.0)
+                                    + 0.3 * specific_bridge_potential.get(brief.doc_id, 0.0)
+                                    + 0.14 * centrality.get(brief.doc_id, 0.0)
+                                    + 0.08 * max(self._title_specificity_score(brief), 0.0)
+                                ),
+                                brief.doc_id,
+                            )
+                        )
+                        followup = family_followups[0]
+                        kept.append(followup.doc_id)
+                        eligible = [brief for brief in eligible if brief.doc_id != followup.doc_id]
+                        for neighbor_id, weight in neighborhoods.get(followup.doc_id, [(followup.doc_id, 1.0)]):
+                            coverage[neighbor_id] = max(coverage.get(neighbor_id, 0.0), weight)
+                        selected_families.add(family)
+                        followup_families.add(family)
+                        cluster = self._topic_cluster(followup)
+                        if cluster:
+                            selected_clusters.add(cluster)
+                        continue
                 if (
                     cluster
                     and cluster not in followup_clusters
@@ -2110,27 +2194,37 @@ class LogicOrchestrator:
                     if bridge_potential < 0.5:
                         continue
                     cluster = self._topic_cluster(brief)
+                    family = self._topic_family(brief)
                     cluster_bonus = 0.14 if cluster and cluster not in selected_clusters else 0.0
+                    family_bonus = 0.16 if family and family not in selected_families else 0.0
                     reserve_score = (
                         0.48 * bridge_potential
                         + 0.26 * self.discovery_anchor_priority(brief)
                         + 0.16 * centrality.get(brief.doc_id, 0.0)
                         + 0.1 * max(self._title_specificity_score(brief), 0.0)
                         + cluster_bonus
+                        + family_bonus
                     )
                     reserve_ranked.append((reserve_score, brief))
                 reserve_ranked.sort(key=lambda item: (-item[0], item[1].doc_id))
                 reserve_kept = 0
                 reserve_clusters: set[str] = set()
+                reserve_families: set[str] = set()
                 for _, brief in reserve_ranked:
                     cluster = self._topic_cluster(brief)
                     if cluster and cluster in reserve_clusters:
+                        continue
+                    family = self._topic_family(brief)
+                    if family and family in reserve_families:
                         continue
                     kept.append(brief.doc_id)
                     reserve_kept += 1
                     if cluster:
                         reserve_clusters.add(cluster)
                         selected_clusters.add(cluster)
+                    if family:
+                        reserve_families.add(family)
+                        selected_families.add(family)
                     if reserve_kept >= reserve_cap:
                         break
             if not kept:

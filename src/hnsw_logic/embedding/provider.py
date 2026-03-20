@@ -1031,6 +1031,7 @@ class OpenAICompatibleProvider(StubProvider):
             "comparison is appropriate for debate or argument corpora when two documents address the same topic from contrasting or alternative positions. "
             "For scientific or clinical corpora, prefer supporting_evidence when the candidate adds aligned risk, treatment, outcome, or progression evidence; prefer same_concept only when both documents clearly describe the same finding family rather than merely related methodology. "
             "For argumentative corpora, require either contrasting stance or a strong alternative-position signal; same-side topical overlap is not enough. "
+            "When a structured topic-family identifier or sibling document family is present, treat it as a strong same-topic signal but never as sufficient evidence on its own. "
             "Use the supplied signals to judge edge utility, and abstain when utility is low or risk flags dominate."
         )
 
@@ -1044,6 +1045,7 @@ class OpenAICompatibleProvider(StubProvider):
             "For scientific or clinical corpora, reward clinically specific bridge terms and aligned outcome or treatment language when they increase retrieval surface. "
             "For argumentative corpora, approve comparison edges only when the pair creates a reusable contrast bridge rather than repeating the same stance. "
             "Do not reject a comparison as a duplicate only because both sides share topic terms; strong stance contrast plus a reusable contrast bridge should survive duplicate checks. "
+            "Prefer same-topic family comparison bridges over broader cross-family policy analogies when both remain plausible. "
             "If the pair is related but not durable or not useful, set canonical_relation='none'. "
             "You may keep the original relation, reject it, or replace it with a safer canonical relation."
         )
@@ -1157,6 +1159,21 @@ class OpenAICompatibleProvider(StubProvider):
         )
         return "-".join(cluster_terms[:3])
 
+    def _topic_family_key(self, doc: DocRecord) -> str:
+        doc_id = doc.doc_id.lower().replace("_", "-").strip()
+        if not doc_id:
+            return ""
+        parts = [part for part in doc_id.split("-") if part]
+        if len(parts) < 4:
+            return ""
+        last = parts[-1]
+        if not any(char.isdigit() for char in last):
+            return ""
+        family = "-".join(parts[:-1]).strip("-")
+        if len(family) < 12:
+            return ""
+        return family
+
     def _profile_dataset_hints(self, doc: DocRecord, title: str, summary: str, claims: list[str]) -> tuple[list[str], list[str], dict]:
         dataset = str(doc.metadata.get("source_dataset", "")).lower()
         metadata = dict(doc.metadata)
@@ -1168,6 +1185,9 @@ class OpenAICompatibleProvider(StubProvider):
         cluster = self._topic_cluster(title, claims, doc)
         if cluster:
             metadata["topic_cluster"] = cluster
+        family = self._topic_family_key(doc)
+        if family:
+            metadata["topic_family"] = family
         if dataset == "arguana":
             metadata.setdefault("topic", "argument")
             metadata["doc_kind"] = "argument"

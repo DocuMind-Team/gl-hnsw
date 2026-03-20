@@ -55,6 +55,22 @@ def test_openai_profile_postprocess_enriches_argumentative_docs():
     assert "debate" in brief.relation_hints
 
 
+def test_openai_profile_postprocess_derives_structured_topic_family():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    doc = DocRecord(
+        doc_id="test-culture-ahrtsdlgra-con01a",
+        title="",
+        text="Artists should be allowed to provoke disgust when challenging taboos and social norms.",
+        metadata={"source_dataset": "arguana"},
+    )
+
+    brief = provider._postprocess_profile(doc, {"summary": "", "entities": [], "keywords": [], "claims": [], "relation_hints": []})
+
+    assert brief.metadata["topic_family"] == "test-culture-ahrtsdlgra"
+    assert brief.metadata["topic_cluster"]
+
+
 def test_openai_profile_postprocess_adds_scientific_risk_facets():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
