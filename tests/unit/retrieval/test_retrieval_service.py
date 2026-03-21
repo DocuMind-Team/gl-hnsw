@@ -120,6 +120,54 @@ def test_search_adds_supplemental_seed_for_structured_memory_doc(tmp_path: Path)
     assert by_id["doc-14"].source_kind == "supplemental"
 
 
+def test_deepagents_overlay_does_not_use_supplemental_sparse_seeds(tmp_path: Path):
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief(
+            "doc-11",
+            "DeepAgents Overview",
+            "DeepAgents powers subagents and shell execution.",
+            keywords=["deepagents", "subagents", "shell"],
+            relation_hints=["overview"],
+            metadata={"topic": "deepagents"},
+        ),
+        _brief(
+            "doc-14",
+            "Long Term Memory",
+            "Persistent storage routes /memories paths through a composite backend on disk.",
+            claims=["The system persists anchor memory and semantic memory through a composite backend."],
+            keywords=["memory", "persistent", "storage", "backend"],
+            relation_hints=["memory", "persistent"],
+            metadata={"topic": "deepagents", "stage": "agent_memory", "doc_kind": "memory"},
+        ),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher([Neighbor(doc_id="doc-11", score=0.62, rank=1)]),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GraphStore(tmp_path / "accepted_edges.jsonl"),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-11", title="DeepAgents Overview", text="DeepAgents powers subagents and shell execution."),
+                DocRecord(doc_id="doc-14", title="Long Term Memory", text="Persistent storage routes memories through a composite backend on disk."),
+            ]
+        ),
+    )
+
+    response = service.search_deepagents_overlay(
+        "How is memory persisted for the agent system?",
+        top_k=3,
+        use_memory_bias=False,
+    )
+    by_id = {hit.doc_id: hit for hit in response.hits}
+
+    assert "doc-14" not in by_id
+    assert by_id["doc-11"].source_kind == "geometric"
+
+
 def test_search_uses_claim_view_for_profiler_query(tmp_path: Path):
     provider = StubProvider(ProviderConfig(kind="stub"))
     retrieval_config = RetrievalConfig()

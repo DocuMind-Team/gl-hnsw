@@ -163,7 +163,7 @@ def test_evaluate_beir_dataset_persists_report(tmp_path: Path, monkeypatch):
         def search_baseline(self, _query: str, top_k: int = 10):
             return FakeResponse("d1")
 
-        def search(self, _query: str, top_k: int = 10, use_memory_bias: bool = False):
+        def search_deepagents_overlay(self, _query: str, top_k: int = 10, use_memory_bias: bool = False):
             return FakeResponse("d1")
 
     class FakeApp:
@@ -207,7 +207,9 @@ def test_evaluate_beir_dataset_persists_report(tmp_path: Path, monkeypatch):
 
     assert report.dataset == "scifact"
     assert report.provider_kind == "stub"
+    assert report.comparison_mode == "deepagents_overlay"
     assert persisted["provider_kind"] == "stub"
+    assert persisted["comparison_mode"] == "deepagents_overlay"
     assert persisted["dataset"] == "scifact"
     assert persisted["query_count"] == 1
 

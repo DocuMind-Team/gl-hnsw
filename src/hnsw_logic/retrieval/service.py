@@ -661,6 +661,98 @@ class HybridRetrievalService:
             )
         return self._hits_from_ranked(query, ranked, top_k)
 
+    def search_deepagents_overlay(self, query: str, top_k: int = 10, use_memory_bias: bool = False) -> SearchResponse:
+        """Search with pure HNSW seeds plus DeepAgents-built graph edges.
+
+        This path intentionally excludes supplemental sparse seeding so benchmark
+        comparisons measure the effect of the offline DeepAgents graph alone.
+        """
+
+        self._refresh_corpus_cache()
+        query_emb = self.scorer.encode_query(query)
+        briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
+        baseline_response = None
+        dense_rows = self._seed_rows_dense(query_emb)
+        graph_available = self.graph_store.has_edges()
+        if not graph_available:
+            baseline_response = self.search_baseline(query, top_k=top_k)
+            if not use_memory_bias:
+                return baseline_response
+            rows = self._response_to_rows(baseline_response)
+            ranked = self._apply_memory_bias(query, rows)
+            return self._hits_from_ranked(query, ranked, top_k)
+
+        seed_rows = dense_rows
+        seeds = {doc_id: (score, source_kind) for doc_id, score, source_kind in seed_rows}
+        strategy = self._default_strategy(graph_available=True)
+        expanded: list[ExpandedCandidate] = []
+        effective_max_seeds, effective_max_expansions = self._graph_budget(
+            query,
+            query_emb,
+            seed_rows,
+            briefs,
+            strategy,
+            graph_available=graph_available,
+        )
+        for doc_id, seed_score, _source_kind in seed_rows[:effective_max_seeds]:
+            source_brief = briefs.get(doc_id)
+            source_specific_overlap = self.scorer.specific_query_overlap(query, source_brief) if source_brief is not None else 0.0
+            for edge in self.graph_store.get_out_edges(doc_id)[:effective_max_expansions]:
+                brief = briefs.get(edge.dst_doc_id)
+                if brief is None:
+                    continue
+                edge_emb = self.scorer.edge_embedding(edge)
+                target_rel_score = self.scorer.score_target(query, query_emb, brief)
+                edge_query_alignment = self.scorer.edge_query_alignment(query, edge, brief)
+                activation_match = self.scorer.activation_match(query, brief, edge)
+                specific_overlap = self.scorer.specific_query_overlap(query, brief, edge)
+                if self.jump_policy.allow_jump(query_emb, edge_emb, edge, target_rel_score, activation_match=activation_match):
+                    if self.scorer.is_concept_bridge(edge):
+                        threshold = 0.12 + 0.12 * self.scorer.query_specificity(query)
+                        if edge_query_alignment < threshold:
+                            continue
+                        if self.scorer._specific_query_tokens(query) and specific_overlap < 0.24:
+                            continue
+                        if specific_overlap <= source_specific_overlap + 0.05:
+                            continue
+                    expanded.append(
+                        ExpandedCandidate(
+                            doc_id=edge.dst_doc_id,
+                            source_doc_id=doc_id,
+                            edge=edge,
+                            seed_score=seed_score,
+                            edge_match=float(query_emb.dot(edge_emb)),
+                            target_rel_score=target_rel_score,
+                            edge_query_alignment=edge_query_alignment,
+                            activation_match=activation_match,
+                        )
+                    )
+        ranked = self.scorer.rank(query, query_emb, seeds, expanded, briefs, top_k)
+        ranked = self._apply_graph_neighborhood_bonus(query, query_emb, ranked, briefs)
+        ranked = self._retain_dense_top_hits(ranked, briefs, dense_rows, top_k)
+        if (
+            all(row["source_kind"] == "geometric" and row.get("via_edge") is None for row in ranked[:top_k])
+            and not any(row["final_score"] > row["geometric_score"] + 1e-6 for row in ranked[:top_k])
+        ):
+            baseline_response = self.search_baseline(query, top_k=top_k)
+            baseline_rows = [(hit.doc_id, hit.final_score) for hit in baseline_response.hits[:top_k]]
+            ranked_rows = [(row["doc_id"], row["geometric_score"]) for row in ranked[:top_k]]
+            if (
+                len(ranked_rows) == len(baseline_rows)
+                and all(
+                    ranked_doc_id == baseline_doc_id and abs(ranked_score - baseline_score) <= 1e-6
+                    for (ranked_doc_id, ranked_score), (baseline_doc_id, baseline_score) in zip(ranked_rows, baseline_rows, strict=False)
+                )
+            ):
+                if not use_memory_bias:
+                    return baseline_response
+                rows = self._response_to_rows(baseline_response)
+                ranked = self._apply_memory_bias(query, rows)
+                return self._hits_from_ranked(query, ranked, top_k)
+        if use_memory_bias:
+            ranked = self._apply_memory_bias(query, ranked)
+        return self._hits_from_ranked(query, ranked, top_k)
+
     def search(self, query: str, top_k: int = 10, use_memory_bias: bool = True) -> SearchResponse:
         self._refresh_corpus_cache()
         query_emb = self.scorer.encode_query(query)

@@ -28,6 +28,7 @@ class BeirEvalReport(BaseModel):
     corpus_size: int
     query_count: int
     provider_kind: str
+    comparison_mode: str
     baseline: EvaluationMetrics
     supplemental: EvaluationMetrics
     improved_recall_queries: list[str]
@@ -141,7 +142,11 @@ def prepare_beir_work_root(repo_root: Path, work_root: Path, corpus: list[DocRec
     if work_root.exists():
         shutil.rmtree(work_root)
     shutil.copytree(repo_root / "configs", work_root / "configs")
-    shutil.copytree(repo_root / ".deepagents", work_root / ".deepagents")
+    shutil.copytree(
+        repo_root / ".deepagents",
+        work_root / ".deepagents",
+        ignore=shutil.ignore_patterns("runtime_views", "__pycache__", "*.pyc"),
+    )
     (work_root / "data" / "raw").mkdir(parents=True, exist_ok=True)
     (work_root / "data" / "demo").mkdir(parents=True, exist_ok=True)
     append_jsonl(work_root / "data" / "raw" / "beir.jsonl", corpus)
@@ -270,7 +275,7 @@ def evaluate_beir_dataset(
         )
 
         start = time.perf_counter()
-        supplemental = app.retrieval.search(item["text"], top_k=10, use_memory_bias=False)
+        supplemental = app.retrieval.search_deepagents_overlay(item["text"], top_k=10, use_memory_bias=False)
         supplemental_rows.append(
             {
                 "query_id": item["query_id"],
@@ -307,6 +312,7 @@ def evaluate_beir_dataset(
         corpus_size=len(beir.corpus),
         query_count=len(beir.queries),
         provider_kind=provider_kind,
+        comparison_mode="deepagents_overlay",
         baseline=baseline_metrics,
         supplemental=supplemental_metrics,
         improved_recall_queries=improved_recall_queries,
