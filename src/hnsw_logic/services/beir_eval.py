@@ -15,7 +15,7 @@ from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.config.settings import load_settings
 from hnsw_logic.core.models import DocRecord
 from hnsw_logic.core.utils import append_jsonl, read_jsonl, write_json
-from hnsw_logic.embedding.provider import StubProvider
+from hnsw_logic.embedding.provider_stub import StubProvider
 from hnsw_logic.services.bootstrap import build_app
 from hnsw_logic.services.evaluation import EvaluationMetrics
 

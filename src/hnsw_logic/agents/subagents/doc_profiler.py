@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from hnsw_logic.core.models import DocBrief, DocRecord
-from hnsw_logic.embedding.provider import ProviderBase
+from hnsw_logic.embedding.provider_base import ProviderBase
 
 
 class DocProfilerAgent:

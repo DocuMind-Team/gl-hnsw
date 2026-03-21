@@ -18,7 +18,8 @@ from hnsw_logic.agents.tools.deepagents_runtime import (
 )
 from hnsw_logic.config.schema import AgentsConfig, ProviderConfig, RetrievalConfig
 from hnsw_logic.core.utils import ensure_dir
-from hnsw_logic.embedding.provider import OpenAICompatibleProvider, ProviderBase
+from hnsw_logic.embedding.provider import OpenAICompatibleProvider
+from hnsw_logic.embedding.provider_base import ProviderBase
 
 
 class AgentFactory:

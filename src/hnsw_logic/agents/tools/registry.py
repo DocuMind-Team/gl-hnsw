@@ -49,7 +49,7 @@ def build_agent_tools(
         doc = doc_map.get(doc_id)
         if doc is None:
             return []
-        from hnsw_logic.embedding.provider import StubProvider
+        from hnsw_logic.embedding.provider_stub import StubProvider
         from hnsw_logic.config.schema import ProviderConfig
 
         provider = StubProvider(ProviderConfig(embedding_dim=hnsw_searcher.config.vector_dim))

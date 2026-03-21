@@ -6,7 +6,7 @@ import numpy as np
 
 from hnsw_logic.core.models import DocRecord
 from hnsw_logic.core.utils import read_json, write_json
-from hnsw_logic.embedding.provider import ProviderBase
+from hnsw_logic.embedding.provider_base import ProviderBase
 
 
 class EmbeddingEncoder:

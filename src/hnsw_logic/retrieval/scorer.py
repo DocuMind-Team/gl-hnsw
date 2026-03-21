@@ -8,7 +8,7 @@ from hnsw_logic.config.schema import RetrievalConfig
 from hnsw_logic.core.facets import build_search_views
 from hnsw_logic.core.models import DocBrief, LogicEdge
 from hnsw_logic.core.utils import cosine, tokenize
-from hnsw_logic.embedding.provider import ProviderBase
+from hnsw_logic.embedding.provider_base import ProviderBase
 
 
 @dataclass(slots=True)
