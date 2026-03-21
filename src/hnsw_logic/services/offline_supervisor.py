@@ -13,7 +13,7 @@ from hnsw_logic.agents.tools.deepagents_runtime import (
 )
 from hnsw_logic.core.models import DocBrief
 from hnsw_logic.core.utils import read_json
-from hnsw_logic.embedding.provider import JudgeResult
+from hnsw_logic.embedding.provider_types import JudgeResult
 
 
 class OfflineIndexingSupervisor:

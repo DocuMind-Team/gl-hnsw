@@ -10,7 +10,7 @@ from hnsw_logic.config.schema import RelationQualityConfig, RetrievalConfig
 from hnsw_logic.core.constants import DEFAULT_TIMESTAMP, RELATION_TYPES
 from hnsw_logic.core.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.core.utils import cosine, tokenize
-from hnsw_logic.embedding.provider import CandidateProposal, JudgeSignals
+from hnsw_logic.embedding.provider_types import CandidateProposal, JudgeSignals
 
 
 ROLE_WORDS = {"role", "roles", "subagent", "subagents", "profiler", "scout", "judge", "curator"}

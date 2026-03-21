@@ -552,7 +552,7 @@ def build_deepagent_toolsets(
         anchor = brief_map()[anchor_doc_id]
         bundle_payload = read_candidate_bundle(anchor_doc_id) or {}
         items = bundle_payload.get("candidates", [])
-        from hnsw_logic.embedding.provider import JudgeSignals
+        from hnsw_logic.embedding.provider_types import JudgeSignals
 
         allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
 
@@ -591,7 +591,7 @@ def build_deepagent_toolsets(
         anchor = brief_map()[anchor_doc_id]
         candidate_payload = read_candidate_bundle(anchor_doc_id) or {}
         judgment_payload = read_judgment_bundle(anchor_doc_id) or {}
-        from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
+        from hnsw_logic.embedding.provider_types import JudgeResult, JudgeSignals
         allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
 
         prepared: list[tuple[Any, JudgeSignals, JudgeResult]] = []
@@ -662,7 +662,7 @@ def build_deepagent_toolsets(
             candidate = brief_map().get(item["candidate_doc_id"])
             if candidate is None:
                 continue
-            from hnsw_logic.embedding.provider import JudgeResult, JudgeSignals
+            from hnsw_logic.embedding.provider_types import JudgeResult, JudgeSignals
             allowed_signal_keys = set(JudgeSignals.__dataclass_fields__.keys())
             signal_payload = {key: value for key, value in item.get("signals", {}).items() if key in allowed_signal_keys}
             signals = JudgeSignals(**signal_payload)
