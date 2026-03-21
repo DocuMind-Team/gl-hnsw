@@ -43,6 +43,17 @@ class FakeCorpusStore:
         return list(self._docs)
 
 
+class GuardedGraphStore:
+    def has_edges(self) -> bool:
+        return False
+
+    def all_edges(self):
+        raise AssertionError("search path should not materialize all edges when graph is empty")
+
+    def get_out_edges(self, _doc_id: str):
+        return []
+
+
 def _brief(
     doc_id: str,
     title: str,
@@ -636,6 +647,38 @@ def test_search_refreshes_corpus_cache_after_initial_missing_processed_docs(tmp_
     service.search("Which protein evidence supports the study claim?", top_k=2, use_memory_bias=False)
 
     assert service._dataset_hint == "scifact"
+
+
+def test_search_uses_graph_has_edges_without_materializing_empty_graph():
+    provider = StubProvider(ProviderConfig(kind="stub"))
+    retrieval_config = RetrievalConfig()
+    briefs = [
+        _brief("doc-a", "Dense Winner", "Dense winner summary.", metadata={"topic": "general"}),
+        _brief("doc-b", "Sparse Match", "Sparse match summary.", metadata={"topic": "general"}),
+    ]
+    service = HybridRetrievalService(
+        searcher=FakeSearcher(
+            [
+                Neighbor(doc_id="doc-a", score=0.66, rank=1),
+                Neighbor(doc_id="doc-b", score=0.61, rank=2),
+            ]
+        ),
+        brief_store=FakeBriefStore(briefs),
+        graph_store=GuardedGraphStore(),
+        scorer=RetrievalScorer(provider, retrieval_config),
+        jump_policy=JumpPolicy(retrieval_config),
+        semantic_memory_store=None,
+        corpus_store=FakeCorpusStore(
+            [
+                DocRecord(doc_id="doc-a", title="Dense Winner", text="Dense winner summary."),
+                DocRecord(doc_id="doc-b", title="Sparse Match", text="Protein evidence supports the study claim."),
+            ]
+        ),
+    )
+
+    response = service.search("Which protein evidence supports the study claim?", top_k=2, use_memory_bias=False)
+
+    assert [hit.doc_id for hit in response.hits]
 
 
 def test_search_uses_graph_budget_for_late_high_utility_seed(tmp_path: Path):

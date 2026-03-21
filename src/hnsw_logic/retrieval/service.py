@@ -475,7 +475,16 @@ class HybridRetrievalService:
             row["rank"] = rank
         return ranked
 
-    def _graph_budget(self, query: str, query_emb, seed_rows: list[tuple[str, float, str]], briefs: dict[str, object], strategy) -> tuple[int, int]:
+    def _graph_budget(
+        self,
+        query: str,
+        query_emb,
+        seed_rows: list[tuple[str, float, str]],
+        briefs: dict[str, object],
+        strategy,
+        *,
+        graph_available: bool,
+    ) -> tuple[int, int]:
         graph_gate = max(0.0, getattr(strategy, "graph_gate", 0.0))
         query_specificity = self.scorer.query_specificity(query)
         base_max_seeds = max(1, math.ceil(self.jump_policy.max_seeds * graph_gate))
@@ -484,7 +493,7 @@ class HybridRetrievalService:
             not self.adaptive_graph_budget_enabled
             or graph_gate <= 0.0
             or not seed_rows
-            or not self.graph_store.all_edges()
+            or not graph_available
         ):
             return base_max_seeds, base_max_expansions
 
@@ -548,13 +557,23 @@ class HybridRetrievalService:
         effective_max_seeds = min(self.adaptive_graph_seed_cap, highest_promising_index + 1)
         return effective_max_seeds, recommended_expansions
 
-    def _seed_rows(self, query: str, query_emb, briefs: dict[str, object], dense_rows=None) -> list[tuple[str, float, str]]:
+    def _seed_rows(
+        self,
+        query: str,
+        query_emb,
+        briefs: dict[str, object],
+        dense_rows=None,
+        *,
+        graph_available: bool | None = None,
+    ) -> tuple[list[tuple[str, float, str]], SimpleNamespace]:
         dense_rows = dense_rows or self._seed_rows_dense(query_emb)
         if self._sparse_doc_count != len(briefs):
             self._sparse.build(list(briefs.values()), self._records_by_id)
             self._sparse_doc_count = len(briefs)
         sparse_hits = self._sparse.search(query, top_k=self.sparse_top_k)
-        strategy = self._default_strategy(graph_available=bool(self.graph_store.all_edges()))
+        if graph_available is None:
+            graph_available = self.graph_store.has_edges()
+        strategy = self._default_strategy(graph_available=graph_available)
         merged: dict[str, tuple[float, str]] = {
             doc_id: (score, source_kind) for doc_id, score, source_kind in dense_rows
         }
@@ -624,7 +643,14 @@ class HybridRetrievalService:
         briefs = {brief.doc_id: brief for brief in self.brief_store.all()}
         baseline_response = None
         dense_rows = self._seed_rows_dense(query_emb)
-        seed_rows, strategy = self._seed_rows(query, query_emb, briefs, dense_rows=dense_rows)
+        graph_available = self.graph_store.has_edges()
+        seed_rows, strategy = self._seed_rows(
+            query,
+            query_emb,
+            briefs,
+            dense_rows=dense_rows,
+            graph_available=graph_available,
+        )
         if getattr(strategy, "sparse_gate", 1.0) <= 0.0 and not getattr(strategy, "allow_sparse_only", True) and getattr(strategy, "graph_gate", 0.0) <= 0.0:
             baseline = self.search_baseline(query, top_k=top_k)
             if not use_memory_bias:
@@ -635,7 +661,14 @@ class HybridRetrievalService:
         seeds = {doc_id: (score, source_kind) for doc_id, score, source_kind in seed_rows}
         expanded: list[ExpandedCandidate] = []
 
-        effective_max_seeds, effective_max_expansions = self._graph_budget(query, query_emb, seed_rows, briefs, strategy)
+        effective_max_seeds, effective_max_expansions = self._graph_budget(
+            query,
+            query_emb,
+            seed_rows,
+            briefs,
+            strategy,
+            graph_available=graph_available,
+        )
         for doc_id, seed_score, source_kind in seed_rows[:effective_max_seeds]:
             source_brief = briefs.get(doc_id)
             source_specific_overlap = self.scorer.specific_query_overlap(query, source_brief) if source_brief is not None else 0.0

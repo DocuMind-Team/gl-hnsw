@@ -67,6 +67,12 @@ class GraphStore:
             key=lambda edge: (-(0.65 * edge.confidence + 0.35 * getattr(edge, "utility_score", 0.0)), -getattr(edge, "utility_score", 0.0), edge.dst_doc_id),
         )
 
+    def has_edges(self) -> bool:
+        return any(self._edges_by_src.values())
+
+    def edge_count(self) -> int:
+        return sum(len(values) for values in self._edges_by_src.values())
+
     def all_edges(self) -> list[LogicEdge]:
         edges: list[LogicEdge] = []
         for values in self._edges_by_src.values():

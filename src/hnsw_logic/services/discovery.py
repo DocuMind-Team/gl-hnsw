@@ -109,7 +109,7 @@ class LogicDiscoveryService:
         self.anchor_memory_store.write(anchor_memory)
         self.semantic_memory_store.write(semantic_memory)
         stats = self.graph_memory_store.read()
-        stats["accepted_edges"] = len(self.graph_store.all_edges())
+        stats["accepted_edges"] = self.graph_store.edge_count()
         self.graph_memory_store.write(stats)
         return accepted
 

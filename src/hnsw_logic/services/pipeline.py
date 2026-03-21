@@ -77,10 +77,11 @@ class BuildPipeline:
             for doc in docs:
                 accepted.extend(self.discovery_service.discover_for_anchor(doc.doc_id, briefs))
         self.graph_store.reload()
+        edge_count = self.graph_store.edge_count()
         stats = self.graph_memory_store.read()
-        stats["accepted_edges"] = len(self.graph_store.all_edges())
+        stats["accepted_edges"] = edge_count
         self.graph_memory_store.write(stats)
-        return {"edges": len(self.graph_store.all_edges()), "new_edges": len(accepted)}
+        return {"edges": edge_count, "new_edges": len(accepted)}
 
     def revalidate_edges(self):
         current_edges = self.graph_store.all_edges()

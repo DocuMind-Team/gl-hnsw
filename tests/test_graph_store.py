@@ -60,6 +60,35 @@ def test_graph_store_deduplicates_edges_by_relation_key(test_root):
     assert edges[0].edge_card_text == "high"
 
 
+def test_graph_store_exposes_has_edges_and_edge_count(test_root):
+    from hnsw_logic.graph.store import GraphStore
+
+    store = GraphStore(test_root / "data" / "graph" / "accepted_edges.jsonl")
+
+    assert store.has_edges() is False
+    assert store.edge_count() == 0
+
+    store.add_edges(
+        [
+            LogicEdge(
+                src_doc_id="a",
+                dst_doc_id="b",
+                relation_type="comparison",
+                confidence=0.9,
+                evidence_spans=["x"],
+                discovery_path=["unit"],
+                edge_card_text="edge",
+                created_at="2026-03-10T00:00:00Z",
+                last_validated_at="2026-03-10T00:00:00Z",
+            )
+        ]
+    )
+    store.reload()
+
+    assert store.has_edges() is True
+    assert store.edge_count() == 1
+
+
 def test_discovery_service_adds_mirror_edges_for_symmetric_relations(test_root):
     from hnsw_logic.graph.store import GraphStore
     from hnsw_logic.services.discovery import LogicDiscoveryService

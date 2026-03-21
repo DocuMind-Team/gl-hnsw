@@ -562,6 +562,24 @@ def test_judge_relations_malformed_batch_retries_single_remote_calls():
     assert "judge_relation" in calls
 
 
+def test_judge_relations_with_signals_returns_empty_for_empty_candidate_list():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+
+    anchor = DocBrief(
+        doc_id="anchor",
+        title="Hybrid Retrieval",
+        summary="Hybrid retrieval combines dense and sparse scores.",
+        entities=["retrieval"],
+        keywords=["hybrid", "retrieval"],
+        claims=["Hybrid retrieval combines dense and sparse scores."],
+        relation_hints=["fusion"],
+        metadata={},
+    )
+
+    assert provider.judge_relations_with_signals(anchor, []) == {}
+
+
 def test_invoke_json_retries_after_empty_remote_response():
     provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
     ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))

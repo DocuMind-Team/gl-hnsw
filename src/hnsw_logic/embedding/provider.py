@@ -1565,10 +1565,7 @@ class OpenAICompatibleProvider(StubProvider):
             for doc in batch:
                 if doc.doc_id in results:
                     continue
-                if self.require_remote:
-                    remember(self.profile_doc(doc))
-                else:
-                    remember(self.profile_doc(doc))
+                remember(self.profile_doc(doc))
         return [results[doc.doc_id] for doc in docs]
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
@@ -1732,8 +1729,6 @@ class OpenAICompatibleProvider(StubProvider):
         return self.judge_relations_with_signals(anchor, default_signals)
 
     def judge_relations_with_signals(self, anchor: DocBrief, candidates: list[tuple[DocBrief, JudgeSignals]]) -> dict[str, JudgeResult]:
-        if not candidates:
-            return {}
         if not candidates:
             return {}
         verdicts: dict[str, JudgeResult] = {}
