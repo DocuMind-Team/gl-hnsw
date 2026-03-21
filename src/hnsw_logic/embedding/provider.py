@@ -1333,6 +1333,7 @@ class OpenAICompatibleProvider(StubProvider):
             return {}
         results: dict[str, dict] = {}
         for batch in self._chunk(candidates, 8):
+            batch_by_id = {candidate.doc_id: (candidate, signals, verdict) for candidate, signals, verdict in batch}
             try:
                 payload = self._invoke_json(
                     self._counterevidence_instruction(),
@@ -1370,10 +1371,7 @@ class OpenAICompatibleProvider(StubProvider):
                     candidate_doc_id = str(item.get("candidate_doc_id", ""))
                     if not candidate_doc_id:
                         continue
-                    candidate_entry = next(
-                        ((candidate, signals, verdict) for candidate, signals, verdict in batch if candidate.doc_id == candidate_doc_id),
-                        None,
-                    )
+                    candidate_entry = batch_by_id.get(candidate_doc_id)
                     result = {
                         "keep": bool(item.get("keep", True)),
                         "risk_flags": [str(flag) for flag in item.get("risk_flags", [])][:8],
@@ -1512,6 +1510,7 @@ class OpenAICompatibleProvider(StubProvider):
                 on_brief(brief)
 
         for batch in self._chunk(docs, 4):
+            batch_by_id = {doc.doc_id: doc for doc in batch}
             try:
                 payload = self._invoke_json(
                     (
@@ -1544,7 +1543,7 @@ class OpenAICompatibleProvider(StubProvider):
                 items = payload if isinstance(payload, list) else payload.get("documents", [])
                 for item in items:
                     doc_id = str(item.get("doc_id", ""))
-                    source = next((doc for doc in batch if doc.doc_id == doc_id), None)
+                    source = batch_by_id.get(doc_id)
                     if source is None:
                         continue
                     remember(self._postprocess_profile(source, item))

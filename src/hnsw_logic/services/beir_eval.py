@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.config.settings import load_settings
 from hnsw_logic.core.models import DocRecord
-from hnsw_logic.core.utils import append_jsonl, read_jsonl
+from hnsw_logic.core.utils import append_jsonl, read_jsonl, write_json
 from hnsw_logic.embedding.provider import StubProvider
 from hnsw_logic.services.bootstrap import build_app
 from hnsw_logic.services.evaluation import EvaluationMetrics
@@ -287,7 +287,7 @@ def evaluate_beir_dataset(
         if supplemental_query_metrics[query_id][1] < base_rr
     )
 
-    return BeirEvalReport(
+    report = BeirEvalReport(
         dataset=dataset,
         split=split,
         corpus_size=len(beir.corpus),
@@ -300,3 +300,5 @@ def evaluate_beir_dataset(
         degraded_rr_queries=degraded_rr_queries,
         work_root=str(work_root),
     )
+    write_json(work_root / "data" / "results" / "benchmark_report.json", report.model_dump(mode="json"))
+    return report
