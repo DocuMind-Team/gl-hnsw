@@ -109,6 +109,43 @@ class SkillSignalRuntime:
             },
         )
 
+    def score_relation_fit(
+        self,
+        anchor: Any,
+        candidate: Any,
+        metrics: dict[str, Any],
+        signal_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._execute(
+            "relation-judging",
+            "score_relation_fit",
+            {
+                "anchor": self._jsonable(anchor),
+                "candidate": self._jsonable(candidate),
+                "metrics": metrics,
+                "signal_report": signal_report,
+            },
+        )
+
+    def score_candidate_utility(
+        self,
+        *,
+        relation_type: str,
+        metrics: dict[str, Any],
+        fit_scores: dict[str, Any],
+        signal_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._execute(
+            "edge-utility-review",
+            "score_candidate_utility",
+            {
+                "relation_type": relation_type,
+                "metrics": metrics,
+                "fit_scores": fit_scores,
+                "signal_report": signal_report,
+            },
+        )
+
     def compute_anchor_priority(
         self,
         brief: Any,

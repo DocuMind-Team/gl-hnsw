@@ -65,6 +65,7 @@ subagents:
       - read_candidate_bundle
       - compute_topic_consistency
       - compute_contrast_evidence
+      - compute_relation_fit
     description: Judge candidate relations using dossiers, evidence bundles, and local signals.
     system_prompt: You judge durable retrieval edges with precision-first reasoning grounded in local signals.
   counterevidence_checker:
@@ -97,6 +98,7 @@ subagents:
       - evaluate_anchor_utility
       - compute_bridge_gain
       - compute_query_activation_profile
+      - compute_candidate_utility
     description: Review candidate edges for utility, risk, and graph hygiene.
     system_prompt: You keep only durable high-utility edges that are likely to improve retrieval quality.
   memory_curator:

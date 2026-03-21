@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -367,6 +366,39 @@ def build_deepagent_toolsets(
             return {}
         return signal_runtime.compute_query_activation_profile(anchor, candidate, relation_type, verdict=verdict)
 
+    def compute_relation_fit(
+        anchor_doc_id: str,
+        candidate_doc_id: str,
+        metrics: dict | None = None,
+        signal_report: dict | None = None,
+    ) -> dict:
+        """Score canonical relation fits for an anchor/candidate pair via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.score_relation_fit(anchor, candidate, metrics or {}, signal_report or {})
+
+    def compute_candidate_utility(
+        anchor_doc_id: str,
+        candidate_doc_id: str,
+        relation_type: str,
+        metrics: dict | None = None,
+        fit_scores: dict | None = None,
+        signal_report: dict | None = None,
+    ) -> dict:
+        """Score reviewed candidate utility for retrieval via skill scripts."""
+        anchor = brief_map().get(anchor_doc_id)
+        candidate = brief_map().get(candidate_doc_id)
+        if anchor is None or candidate is None:
+            return {}
+        return signal_runtime.score_candidate_utility(
+            relation_type=relation_type,
+            metrics=metrics or {},
+            fit_scores=fit_scores or {},
+            signal_report=signal_report or {},
+        )
+
     def execute_index_planning(output_path: str = "indexing/plans/indexing_plan.json") -> dict:
         """Generate the offline indexing plan and persist it to the workspace."""
         destination = resolve_workspace_output_path(
@@ -569,11 +601,7 @@ def build_deepagent_toolsets(
                 continue
             signal_payload = {key: value for key, value in item.get("signals", {}).items() if key in allowed_signal_keys}
             signals_obj = JudgeSignals(**signal_payload)
-            verdict_obj = (
-                orchestrator.relation_judge.provider._verdict_from_payload(item.get("verdict", {}))
-                if hasattr(orchestrator.relation_judge.provider, "_verdict_from_payload")
-                else JudgeResult(**item.get("verdict", {}))
-            )
+            verdict_obj = JudgeResult(**item.get("verdict", {}))
             prepared.append((candidate, signals_obj, verdict_obj))
         provider_payloads = provider.check_counterevidence_many(anchor, prepared)
         checks: list[CounterevidenceBundleItem] = []
@@ -661,12 +689,21 @@ def build_deepagent_toolsets(
                 or "contrast" in flag
                 or flag.startswith("alternative_position")
             }
-            reviewer_provider = getattr(orchestrator.edge_reviewer, "provider", None)
+            contrast_report = signal_runtime.compute_contrast_evidence(
+                anchor,
+                candidate,
+                local_signals=signal_payload,
+                verdict=to_jsonable(reviewed_verdict),
+            )
             contrastive_comparison_bridge = bool(
                 getattr(reviewed_verdict, "relation_type", "") == "comparison"
-                and reviewer_provider is not None
-                and hasattr(reviewer_provider, "_is_contrastive_comparison_bridge")
-                and reviewer_provider._is_contrastive_comparison_bridge(signals, reviewed_verdict)
+                and float(contrast_report.get("contrast_evidence", 0.0) or 0.0) >= 0.56
+                and max(
+                    float(signal_payload.get("topic_family_match", 0.0) or 0.0),
+                    float(signal_payload.get("topic_cluster_match", 0.0) or 0.0),
+                    float(contrast_report.get("topic_consistency", 0.0) or 0.0),
+                )
+                >= 0.32
             )
             hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility", "weak_direction"}
             effective_risk_flags = set(normalized_risk_flags)
@@ -774,6 +811,8 @@ def build_deepagent_toolsets(
         "compute_bridge_gain": compute_bridge_gain,
         "compute_contrast_evidence": compute_contrast_evidence,
         "compute_query_activation_profile": compute_query_activation_profile,
+        "compute_relation_fit": compute_relation_fit,
+        "compute_candidate_utility": compute_candidate_utility,
     }
 
     project_tools = {
