@@ -559,7 +559,7 @@ def test_invoke_json_retries_transient_connection_errors(monkeypatch):
             return SimpleNamespace(content='{"ok": true}')
 
     provider._chat = FakeChat()
-    monkeypatch.setattr("hnsw_logic.embedding.provider.time.sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("hnsw_logic.embedding.provider_client.time.sleep", lambda *_args, **_kwargs: None)
 
     payload = provider._invoke_json("system", "user", stage="generic")
 
