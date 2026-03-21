@@ -4,6 +4,23 @@ from hnsw_logic.core.models import AnchorMemory, DocBrief, GlobalSemanticMemory,
 
 
 class MemoryCuratorService:
+    @staticmethod
+    def _normalized_items(values, *, limit: int) -> list[str]:
+        items: list[str] = []
+        seen: set[str] = set()
+        for value in values or []:
+            text = str(value).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(text)
+            if len(items) >= limit:
+                break
+        return items
+
     def merge(
         self,
         anchor_brief: DocBrief,
@@ -19,9 +36,12 @@ class MemoryCuratorService:
         anchor_memory.explored_docs = sorted(set(anchor_memory.explored_docs + [edge.dst_doc_id for edge in accepted_edges] + rejected_docs))
         anchor_memory.rejected_docs = sorted(set(anchor_memory.rejected_docs + rejected_docs))
         anchor_memory.accepted_edge_ids = sorted(set(anchor_memory.accepted_edge_ids + [f"{edge.src_doc_id}->{edge.dst_doc_id}" for edge in accepted_edges]))
-        anchor_memory.active_hypotheses = provider_payload.get("active_hypotheses", anchor_brief.relation_hints[:3])
-        anchor_memory.successful_queries = provider_payload.get("successful_queries", [])
-        anchor_memory.failed_queries = provider_payload.get("failed_queries", [])
+        anchor_memory.active_hypotheses = self._normalized_items(
+            provider_payload.get("active_hypotheses", anchor_brief.relation_hints[:3]),
+            limit=6,
+        )
+        anchor_memory.successful_queries = self._normalized_items(provider_payload.get("successful_queries", []), limit=8)
+        anchor_memory.failed_queries = self._normalized_items(provider_payload.get("failed_queries", []), limit=8)
         anchor_memory.rejection_reasons.update(rejection_reasons or {})
         for doc_id, score in (top_candidate_scores or {}).items():
             anchor_memory.top_candidate_scores[doc_id] = max(anchor_memory.top_candidate_scores.get(doc_id, 0.0), score)
@@ -30,11 +50,17 @@ class MemoryCuratorService:
 
         aliases = provider_payload.get("aliases", {})
         for entity, items in aliases.items():
-            semantic_memory.aliases[entity] = sorted(set(semantic_memory.aliases.get(entity, []) + items))
+            semantic_memory.aliases[entity] = self._normalized_items(
+                [*semantic_memory.aliases.get(entity, []), *items],
+                limit=8,
+            )
             semantic_memory.canonical_entities.setdefault(entity, entity)
 
         for relation_type, patterns in provider_payload.get("relation_patterns", {}).items():
-            semantic_memory.relation_patterns[relation_type] = sorted(set(semantic_memory.relation_patterns.get(relation_type, []) + patterns))
+            semantic_memory.relation_patterns[relation_type] = self._normalized_items(
+                [*semantic_memory.relation_patterns.get(relation_type, []), *patterns],
+                limit=12,
+            )
 
         if rejected_docs:
             semantic_memory.rejection_patterns.setdefault(anchor_brief.doc_id, [])

@@ -1405,7 +1405,9 @@ class OpenAICompatibleProvider(StubProvider):
                 self._handle_remote_failure("check_counterevidence_batch", exc)
                 results.update(super().check_counterevidence_many(anchor, batch))
             for candidate, signals, verdict in batch:
-                results.setdefault(candidate.doc_id, super().check_counterevidence(anchor, candidate, signals, verdict))
+                if candidate.doc_id in results:
+                    continue
+                results[candidate.doc_id] = super().check_counterevidence(anchor, candidate, signals, verdict)
         return results
 
     def summarize_memory_learnings(self, payload: dict) -> dict:

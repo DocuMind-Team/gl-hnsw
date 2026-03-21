@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -12,7 +13,15 @@ from hnsw_logic.services.bootstrap import build_app
 def create_app(root_dir=None) -> FastAPI:
     container = build_app(root_dir=root_dir)
     executor = ThreadPoolExecutor(max_workers=2)
-    app = FastAPI(title="gl-hnsw")
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:  # pragma: no branch
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    app = FastAPI(title="gl-hnsw", lifespan=lifespan)
 
     def submit_job(job_type: str, fn):
         job = container.jobs.create(job_type, "{}")
