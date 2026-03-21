@@ -15,8 +15,14 @@ class HnswIndexBuilder:
         self.meta_path = meta_path
 
     def build(self, doc_ids: list[str], vectors: np.ndarray) -> None:
+        if not doc_ids:
+            raise ValueError("Cannot build HNSW index for an empty corpus")
         if vectors.ndim != 2:
             raise ValueError("Embeddings must be a 2D array")
+        if len(doc_ids) != vectors.shape[0]:
+            raise ValueError(
+                f"Embedding row count {vectors.shape[0]} does not match doc id count {len(doc_ids)}"
+            )
         if vectors.shape[1] != self.config.vector_dim:
             raise ValueError(f"Embedding dim {vectors.shape[1]} does not match config dim {self.config.vector_dim}")
         ensure_dir(self.index_path.parent)

@@ -17,7 +17,7 @@ class DocumentPreprocessor:
                     doc_id=doc.doc_id,
                     title=doc.title.strip(),
                     text=SPACE_RE.sub(" ", doc.text).strip(),
-                    metadata=doc.metadata,
+                    metadata=dict(doc.metadata),
                 )
             )
         return normalized

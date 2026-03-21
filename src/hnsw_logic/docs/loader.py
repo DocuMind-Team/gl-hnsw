@@ -28,12 +28,22 @@ class DocumentLoader:
 
     def _load_jsonl(self, path: Path) -> list[DocRecord]:
         rows = read_jsonl(path)
-        return [
-            DocRecord(
-                doc_id=row["doc_id"],
-                title=row["title"],
-                text=row["text"],
-                metadata=row.get("metadata", {}),
+        docs: list[DocRecord] = []
+        for line_no, row in enumerate(rows, start=1):
+            doc_id = str(row.get("doc_id", "")).strip()
+            text = str(row.get("text", "")).strip()
+            if not doc_id:
+                raise ValueError(f"Missing `doc_id` in {path}:{line_no}")
+            if not text:
+                raise ValueError(f"Missing `text` in {path}:{line_no} for doc `{doc_id}`")
+            title = str(row.get("title", "")).strip() or doc_id.replace("-", " ").title()
+            metadata = row.get("metadata", {})
+            docs.append(
+                DocRecord(
+                    doc_id=doc_id,
+                    title=title,
+                    text=text,
+                    metadata=dict(metadata) if isinstance(metadata, dict) else {"raw_metadata": metadata},
+                )
             )
-            for row in rows
-        ]
+        return docs
