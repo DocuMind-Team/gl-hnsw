@@ -670,14 +670,13 @@ tools registry 定义在 [registry.py](/Users/armstrong/gl-hnsw/src/hnsw_logic/a
 - `get_hnsw_neighbors`
 - `read_doc_brief`
 - `read_doc_full`
-- `commit_logic_edge`
 - `load_anchor_memory`
-- `update_global_memory`
 
 这些工具的定位是：
 
 - 面向 deepagent runtime 的环境接口
-- 而不是替代 orchestrator 的主流程
+- 以只读检索与上下文装配为主
+- 不直接暴露图写入或全局记忆写接口
 
 ### 11.3 Skill 能力
 

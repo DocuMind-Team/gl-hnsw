@@ -24,7 +24,7 @@ def create_app(root_dir=None) -> FastAPI:
     app = FastAPI(title="gl-hnsw", lifespan=lifespan)
 
     def submit_job(job_type: str, fn):
-        job = container.jobs.create(job_type, "{}")
+        job = container.jobs.create(job_type, {})
 
         def _runner():
             container.jobs.update(job.job_id, "running", "started")

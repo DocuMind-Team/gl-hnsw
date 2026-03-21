@@ -3,6 +3,9 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from pathlib import Path
+from typing import Any
+
+import orjson
 
 from hnsw_logic.core.models import JobStatus
 from hnsw_logic.core.utils import ensure_dir, utc_now
@@ -33,13 +36,30 @@ class JobRegistry:
                 """
             )
 
-    def create(self, job_type: str, payload: str) -> JobStatus:
+    @staticmethod
+    def _serialize_payload(payload: str | dict[str, Any]) -> str:
+        if isinstance(payload, str):
+            return payload
+        return orjson.dumps(payload).decode("utf-8")
+
+    @staticmethod
+    def _deserialize_payload(payload: str) -> dict[str, Any]:
+        try:
+            parsed = orjson.loads(payload)
+        except orjson.JSONDecodeError:
+            return {"raw": payload}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+
+    def create(self, job_type: str, payload: str | dict[str, Any]) -> JobStatus:
         now = utc_now()
+        payload_text = self._serialize_payload(payload)
         job = JobStatus(
             job_id=str(uuid.uuid4()),
             job_type=job_type,
             state="queued",
-            payload={"raw": payload},
+            payload=self._deserialize_payload(payload_text),
             message="queued",
             created_at=now,
             updated_at=now,
@@ -47,7 +67,7 @@ class JobRegistry:
         with self._connect() as conn:
             conn.execute(
                 "insert into jobs values (?, ?, ?, ?, ?, ?, ?)",
-                (job.job_id, job.job_type, job.state, payload, job.message, job.created_at, job.updated_at),
+                (job.job_id, job.job_type, job.state, payload_text, job.message, job.created_at, job.updated_at),
             )
         return job
 
@@ -71,7 +91,7 @@ class JobRegistry:
             job_id=row[0],
             job_type=row[1],
             state=row[2],
-            payload={"raw": row[3]},
+            payload=self._deserialize_payload(row[3]),
             message=row[4],
             created_at=row[5],
             updated_at=row[6],
@@ -88,7 +108,7 @@ class JobRegistry:
                 job_id=row[0],
                 job_type=row[1],
                 state=row[2],
-                payload={"raw": row[3]},
+                payload=self._deserialize_payload(row[3]),
                 message=row[4],
                 created_at=row[5],
                 updated_at=row[6],
