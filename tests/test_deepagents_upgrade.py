@@ -193,6 +193,33 @@ def test_controlled_self_update_only_touches_allowlisted_targets(tmp_path: Path)
     assert blocked_path.read_text(encoding="utf-8") == "print('blocked')\n"
 
 
+def test_controlled_self_update_preserves_reference_content_and_appends_updates(tmp_path: Path):
+    repo_root = tmp_path / "repo"
+    ref_path = repo_root / ".deepagents" / "skills" / "graph-hygiene" / "references" / "hygiene-rules.md"
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    ref_path.write_text("# Hygiene Rules\n\nKeep graph edges precise.\n", encoding="utf-8")
+    manager = ControlledSelfUpdateManager(
+        repo_root,
+        [".deepagents/skills/*/references/*.md"],
+    )
+
+    manager.update_references(
+        {
+            ".deepagents/skills/graph-hygiene/references/hygiene-rules.md": [
+                "avoid duplicate bridge edges",
+                "preserve reviewed contrast bridges",
+            ]
+        }
+    )
+
+    content = ref_path.read_text(encoding="utf-8")
+    assert "# Hygiene Rules" in content
+    assert "Keep graph edges precise." in content
+    assert "## Learned Updates" in content
+    assert "- avoid duplicate bridge edges" in content
+    assert "- preserve reviewed contrast bridges" in content
+
+
 def test_runtime_tool_scopes_exclude_edge_commit(app_container):
     scoped = app_container.agent_factory.runtime_toolsets
     assert scoped["index_planner"]
@@ -579,3 +606,78 @@ def test_offline_supervisor_applies_reviewed_activation_profile(app_container, m
     assert assessments[0].edge is not None
     assert assessments[0].edge.utility_score == 0.74
     assert assessments[0].edge.activation_profile["activation_prior"] == 0.78
+
+
+def test_offline_supervisor_rejects_missing_review_artifact(app_container, monkeypatch):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+    accepted = CandidateAssessment(
+        candidate_doc_id=candidate.doc_id,
+        accepted=True,
+        reject_reason="",
+        score=0.88,
+        local_support=0.6,
+        evidence_quality=0.82,
+        relation_type="comparison",
+        confidence=0.84,
+        edge=LogicEdge(
+            src_doc_id=anchor.doc_id,
+            dst_doc_id=candidate.doc_id,
+            relation_type="same_concept",
+            confidence=0.84,
+            evidence_spans=[anchor.summary, candidate.summary],
+            discovery_path=["judge", "review", "gate"],
+            edge_card_text=f"{anchor.title} <> {candidate.title}",
+            created_at="2026-03-16T00:00:00Z",
+            last_validated_at="2026-03-16T00:00:00Z",
+            utility_score=0.93,
+        ),
+    )
+
+    monkeypatch.setattr(
+        type(app_container.offline_supervisor.orchestrator),
+        "_assessment_for",
+        lambda self, *_args, **_kwargs: accepted,
+    )
+
+    verdicts = {
+        candidate.doc_id: JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.84,
+            evidence_spans=[],
+            rationale="durable concept bridge",
+            support_score=0.0,
+            contradiction_flags=[],
+            decision_reason="review accepted",
+            utility_score=0.93,
+            uncertainty=0.22,
+            canonical_relation="same_concept",
+            semantic_relation_label="same_concept",
+        )
+    }
+    bundle_lookup = {
+        "reviews": {},
+        "checks": {
+            candidate.doc_id: {
+                "keep": True,
+                "risk_penalty": 0.0,
+                "risk_flags": [],
+            }
+        },
+    }
+
+    assessments = app_container.offline_supervisor._apply_review_consensus(
+        anchor,
+        [candidate],
+        verdicts,
+        {},
+        bundle_lookup,
+    )
+
+    assert assessments
+    assert assessments[0].accepted is False
+    assert assessments[0].reject_reason == "missing_review_artifact"

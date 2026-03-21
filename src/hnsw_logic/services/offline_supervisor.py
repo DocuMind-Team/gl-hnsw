@@ -246,21 +246,33 @@ class OfflineIndexingSupervisor:
         reviews: dict[str, JudgeResult],
         bundle_lookup: dict[str, dict],
     ) -> list[CandidateAssessment]:
-        assessments = [
-            self.orchestrator._assessment_for(anchor, candidate, verdicts.get(candidate.doc_id), reviews.get(candidate.doc_id))
-            for candidate in candidates
-            if candidate.doc_id in verdicts
-        ]
         review_rows = bundle_lookup.get("reviews", {})
         check_rows = bundle_lookup.get("checks", {})
         adjusted: list[CandidateAssessment] = []
-        for assessment in assessments:
+        for candidate in candidates:
+            if candidate.doc_id not in verdicts:
+                continue
+            review_verdict = reviews.get(candidate.doc_id)
+            assessment = self.orchestrator._assessment_for(
+                anchor,
+                candidate,
+                verdicts.get(candidate.doc_id),
+                review_verdict,
+            )
             review_row = review_rows.get(assessment.candidate_doc_id, {})
-            check_row = check_rows.get(assessment.candidate_doc_id, {})
-            review_keep = bool(review_row.get("keep", True))
-            check_keep = bool(check_row.get("keep", True))
+            check_row = check_rows.get(assessment.candidate_doc_id, {}) if self.agents_config.counterevidence_enabled else {"keep": True}
+            reject_reason = ""
+            if not review_row:
+                reject_reason = "missing_review_artifact"
+            elif self.agents_config.counterevidence_enabled and not check_row:
+                reject_reason = "missing_check_artifact"
+            elif review_verdict is None:
+                reject_reason = "missing_review_verdict"
+            review_keep = bool(review_row.get("keep", False)) if review_row else False
+            check_keep = bool(check_row.get("keep", False)) if check_row else False
             reject_reason = str(
-                review_row.get("decision_reason")
+                reject_reason
+                or review_row.get("decision_reason")
                 or check_row.get("decision_reason")
                 or assessment.reject_reason
                 or "review_rejected"

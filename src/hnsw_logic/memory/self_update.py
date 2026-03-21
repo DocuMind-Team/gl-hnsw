@@ -28,6 +28,41 @@ class ControlledSelfUpdateManager:
         suffix = content[end:]
         return prefix + replacement + suffix.lstrip("\n")
 
+    def _upsert_reference_updates(self, content: str, lines: list[str]) -> str:
+        marker = "## Learned Updates"
+        normalized = [line.strip() for line in lines if str(line).strip()]
+        if not normalized:
+            return content
+        existing_items: list[str] = []
+        start = content.find(marker)
+        if start >= 0:
+            after = content.find("\n## ", start + len(marker))
+            end = len(content) if after < 0 else after
+            section = content[start:end]
+            for line in section.splitlines()[1:]:
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    existing_items.append(stripped[2:].strip())
+            prefix = content[:start]
+            suffix = content[end:]
+        else:
+            prefix = content.rstrip()
+            suffix = "\n" if prefix else ""
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in [*existing_items, *normalized]:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+        section_body = "\n".join(f"- {line}" for line in merged) if merged else "- No updates."
+        replacement = f"{marker}\n\n{section_body}\n"
+        if start >= 0:
+            return prefix + replacement + suffix.lstrip("\n")
+        spacer = "\n\n" if prefix else ""
+        return f"{prefix}{spacer}{replacement}"
+
     def update_agents_memory(self, bundle: MemoryLearningBundle, memory_path: Path) -> None:
         relative_path = str(memory_path.relative_to(self.repo_root))
         if not self._is_allowed(relative_path):
@@ -45,9 +80,9 @@ class ControlledSelfUpdateManager:
                 continue
             path = self.repo_root / normalized
             ensure_dir(path.parent)
-            header = "# Learned Updates\n\n"
-            body = "\n".join(f"- {line}" for line in lines if line.strip())
-            path.write_text(header + (body or "- No updates.") + "\n", encoding="utf-8")
+            content = path.read_text(encoding="utf-8") if path.exists() else ""
+            updated = self._upsert_reference_updates(content, lines)
+            path.write_text(updated, encoding="utf-8")
 
     def apply(self, bundle: MemoryLearningBundle, memory_path: Path) -> None:
         self.update_agents_memory(bundle, memory_path)
