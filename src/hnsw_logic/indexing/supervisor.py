@@ -55,6 +55,10 @@ class OfflineIndexingSupervisor:
     def _required_stages(self) -> list[str]:
         return required_indexing_stages(self.agents_config.counterevidence_enabled)
 
+    def _relative_stage_artifact_path(self, stage: str, anchor_doc_id: str) -> str:
+        """Return the workspace-relative artifact path for a delegated stage."""
+        return self._stage_path(stage, anchor_doc_id).relative_to(self.workspace_root).as_posix()
+
     def _audit_anchor_execution(self, anchor_doc_id: str) -> ExecutionAudit:
         return audit_execution_state(
             self.workspace_root,
@@ -138,13 +142,28 @@ class OfflineIndexingSupervisor:
     def _deepagent_stage_prompt(self, anchor_doc_id: str, stage: str, audit: ExecutionAudit) -> str:
         runner = self._stage_runners[stage]
         agent_name, tool_name = runner
+        artifact_path = self._relative_stage_artifact_path(stage, anchor_doc_id)
+        stage_instruction = (
+            f"The delegated subagent must call `{tool_name}(anchor_doc_id=\"{anchor_doc_id}\", "
+            f"output_path=\"{artifact_path}\")` unless `{artifact_path}` already exists and can be reused as-is."
+        )
+        stage_completion_rule = f"The stage is complete only when `{artifact_path}` exists."
+        stage_context = ""
+        if stage == "memory":
+            stage_context = (
+                "Read the review bundle, summarize durable learned and failure patterns, "
+                "and materialize the memory bundle. Do not stop at prose notes or proposed updates."
+            )
         return "\n".join(
             [
                 f"Resume the offline indexing workflow for anchor `{anchor_doc_id}`.",
                 "Use the execution-audit, resume-recovery, and delegation-policy skills.",
                 f"First call audit_anchor_execution for `{anchor_doc_id}` and confirm the next missing stage is `{stage}`.",
                 f"Then use the task tool to delegate only the `{stage}` stage to `{agent_name}`.",
-                f"The subagent must call `{tool_name}` and rely on workspace files as the handoff boundary.",
+                stage_instruction,
+                stage_completion_rule,
+                stage_context,
+                "Rely on workspace files as the handoff boundary.",
                 "After the delegated task returns, call audit_anchor_execution again and verify progress.",
                 "Do not edit code, configs, benchmark labels, or core SKILL.md files.",
                 f"Respect the iteration cap of {self.agents_config.task_iteration_cap} and the task-slot budget of {self.agents_config.max_parallel_tasks}.",

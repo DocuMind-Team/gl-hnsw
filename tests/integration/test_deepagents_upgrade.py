@@ -13,6 +13,7 @@ from hnsw_logic.agents.runtime.execution import (
     resolve_workspace_output_path,
     stage_artifact_path,
 )
+from hnsw_logic.agents.runtime.models import ExecutionAudit
 from hnsw_logic.agents.runtime.skill_runtime import SkillSignalRuntime
 from hnsw_logic.agents.runtime.toolsets import build_agent_tools
 from hnsw_logic.domain.models import LogicEdge
@@ -233,6 +234,26 @@ def test_runtime_tool_scopes_exclude_edge_commit(app_container):
             assert "evaluate_anchor_utility" in tools
     supervisor_tool_names = {tool.__name__ for tool in app_container.agent_factory.supervisor_tools}
     assert {"read_indexing_plan", "read_execution_manifest", "audit_anchor_execution"} <= supervisor_tool_names
+
+
+def test_supervisor_memory_prompt_requires_materialized_bundle(app_container):
+    prompt = app_container.offline_supervisor._deepagent_stage_prompt(
+        "doc-1",
+        "memory",
+        ExecutionAudit(
+            anchor_doc_id="doc-1",
+            generated_at="2026-03-21T00:00:00Z",
+            current_stage="memory",
+            completed_stages=["dossiers", "candidates", "judgments", "checks", "reviews"],
+            next_stage="memory",
+        ),
+    )
+
+    assert (
+        'execute_memory_summarization(anchor_doc_id="doc-1", output_path="indexing/memory/doc-1.json")'
+        in prompt
+    )
+    assert "`indexing/memory/doc-1.json` exists" in prompt
 
 
 def test_registry_tools_serialize_slotted_models(app_container):
