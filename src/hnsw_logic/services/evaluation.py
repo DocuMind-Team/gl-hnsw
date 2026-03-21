@@ -6,7 +6,7 @@ from typing import Iterable
 
 from pydantic import BaseModel
 
-from hnsw_logic.core.utils import read_json, read_jsonl
+from hnsw_logic.core.utils import read_json, read_jsonl, write_json
 
 
 class EvaluationMetrics(BaseModel):
@@ -151,7 +151,7 @@ class EvaluationService:
         ][:5]
         unique_anchors = {edge.src_doc_id for edge in live_edge_rows}
         avg_edges_per_anchor = len(live_edge_rows) / max(1, len(unique_anchors))
-        return EvaluationReport(
+        report = EvaluationReport(
             baseline=self._metric_bundle("baseline_hnsw", baseline_rows, qrels),
             hybrid=self._metric_bundle("hybrid_overlay", hybrid_rows, qrels),
             hybrid_no_memory_bias=self._metric_bundle("hybrid_no_memory_bias", hybrid_no_memory_rows, qrels),
@@ -164,3 +164,5 @@ class EvaluationService:
                 avg_edges_per_anchor=avg_edges_per_anchor,
             ),
         )
+        write_json(self.settings.root_dir / "data" / "results" / "evaluation_report.json", report.model_dump(mode="json"))
+        return report
