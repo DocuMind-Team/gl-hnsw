@@ -238,6 +238,43 @@ class OfflineIndexingSupervisor:
         review_rows = {item["candidate_doc_id"]: item for item in review_payload.get("reviews", []) if item.get("candidate_doc_id")}
         return candidates, verdicts, reviews, {"checks": checks, "reviews": review_rows}
 
+    def _validate_candidate_assets(
+        self,
+        anchor_doc_id: str,
+        candidates: list[DocBrief],
+        verdicts: dict[str, JudgeResult],
+        reviews: dict[str, JudgeResult],
+        bundle_lookup: dict[str, dict],
+    ) -> None:
+        candidate_ids = {candidate.doc_id for candidate in candidates}
+        if not candidate_ids:
+            return
+        missing_judgments = sorted(candidate_ids - set(verdicts))
+        if missing_judgments:
+            raise RuntimeError(
+                f"deepagents workflow for `{anchor_doc_id}` materialized incomplete judgments: "
+                f"missing={missing_judgments}"
+            )
+        missing_reviews = sorted(candidate_ids - set(bundle_lookup.get('reviews', {})))
+        if missing_reviews:
+            raise RuntimeError(
+                f"deepagents workflow for `{anchor_doc_id}` materialized incomplete reviews: "
+                f"missing={missing_reviews}"
+            )
+        missing_review_verdicts = sorted(candidate_ids - set(reviews))
+        if missing_review_verdicts:
+            raise RuntimeError(
+                f"deepagents workflow for `{anchor_doc_id}` materialized review rows without final verdicts: "
+                f"missing={missing_review_verdicts}"
+            )
+        if self.agents_config.counterevidence_enabled:
+            missing_checks = sorted(candidate_ids - set(bundle_lookup.get("checks", {})))
+            if missing_checks:
+                raise RuntimeError(
+                    f"deepagents workflow for `{anchor_doc_id}` materialized incomplete checks: "
+                    f"missing={missing_checks}"
+                )
+
     def _apply_review_consensus(
         self,
         anchor: DocBrief,
@@ -332,13 +369,11 @@ class OfflineIndexingSupervisor:
         if not candidates:
             self._apply_memory_updates(anchor_doc_id)
             return []
-        if not verdicts:
+        try:
+            self._validate_candidate_assets(anchor_doc_id, candidates, verdicts, reviews, bundle_lookup)
+        except RuntimeError:
             self._apply_memory_updates(anchor_doc_id)
-            audit = self._audit_anchor_execution(anchor_doc_id)
-            raise RuntimeError(
-                f"deepagents workflow for `{anchor_doc_id}` did not materialize judgments; "
-                f"missing stages={audit.missing_stages}, completed={audit.completed_stages}"
-            )
+            raise
         assessments = self._apply_review_consensus(anchor, candidates, verdicts, reviews, bundle_lookup)
         accepted = self.discovery_service.commit_assessments(anchor, assessments)
         self._apply_memory_updates(anchor_doc_id)

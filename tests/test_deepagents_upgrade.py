@@ -681,3 +681,82 @@ def test_offline_supervisor_rejects_missing_review_artifact(app_container, monke
     assert assessments
     assert assessments[0].accepted is False
     assert assessments[0].reject_reason == "missing_review_artifact"
+
+
+def test_offline_supervisor_raises_for_incomplete_review_bundle(app_container):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+
+    verdicts = {
+        candidate.doc_id: JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.84,
+            evidence_spans=[],
+            rationale="durable concept bridge",
+            support_score=0.0,
+            contradiction_flags=[],
+            decision_reason="review accepted",
+            utility_score=0.93,
+            uncertainty=0.22,
+            canonical_relation="same_concept",
+            semantic_relation_label="same_concept",
+        )
+    }
+
+    try:
+        app_container.offline_supervisor._validate_candidate_assets(
+            anchor.doc_id,
+            [candidate],
+            verdicts,
+            {},
+            {"checks": {candidate.doc_id: {"keep": True}}, "reviews": {}},
+        )
+    except RuntimeError as exc:
+        assert "incomplete reviews" in str(exc)
+    else:
+        raise AssertionError("expected incomplete review bundle to raise")
+
+
+def test_offline_supervisor_raises_for_missing_review_verdict(app_container):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+
+    verdicts = {
+        candidate.doc_id: JudgeResult(
+            accepted=True,
+            relation_type="same_concept",
+            confidence=0.84,
+            evidence_spans=[],
+            rationale="durable concept bridge",
+            support_score=0.0,
+            contradiction_flags=[],
+            decision_reason="review accepted",
+            utility_score=0.93,
+            uncertainty=0.22,
+            canonical_relation="same_concept",
+            semantic_relation_label="same_concept",
+        )
+    }
+
+    try:
+        app_container.offline_supervisor._validate_candidate_assets(
+            anchor.doc_id,
+            [candidate],
+            verdicts,
+            {},
+            {
+                "checks": {candidate.doc_id: {"keep": True}},
+                "reviews": {candidate.doc_id: {"keep": True}},
+            },
+        )
+    except RuntimeError as exc:
+        assert "review rows without final verdicts" in str(exc)
+    else:
+        raise AssertionError("expected missing review verdict to raise")
