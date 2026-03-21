@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from hnsw_logic.domain.models import DocRecord
 from hnsw_logic.domain.serialization import read_json, read_jsonl
 from hnsw_logic.evaluation.beir import (
@@ -198,10 +200,55 @@ def test_evaluate_beir_dataset_persists_report(tmp_path: Path, monkeypatch):
         corpus_limit=1,
         cache_root=tmp_path / "cache",
         work_root=work_root,
+        allow_stub=True,
     )
 
     persisted = read_json(work_root / "data" / "results" / "benchmark_report.json", default={})
 
     assert report.dataset == "scifact"
+    assert report.provider_kind == "stub"
+    assert persisted["provider_kind"] == "stub"
     assert persisted["dataset"] == "scifact"
     assert persisted["query_count"] == 1
+
+
+def test_evaluate_beir_dataset_rejects_stub_by_default(tmp_path: Path, monkeypatch):
+    repo_root = Path(__file__).resolve().parents[2]
+    dataset_root = tmp_path / "scifact"
+    (dataset_root / "qrels").mkdir(parents=True)
+    (dataset_root / "corpus.jsonl").write_text(
+        json.dumps({"_id": "d1", "title": "Doc 1", "text": "Alpha"}) + "\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "queries.jsonl").write_text(
+        json.dumps({"_id": "q1", "text": "alpha"}) + "\n",
+        encoding="utf-8",
+    )
+    (dataset_root / "qrels" / "test.tsv").write_text(
+        "query-id\tcorpus-id\tscore\nq1\td1\t1\n",
+        encoding="utf-8",
+    )
+
+    class FakeApp:
+        def __init__(self):
+            self.settings = type(
+                "Settings",
+                (),
+                {
+                    "app": type("AppCfg", (), {"provider": type("ProviderCfg", (), {"kind": "stub"})()})(),
+                    "hnsw": type("HnswCfg", (), {"vector_dim": 1024})(),
+                },
+            )()
+
+    monkeypatch.setattr("hnsw_logic.evaluation.beir.download_and_extract_beir_dataset", lambda *_args, **_kwargs: dataset_root)
+    monkeypatch.setattr("hnsw_logic.evaluation.beir.build_app", lambda _work_root: FakeApp())
+
+    with pytest.raises(RuntimeError, match="stub provider"):
+        evaluate_beir_dataset(
+            repo_root,
+            "scifact",
+            query_limit=1,
+            corpus_limit=1,
+            cache_root=tmp_path / "cache",
+            work_root=tmp_path / "work",
+        )

@@ -27,6 +27,7 @@ class BeirEvalReport(BaseModel):
     split: str
     corpus_size: int
     query_count: int
+    provider_kind: str
     baseline: EvaluationMetrics
     supplemental: EvaluationMetrics
     improved_recall_queries: list[str]
@@ -157,6 +158,17 @@ def _should_build_offline_graph(dataset: str) -> bool:
     return dataset.lower() in {"scifact", "nfcorpus", "arguana"}
 
 
+def _ensure_live_provider(provider_kind: str, *, allow_stub: bool) -> None:
+    if allow_stub:
+        return
+    if provider_kind == "stub":
+        raise RuntimeError(
+            "BEIR evaluation is using the stub provider. "
+            "Set GL_HNSW_PROVIDER_KIND=openai_compatible and the required model environment, "
+            "or rerun with allow_stub=True only for local debugging."
+        )
+
+
 def _metric_bundle(name: str, rows: list[dict], qrels: dict[str, dict[str, int]]) -> EvaluationMetrics:
     recalls = []
     mrrs = []
@@ -218,6 +230,7 @@ def evaluate_beir_dataset(
     corpus_limit: int | None = None,
     cache_root: Path | None = None,
     work_root: Path | None = None,
+    allow_stub: bool = False,
 ) -> BeirEvalReport:
     cache_root = cache_root or repo_root / "data" / "external" / "beir"
     dataset_root = download_and_extract_beir_dataset(dataset, cache_root)
@@ -228,9 +241,11 @@ def evaluate_beir_dataset(
 
     load_settings.cache_clear()
     app = build_app(work_root)
+    provider_kind = app.settings.app.provider.kind
+    _ensure_live_provider(provider_kind, allow_stub=allow_stub)
     app.pipeline.build_embeddings()
     app.pipeline.build_hnsw()
-    if app.settings.app.provider.kind == "openai_compatible":
+    if provider_kind == "openai_compatible":
         app.pipeline.profile_docs()
         if _should_build_offline_graph(dataset):
             app.pipeline.discover_edges()
@@ -291,6 +306,7 @@ def evaluate_beir_dataset(
         split=split,
         corpus_size=len(beir.corpus),
         query_count=len(beir.queries),
+        provider_kind=provider_kind,
         baseline=baseline_metrics,
         supplemental=supplemental_metrics,
         improved_recall_queries=improved_recall_queries,
