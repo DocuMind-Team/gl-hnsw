@@ -1,30 +1,44 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from types import SimpleNamespace
+from typing import Any
 
-from hnsw_logic.core.models import SearchHit, SearchResponse
-from hnsw_logic.docs.brief_store import BriefStore
-from hnsw_logic.graph.store import GraphStore
-from hnsw_logic.hnsw.searcher import HnswSearcher
-from hnsw_logic.memory.semantic_memory import SemanticMemoryStore
+from hnsw_logic.domain.models import DocBrief, DocRecord, SearchHit, SearchResponse
+from hnsw_logic.domain.protocols import (
+    BriefStore as BriefStoreProtocol,
+)
+from hnsw_logic.domain.protocols import (
+    CorpusStore as CorpusStoreProtocol,
+)
+from hnsw_logic.domain.protocols import (
+    GraphStore as GraphStoreProtocol,
+)
+from hnsw_logic.domain.protocols import (
+    Searcher as SearcherProtocol,
+)
+from hnsw_logic.domain.protocols import (
+    SemanticMemoryStore as SemanticMemoryStoreProtocol,
+)
+from hnsw_logic.domain.tokens import tokenize
 from hnsw_logic.retrieval.jump_policy import JumpPolicy
 from hnsw_logic.retrieval.scorer import ExpandedCandidate, RetrievalScorer
 from hnsw_logic.retrieval.sparse import SparseRetriever
-from hnsw_logic.services.corpus import CorpusStore
-from hnsw_logic.core.utils import tokenize
 
 
 class HybridRetrievalService:
+    """Run hybrid retrieval with local dense seeds and offline logic overlays."""
+
     def __init__(
         self,
-        searcher: HnswSearcher,
-        brief_store: BriefStore,
-        graph_store: GraphStore,
+        searcher: SearcherProtocol,
+        brief_store: BriefStoreProtocol,
+        graph_store: GraphStoreProtocol,
         scorer: RetrievalScorer,
         jump_policy: JumpPolicy,
-        semantic_memory_store: SemanticMemoryStore | None = None,
-        corpus_store: CorpusStore | None = None,
+        semantic_memory_store: SemanticMemoryStoreProtocol | None = None,
+        corpus_store: CorpusStoreProtocol | None = None,
     ):
         self.searcher = searcher
         self.brief_store = brief_store
@@ -54,8 +68,8 @@ class HybridRetrievalService:
         self._sparse = SparseRetriever()
         self._sparse_doc_count = -1
         self._processed_doc_count = -1
-        self._records_by_id = {}
-        self._record_tokens_by_id = {}
+        self._records_by_id: dict[str, DocRecord] = {}
+        self._record_tokens_by_id: dict[str, set[str]] = {}
         self._dataset_hint = ""
         self._refresh_corpus_cache()
 
@@ -68,7 +82,12 @@ class HybridRetrievalService:
         raw_tokens = self._record_tokens_by_id.get(doc_id, set())
         return min(len(query_tokens & raw_tokens) / max(1, min(len(query_tokens), 6)), 1.0)
 
-    def _effective_query_specificity(self, query: str, briefs: dict[str, object], sparse_hits) -> float:
+    def _effective_query_specificity(
+        self,
+        query: str,
+        briefs: Mapping[str, DocBrief],
+        sparse_hits,
+    ) -> float:
         base = self.scorer.query_specificity(query)
         if not sparse_hits:
             return base
@@ -99,7 +118,7 @@ class HybridRetrievalService:
     def _strong_sparse_match(
         self,
         query: str,
-        brief,
+        brief: DocBrief,
         *,
         doc_id: str,
         sparse_score: float,
@@ -168,7 +187,7 @@ class HybridRetrievalService:
         ]
         return SearchResponse(query=query, hits=hits)
 
-    def _default_strategy(self, *, graph_available: bool):
+    def _default_strategy(self, *, graph_available: bool) -> Any:
         if graph_available and self._dataset_hint in {"gl_hnsw_demo", "demo", "project_docs"}:
             return SimpleNamespace(
                 sparse_gate=0.8,
@@ -232,7 +251,7 @@ class HybridRetrievalService:
         self,
         query: str,
         query_emb,
-        briefs: dict[str, object],
+        briefs: Mapping[str, DocBrief],
         dense_rows: list[tuple[str, float, str]],
         sparse_hits,
         strategy,
@@ -249,7 +268,6 @@ class HybridRetrievalService:
         dense_score_map = {doc_id: score for doc_id, score, _ in dense_rows}
         dense_protected = {doc_id for doc_id, _, _ in dense_rows[: self.novelty_dense_top_k]}
         sparse_score_map = {hit.doc_id: hit.score for hit in sparse_hits}
-        sparse_rank_map = {hit.doc_id: rank for rank, hit in enumerate(sparse_hits, start=1)}
         dense_head = {doc_id for doc_id, _, _ in dense_rows[: self.sparse_agreement_top_k]}
         sparse_head = {hit.doc_id for hit in sparse_hits[: self.sparse_agreement_top_k]}
         agreement_ratio = len(dense_head & sparse_head) / max(1, len(sparse_head))
@@ -376,7 +394,7 @@ class HybridRetrievalService:
     def _retain_dense_top_hits(
         self,
         ranked: list[dict],
-        briefs: dict[str, object],
+        briefs: Mapping[str, DocBrief],
         dense_rows: list[tuple[str, float, str]],
         top_k: int,
     ) -> list[dict]:
@@ -418,7 +436,13 @@ class HybridRetrievalService:
             row["rank"] = rank
         return rows
 
-    def _apply_graph_neighborhood_bonus(self, query: str, query_emb, ranked: list[dict], briefs: dict[str, object]) -> list[dict]:
+    def _apply_graph_neighborhood_bonus(
+        self,
+        query: str,
+        query_emb,
+        ranked: list[dict],
+        briefs: Mapping[str, DocBrief],
+    ) -> list[dict]:
         if not ranked:
             return ranked
         query_specificity = self.scorer.query_specificity(query)
@@ -480,7 +504,7 @@ class HybridRetrievalService:
         query: str,
         query_emb,
         seed_rows: list[tuple[str, float, str]],
-        briefs: dict[str, object],
+        briefs: Mapping[str, DocBrief],
         strategy,
         *,
         graph_available: bool,
@@ -561,7 +585,7 @@ class HybridRetrievalService:
         self,
         query: str,
         query_emb,
-        briefs: dict[str, object],
+        briefs: Mapping[str, DocBrief],
         dense_rows=None,
         *,
         graph_available: bool | None = None,
@@ -669,7 +693,7 @@ class HybridRetrievalService:
             strategy,
             graph_available=graph_available,
         )
-        for doc_id, seed_score, source_kind in seed_rows[:effective_max_seeds]:
+        for doc_id, seed_score, _source_kind in seed_rows[:effective_max_seeds]:
             source_brief = briefs.get(doc_id)
             source_specific_overlap = self.scorer.specific_query_overlap(query, source_brief) if source_brief is not None else 0.0
             for edge in self.graph_store.get_out_edges(doc_id)[:effective_max_expansions]:

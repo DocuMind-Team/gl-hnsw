@@ -1,9 +1,10 @@
 """Embedding package."""
 
-from hnsw_logic.embedding.provider import OpenAICompatibleProvider, build_provider
-from hnsw_logic.embedding.provider_base import ProviderBase
-from hnsw_logic.embedding.provider_stub import StubProvider
-from hnsw_logic.embedding.provider_types import CandidateProposal, JudgeResult, JudgeSignals
+from hnsw_logic.embedding.factory import build_provider
+from hnsw_logic.embedding.providers.base import ProviderBase
+from hnsw_logic.embedding.providers.live import OpenAICompatibleProvider
+from hnsw_logic.embedding.providers.stub import StubProvider
+from hnsw_logic.embedding.providers.types import CandidateProposal, JudgeResult, JudgeSignals
 
 __all__ = [
     "CandidateProposal",

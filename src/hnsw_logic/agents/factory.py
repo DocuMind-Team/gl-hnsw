@@ -3,8 +3,14 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+from pydantic import SecretStr
+
+from hnsw_logic.agents.runtime.execution import (
+    build_deepagent_supervisor_tools,
+    build_deepagent_toolsets,
+)
 from hnsw_logic.agents.subagents.corpus_scout import CorpusScoutAgent
 from hnsw_logic.agents.subagents.counterevidence_checker import CounterevidenceCheckerAgent
 from hnsw_logic.agents.subagents.doc_profiler import DocProfilerAgent
@@ -12,14 +18,10 @@ from hnsw_logic.agents.subagents.edge_reviewer import EdgeReviewerAgent
 from hnsw_logic.agents.subagents.index_planner import IndexPlannerAgent
 from hnsw_logic.agents.subagents.memory_curator import MemoryCuratorAgent
 from hnsw_logic.agents.subagents.relation_judge import RelationJudgeAgent
-from hnsw_logic.agents.tools.deepagents_runtime import (
-    build_deepagent_supervisor_tools,
-    build_deepagent_toolsets,
-)
 from hnsw_logic.config.schema import AgentsConfig, ProviderConfig, RetrievalConfig
-from hnsw_logic.core.utils import ensure_dir
-from hnsw_logic.embedding.provider import OpenAICompatibleProvider
-from hnsw_logic.embedding.provider_base import ProviderBase
+from hnsw_logic.domain.serialization import ensure_dir
+from hnsw_logic.embedding.providers.base import ProviderBase
+from hnsw_logic.embedding.providers.live import OpenAICompatibleProvider
 
 
 class AgentFactory:
@@ -132,7 +134,7 @@ class AgentFactory:
         return self.runtime_toolsets
 
     def create_orchestrator(self):
-        from hnsw_logic.agents.orchestrator import LogicOrchestrator
+        from hnsw_logic.agents.orchestration.orchestrator import LogicOrchestrator
 
         orchestrator = LogicOrchestrator(
             doc_profiler=self.create_doc_profiler(),
@@ -202,7 +204,7 @@ class AgentFactory:
             return None
         model = ChatOpenAI(
             base_url=self.provider_config.base_url,
-            api_key=api_key,
+            api_key=SecretStr(api_key),
             model=self.provider_config.chat_model,
             temperature=0,
         )
@@ -213,7 +215,7 @@ class AgentFactory:
             skills=root_skill_paths,
             memory=memory_files,
             tools=self.supervisor_tools,
-            subagents=self.create_deepagent_specs(),
+            subagents=cast(Any, self.create_deepagent_specs()),
             backend=FilesystemBackend(root_dir=str(self.repo_root), virtual_mode=True),
             system_prompt=(
                 "You are the gl-hnsw offline indexing supervisor. "

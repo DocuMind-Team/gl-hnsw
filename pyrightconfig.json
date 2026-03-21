@@ -1,0 +1,27 @@
+{
+  "include": [
+    "src",
+    "tests",
+    "scripts"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".deepagents/runtime_views",
+    "data",
+    "dist",
+    "build"
+  ],
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "standard",
+  "reportMissingTypeStubs": false,
+  "reportImplicitRelativeImport": true,
+  "reportPrivateUsage": false,
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": [
+        "src"
+      ]
+    }
+  ]
+}

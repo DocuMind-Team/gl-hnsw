@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from hnsw_logic.core.models import DocBrief
-from hnsw_logic.embedding.provider_base import ProviderBase
-from hnsw_logic.embedding.provider_types import CandidateProposal
+from hnsw_logic.domain.models import DocBrief
+from hnsw_logic.embedding.providers.base import ProviderBase
+from hnsw_logic.embedding.providers.types import CandidateProposal
 
 
 class CorpusScoutAgent:

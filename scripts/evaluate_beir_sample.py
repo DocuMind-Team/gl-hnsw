@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import _bootstrap  # noqa: F401
-
-from hnsw_logic.services.beir_eval import evaluate_beir_dataset
+from hnsw_logic.evaluation.beir import evaluate_beir_dataset
 
 
 def main() -> None:

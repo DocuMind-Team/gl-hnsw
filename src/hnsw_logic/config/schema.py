@@ -66,7 +66,7 @@ class AgentsConfig(BaseModel):
     max_parallel_tasks: int = 4
     task_iteration_cap: int = 2
     subagents: dict[str, SubagentConfig] = Field(default_factory=dict)
-    live_reasoning: "LiveReasoningConfig" = Field(default_factory=lambda: LiveReasoningConfig())
+    live_reasoning: LiveReasoningConfig = Field(default_factory=lambda: LiveReasoningConfig())
 
 
 class LiveReasoningConfig(BaseModel):

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 
 from hnsw_logic.api.schemas import JobRequest, SearchRequest, SearchResponseModel
-from hnsw_logic.core.utils import to_jsonable
-from hnsw_logic.services.bootstrap import build_app
+from hnsw_logic.app.container import build_app
+from hnsw_logic.domain.serialization import to_jsonable
 
 
 def create_app(root_dir=None) -> FastAPI:

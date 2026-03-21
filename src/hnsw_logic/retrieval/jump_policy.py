@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from hnsw_logic.config.schema import RetrievalConfig
-from hnsw_logic.core.models import LogicEdge
+from hnsw_logic.domain.models import LogicEdge
 
 
 class JumpPolicy:

@@ -4,9 +4,9 @@ from collections import Counter
 from dataclasses import dataclass
 from math import log
 
-from hnsw_logic.core.facets import build_search_views
-from hnsw_logic.core.models import DocBrief, DocRecord
-from hnsw_logic.core.utils import tokenize
+from hnsw_logic.domain.facets import build_search_views
+from hnsw_logic.domain.models import DocBrief, DocRecord
+from hnsw_logic.domain.tokens import tokenize
 
 
 @dataclass(slots=True)

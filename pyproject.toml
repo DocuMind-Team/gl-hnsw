@@ -23,8 +23,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "basedpyright>=1.31.0",
   "httpx>=0.28.0",
   "pytest>=8.3.0",
+  "ruff>=0.11.0",
 ]
 
 [project.scripts]
@@ -45,3 +47,20 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests", "scripts"]
+extend-exclude = [
+  ".deepagents/skills",
+  ".deepagents/runtime_views",
+  "data",
+]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["B011"]

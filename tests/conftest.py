@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from hnsw_logic.app.container import build_app
 from hnsw_logic.config.settings import load_settings
-from hnsw_logic.services.bootstrap import build_app
 
 
 @pytest.fixture()

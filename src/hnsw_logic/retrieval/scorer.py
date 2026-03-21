@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
 from hnsw_logic.config.schema import RetrievalConfig
-from hnsw_logic.core.facets import build_search_views
-from hnsw_logic.core.models import DocBrief, LogicEdge
-from hnsw_logic.core.utils import cosine, tokenize
-from hnsw_logic.embedding.provider_base import ProviderBase
+from hnsw_logic.domain.facets import build_search_views
+from hnsw_logic.domain.models import DocBrief, LogicEdge
+from hnsw_logic.domain.protocols import EmbeddingProvider
+from hnsw_logic.domain.tokens import cosine, tokenize
 
 
 @dataclass(slots=True)
@@ -24,7 +26,9 @@ class ExpandedCandidate:
 
 
 class RetrievalScorer:
-    def __init__(self, provider: ProviderBase, retrieval_config: RetrievalConfig):
+    """Score dense and logic-overlay retrieval candidates."""
+
+    def __init__(self, provider: EmbeddingProvider, retrieval_config: RetrievalConfig):
         self.provider = provider
         self.alpha = retrieval_config.fusion.alpha
         self.beta = retrieval_config.fusion.beta
@@ -51,7 +55,7 @@ class RetrievalScorer:
         self._brief_embedding_cache[key] = cached
         return cached
 
-    def preload_views(self, briefs: list[DocBrief], view_names: tuple[str, ...]) -> None:
+    def preload_views(self, briefs: Sequence[DocBrief], view_names: tuple[str, ...]) -> None:
         for view_name in view_names:
             missing = [brief for brief in briefs if (brief.doc_id, view_name) not in self._brief_embedding_cache]
             if not missing:
@@ -61,7 +65,7 @@ class RetrievalScorer:
                 views = self._brief_views(brief)
                 texts.append(views.get(view_name, "") or views.get("full", ""))
             embeddings = self.provider.embed_texts(texts)
-            for brief, embedding in zip(missing, embeddings):
+            for brief, embedding in zip(missing, embeddings, strict=True):
                 self._brief_embedding_cache[(brief.doc_id, view_name)] = embedding
 
     def _query_tokens(self, query: str) -> set[str]:
@@ -200,13 +204,20 @@ class RetrievalScorer:
         return 0.68 * dense_score + 0.22 * lexical_alignment + 0.1 * structure_alignment
 
     @staticmethod
-    def _edge_activation_profile(edge: LogicEdge) -> dict[str, object]:
+    def _edge_activation_profile(edge: LogicEdge) -> dict[str, Any]:
         profile = getattr(edge, "activation_profile", {}) or {}
         return profile if isinstance(profile, dict) else {}
 
+    @staticmethod
+    def _profile_list(profile: dict[str, Any], key: str) -> list[str]:
+        value = profile.get(key)
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
     def edge_use_cases(self, edge: LogicEdge) -> set[str]:
         profile = self._edge_activation_profile(edge)
-        return {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
+        return {item.lower() for item in self._profile_list(profile, "edge_use_cases")}
 
     def is_concept_bridge(self, edge: LogicEdge) -> bool:
         return "concept-bridge" in self.edge_use_cases(edge)
@@ -232,10 +243,18 @@ class RetrievalScorer:
         query_tokens = self._query_tokens(query)
         if not query_tokens:
             return 0.0
-        surface_terms = {token for token in tokenize(" ".join(profile.get("query_surface_terms", []) or [])) if len(token) > 2}
-        topic_terms = {token for token in tokenize(" ".join(profile.get("topic_signature", []) or [])) if len(token) > 2}
-        use_cases = {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
-        negative_patterns = {str(item).strip().lower() for item in profile.get("negative_patterns", []) or [] if str(item).strip()}
+        surface_terms = {
+            token
+            for token in tokenize(" ".join(self._profile_list(profile, "query_surface_terms")))
+            if len(token) > 2
+        }
+        topic_terms = {
+            token
+            for token in tokenize(" ".join(self._profile_list(profile, "topic_signature")))
+            if len(token) > 2
+        }
+        use_cases = {item.lower() for item in self._profile_list(profile, "edge_use_cases")}
+        negative_patterns = {item.lower() for item in self._profile_list(profile, "negative_patterns")}
         surface_overlap = min(len(query_tokens & surface_terms) / max(1, min(len(query_tokens), 4)), 1.0) if surface_terms else 0.0
         topic_overlap = min(len(query_tokens & topic_terms) / max(1, min(len(query_tokens), 3)), 1.0) if topic_terms else 0.0
         lexical_alignment = self.query_alignment(query, brief)

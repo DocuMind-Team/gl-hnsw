@@ -16,6 +16,8 @@ data/graph/*
 !data/graph/.gitkeep
 data/memories/*
 !data/memories/.gitkeep
+data/results/*
+!data/results/.gitkeep
 data/jobs.sqlite3
 
 data/workspace/

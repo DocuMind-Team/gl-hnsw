@@ -4,13 +4,15 @@ from pathlib import Path
 
 import numpy as np
 
-from hnsw_logic.core.models import DocRecord
-from hnsw_logic.core.utils import read_json, write_json
-from hnsw_logic.embedding.provider_base import ProviderBase
+from hnsw_logic.domain.models import DocRecord
+from hnsw_logic.domain.protocols import EmbeddingProvider
+from hnsw_logic.domain.serialization import read_json, write_json
 
 
 class EmbeddingEncoder:
-    def __init__(self, provider: ProviderBase, output_path: Path):
+    """Persist document embeddings produced by an embedding-capable provider."""
+
+    def __init__(self, provider: EmbeddingProvider, output_path: Path):
         self.provider = provider
         self.output_path = output_path
 
