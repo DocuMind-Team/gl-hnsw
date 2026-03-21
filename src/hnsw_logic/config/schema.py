@@ -88,7 +88,6 @@ class FusionConfig(BaseModel):
 
 
 class RelationQualityConfig(BaseModel):
-    enabled: bool = True
     min_confidence: float = 0.8
     min_support: float = 0.3
     min_evidence_quality: float = 0.35
@@ -98,8 +97,8 @@ def _default_relation_thresholds() -> dict[str, RelationQualityConfig]:
     return {
         "supporting_evidence": RelationQualityConfig(min_confidence=0.82, min_support=0.3, min_evidence_quality=0.35),
         "implementation_detail": RelationQualityConfig(min_confidence=0.84, min_support=0.34, min_evidence_quality=0.4),
-        "same_concept": RelationQualityConfig(enabled=False, min_confidence=0.9, min_support=0.5, min_evidence_quality=0.4),
-        "comparison": RelationQualityConfig(enabled=False, min_confidence=0.92, min_support=0.55, min_evidence_quality=0.45),
+        "same_concept": RelationQualityConfig(min_confidence=0.9, min_support=0.5, min_evidence_quality=0.4),
+        "comparison": RelationQualityConfig(min_confidence=0.92, min_support=0.55, min_evidence_quality=0.45),
         "prerequisite": RelationQualityConfig(min_confidence=0.88, min_support=0.38, min_evidence_quality=0.4),
     }
 

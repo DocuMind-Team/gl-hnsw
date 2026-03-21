@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from hnsw_logic.agents.orchestrator import CandidateAssessment
 from hnsw_logic.agents.tools.deepagents_runtime import (
@@ -17,6 +18,16 @@ from hnsw_logic.core.models import LogicEdge
 from hnsw_logic.core.utils import write_json
 from hnsw_logic.embedding.provider import JudgeResult
 from hnsw_logic.agents.tools.registry import build_agent_tools
+
+
+def _skill_frontmatter(content: str) -> dict[str, str]:
+    assert content.startswith("---\n")
+    _, frontmatter, _ = content.split("---", 2)
+    fields: dict[str, str] = {}
+    for line in frontmatter.strip().splitlines():
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    return fields
 
 
 def test_settings_enable_deepagents_runtime(test_root: Path):
@@ -37,14 +48,28 @@ def test_skill_packages_have_frontmatter_and_resources(test_root: Path):
         skill_md = skill_dir / "SKILL.md"
         assert skill_md.exists(), skill_dir
         content = skill_md.read_text(encoding="utf-8")
-        assert content.startswith("---\n")
-        assert "name:" in content and "description:" in content
+        frontmatter = _skill_frontmatter(content)
+        assert set(frontmatter) == {"name", "description"}, skill_dir
+        assert all(frontmatter.values()), skill_dir
         assert (skill_dir / "references").exists(), skill_dir
         assert (skill_dir / "scripts").exists(), skill_dir
 
 
 def test_legacy_skill_tree_is_removed(test_root: Path):
     assert not (test_root / "src" / "hnsw_logic" / "agents" / "skills").exists()
+
+
+def test_runtime_skill_tree_has_no_python_cache():
+    repo_root = Path(__file__).resolve().parents[1]
+    tracked = subprocess.run(
+        ["git", "ls-files", ".deepagents/skills"],
+        cwd=repo_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert not any("__pycache__" in path for path in tracked)
+    assert not any(path.endswith(".pyc") for path in tracked)
 
 
 def test_supervisor_runtime_has_no_local_runtime_escape_source(test_root: Path):
@@ -105,6 +130,13 @@ def test_skill_signal_runtime_returns_structured_signal_report(test_root: Path):
         fit_scores={"comparison": 0.8},
         signal_report=report,
     )
+    relation_fit = runtime.score_relation_fit(anchor, candidate, {"dense_score": 0.71, "topic_alignment": 1.0}, report)
+    utility = runtime.score_candidate_utility(
+        relation_type="comparison",
+        metrics={"dense_score": 0.71, "local_support": 0.68, "mention_score": 0.22},
+        fit_scores=relation_fit["fit_scores"],
+        signal_report=report,
+    )
     edge_budget = runtime.compute_edge_budget_score(
         score=0.7,
         utility_score=0.8,
@@ -119,6 +151,8 @@ def test_skill_signal_runtime_returns_structured_signal_report(test_root: Path):
     assert "query_surface_terms" in profile
     assert anchor_priority["priority_score"] > 0.0
     assert candidate_priority["priority_score"] > 0.0
+    assert relation_fit["best_relation"] in relation_fit["fit_scores"]
+    assert utility["utility_score"] > 0.0
     assert edge_budget["selection_score"] > 0.0
 
 
@@ -164,6 +198,7 @@ def test_runtime_tool_scopes_exclude_edge_commit(app_container):
     assert scoped["index_planner"]
     for agent_name, tools in scoped.items():
         assert "commit_logic_edge" not in tools
+        assert "update_global_memory" not in tools
         if agent_name == "memory_curator":
             assert "execute_memory_summarization" in tools
         if agent_name == "edge_reviewer":
@@ -186,6 +221,8 @@ def test_registry_tools_serialize_slotted_models(app_container):
     briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
     doc_id = briefs[0].doc_id
 
+    assert "commit_logic_edge" not in tools
+    assert "update_global_memory" not in tools
     assert isinstance(tools["read_doc_brief"](doc_id), dict)
     assert isinstance(tools["read_doc_full"](doc_id), dict)
     assert isinstance(tools["load_anchor_memory"](doc_id), dict)

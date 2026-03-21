@@ -246,26 +246,15 @@ class LogicOrchestrator:
             penalty += 0.16
         if metrics["mention_score"] >= 0.45 and metrics["novel_term_ratio"] >= 0.9 and bridge_gain < 0.48:
             penalty += 0.08
-        contrastive_reuse = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        contrastive_reuse = float(
+            self._signal_runtime.compute_contrast_evidence(anchor, candidate, local_signals=metrics).get("contrast_evidence", 0.0)
+            or 0.0
+        )
         if contrastive_reuse >= 0.56:
             penalty = max(0.0, penalty - (0.18 + 0.14 * contrastive_reuse))
         penalty = max(0.0, min(penalty, 0.55))
         self._embedding_cache[cache_key] = penalty
         return penalty
-
-    def _is_effective_duplicate(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float] | None = None) -> bool:
-        title_a = self._normalized_tokens({token for token in tokenize(anchor.title) if len(token) > 2})
-        title_b = self._normalized_tokens({token for token in tokenize(candidate.title) if len(token) > 2})
-        if not title_a or not title_b:
-            return False
-        exact_title_match = " ".join(sorted(title_a)) == " ".join(sorted(title_b))
-        if not exact_title_match:
-            return False
-        if metrics is None:
-            metrics = self._candidate_metrics(anchor, candidate)
-        if self._contrastive_argument_reuse(anchor, candidate, metrics) >= 0.6:
-            return False
-        return metrics["content_overlap_score"] >= 0.85 and metrics["dense_score"] >= 0.7
 
     def _source_dataset(self, brief: DocBrief) -> str:
         return str(brief.metadata.get("source_dataset", "")).lower()
@@ -335,72 +324,6 @@ class LogicOrchestrator:
     def _supports_same_concept_pair(self, anchor: DocBrief, candidate: DocBrief) -> bool:
         return self._is_evidence_like_doc(anchor) and self._doc_stage(candidate) == self._doc_stage(anchor)
 
-    def _has_same_concept_signature(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> bool:
-        if not self._supports_same_concept_pair(anchor, candidate):
-            return False
-        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
-        return (
-            metrics["family_bridge_score"] >= 0.45
-            or metrics["shared_dominant_family"] >= 1.0
-            or metrics["entity_overlap"] >= 1.0
-            or specific_title_bridge >= 1.0
-            or (
-                evidence_bridge_strength >= 0.58
-                and metrics["title_overlap"] >= 2.0
-                and metrics["topic_alignment"] >= 1.0
-            )
-        )
-
-    def _high_utility_same_concept_bridge(
-        self,
-        anchor: DocBrief,
-        candidate: DocBrief,
-        metrics: dict[str, float],
-        *,
-        blended_support: float,
-        blended_utility: float,
-    ) -> bool:
-        if not self._supports_same_concept_pair(anchor, candidate):
-            return False
-        if metrics["topic_drift"] >= 1.0:
-            return False
-        return (
-            metrics["dense_score"] >= 0.75
-            and blended_support >= 0.7
-            and blended_utility >= 0.72
-            and metrics["topic_alignment"] >= 1.0
-            and (
-                metrics["title_overlap"] >= 2.0
-                or metrics["mention_score"] >= 0.32
-                or self._specific_title_bridge_score(anchor, candidate) >= 0.45
-            )
-        )
-
-    def _same_concept_methodology_penalty(self, anchor: DocBrief, candidate: DocBrief) -> float:
-        anchor_stage = self._doc_stage(anchor)
-        if anchor_stage not in {"scientific_evidence", "clinical_passage"} or self._doc_stage(candidate) != anchor_stage:
-            return 0.0
-        anchor_title_tokens = {token for token in tokenize(anchor.title) if len(token) > 2}
-        candidate_title_tokens = {token for token in tokenize(candidate.title) if len(token) > 2}
-        candidate_method_terms = candidate_title_tokens & METHOD_TITLE_TERMS
-        if not candidate_method_terms:
-            return 0.0
-        anchor_method_terms = anchor_title_tokens & METHOD_TITLE_TERMS
-        anchor_outcome_terms = anchor_title_tokens & OUTCOME_TITLE_TERMS
-        candidate_outcome_terms = candidate_title_tokens & OUTCOME_TITLE_TERMS
-        shared_focus = len((anchor_title_tokens - METHOD_TITLE_TERMS) & (candidate_title_tokens - METHOD_TITLE_TERMS))
-        penalty = 0.0
-        if candidate_method_terms - anchor_method_terms:
-            penalty += 0.38
-        if not candidate_outcome_terms:
-            penalty += 0.18
-        if anchor_outcome_terms and not (anchor_outcome_terms & candidate_outcome_terms):
-            penalty += 0.12
-        if shared_focus <= 1:
-            penalty += 0.12
-        return min(penalty, 0.8)
-
     def _family_bridge_score(self, anchor_terms: set[str], candidate_terms: set[str]) -> float:
         best = 0.0
         for _, family in DETAIL_FAMILIES:
@@ -454,84 +377,6 @@ class LogicOrchestrator:
             return 0.0
         return min(len(shared) / 2.0, 1.0)
 
-    def _argument_bridge_strength(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
-        if not self._is_argumentative_pair(anchor, candidate):
-            return 0.0
-        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
-        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        return max(
-            0.0,
-            min(
-                1.0,
-                0.26 * topic_consistency
-                + 0.24 * metrics["stance_contrast"]
-                + 0.18 * metrics["content_overlap_score"]
-                + 0.14 * metrics["overlap_score"]
-                + 0.16 * specific_title_bridge,
-            ),
-        )
-
-    def _argument_topic_consistency(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
-        if not self._is_argumentative_pair(anchor, candidate):
-            return 0.0
-        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        topic_family_match = metrics.get("topic_family_match", 0.0)
-        normalized_title_overlap = min(metrics["title_overlap"] / 3.0, 1.0)
-        normalized_content_overlap = min(metrics["content_overlap_score"] / 0.3, 1.0)
-        normalized_mention = min(metrics["mention_score"] / 0.24, 1.0)
-        family_weight = 0.34 if self._topic_family(anchor) and self._topic_family(candidate) else 0.0
-        base_consistency = (
-            0.34 * metrics["topic_cluster_match"]
-            + 0.26 * specific_title_bridge
-            + 0.16 * normalized_title_overlap
-            + 0.14 * normalized_content_overlap
-            + 0.10 * normalized_mention
-        )
-        return max(
-            0.0,
-            min(
-                1.0,
-                family_weight * topic_family_match + (1.0 - family_weight) * base_consistency,
-            ),
-        )
-
-    def _contrastive_argument_reuse(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
-        if not self._is_argumentative_pair(anchor, candidate):
-            return 0.0
-        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
-        topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
-        if metrics["stance_contrast"] < 1.0:
-            return 0.0
-        return max(
-            0.0,
-            min(
-                1.0,
-                0.46 * argument_bridge_strength
-                + 0.24 * topic_consistency
-                + 0.18 * metrics["content_overlap_score"]
-                + 0.08 * metrics.get("topic_family_match", 0.0)
-                + 0.12 * min(metrics["title_overlap"] / 3.0, 1.0),
-            ),
-        )
-
-    def _evidence_bridge_strength(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
-        if not self._supports_same_concept_pair(anchor, candidate):
-            return 0.0
-        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        return max(
-            0.0,
-            min(
-                1.0,
-                0.24 * metrics["dense_score"]
-                + 0.16 * metrics["family_bridge_score"]
-                + 0.12 * metrics["shared_dominant_family"]
-                + 0.14 * metrics["topic_alignment"]
-                + 0.1 * metrics["topic_cluster_match"]
-                + 0.12 * metrics["novelty_bridge_score"]
-                + 0.12 * specific_title_bridge,
-            ),
-        )
-
     def _specific_title_bridge_potential(self, anchor: DocBrief, corpus: list[DocBrief]) -> float:
         anchor_terms = self._specific_title_terms(anchor)
         if not anchor_terms:
@@ -554,22 +399,6 @@ class LogicOrchestrator:
         content_terms = self._content_terms(brief)
         cue_hits = len(content_terms & DETAIL_CUES)
         return min(cue_hits / 6.0, 1.0)
-
-    def _implementation_direction_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> float:
-        candidate_spec = self._title_specificity_score(candidate)
-        anchor_spec = self._title_specificity_score(anchor)
-        detail_gap = self._detail_density(candidate) - self._detail_density(anchor)
-        reference_gap = metrics["forward_reference_score"] - 0.85 * metrics["reverse_reference_score"]
-        score = (
-            0.55 * (candidate_spec - anchor_spec)
-            + 0.2 * detail_gap
-            + 0.2 * reference_gap
-            + 0.15 * (metrics["family_bridge_score"] - 0.5)
-        )
-        return max(-1.0, min(score, 1.0))
-
-    def _has_listing_context(self, brief: DocBrief) -> float:
-        return 1.0 if any(word in self._brief_text(brief) for word in LISTING_WORDS) else 0.0
 
     def _doc_stage(self, brief: DocBrief) -> str:
         title_tokens = set(tokenize(brief.title))
@@ -658,213 +487,50 @@ class LogicOrchestrator:
                 return "eval_report"
         return ""
 
-    def _relation_stage_bonus(self, anchor: DocBrief, candidate: DocBrief, relation_type: str, metrics: dict[str, float]) -> float:
-        anchor_stage = self._doc_stage(anchor)
-        candidate_stage = self._doc_stage(candidate)
-        pair = (anchor_stage, candidate_stage)
-        bonus = 0.0
-        if relation_type == "implementation_detail":
-            positive = {
-                ("retrieval_overview", "logic_fusion"): 0.3,
-                ("logic_graph", "logic_policy"): 0.34,
-                ("agent_overview", "agent_roles"): 0.28,
-                ("agent_overview", "agent_memory"): 0.28,
-                ("ops_overview", "ops_registry"): 0.32,
-                ("ops_service", "ops_registry"): 0.28,
-                ("eval_metrics", "eval_report"): 0.26,
-            }
-            negative = {
-                ("logic_fusion", "retrieval_overview"): -0.3,
-                ("logic_policy", "logic_graph"): -0.34,
-                ("agent_roles", "agent_overview"): -0.28,
-                ("agent_memory", "agent_overview"): -0.28,
-                ("ops_registry", "ops_overview"): -0.34,
-                ("ops_registry", "ops_service"): -0.28,
-                ("ops_service", "ops_overview"): -0.32,
-                ("eval_report", "eval_metrics"): -0.26,
-            }
-            bonus = positive.get(pair, negative.get(pair, 0.0))
-            if bonus == 0.0:
-                if candidate_stage.endswith("_overview") and anchor_stage and candidate_stage != anchor_stage:
-                    bonus -= 0.28
-                if metrics["specific_role_score"] >= 0.5 and anchor_stage not in {"agent_overview", "agent_roles"}:
-                    bonus -= 0.22
-        elif relation_type == "supporting_evidence":
-            positive = {
-                ("logic_graph", "retrieval_overview"): 0.28,
-                ("logic_policy", "logic_fusion"): 0.3,
-                ("scientific_evidence", "scientific_evidence"): 0.18,
-                ("clinical_passage", "clinical_passage"): 0.16,
-            }
-            negative = {
-                ("retrieval_overview", "logic_graph"): -0.28,
-                ("logic_fusion", "logic_policy"): -0.32,
-                ("ops_revalidation", "agent_roles"): -0.28,
-            }
-            bonus = positive.get(pair, negative.get(pair, 0.0))
-            if "judge" in set(tokenize(anchor.title)) and candidate_stage == "ops_revalidation":
-                bonus = max(bonus, 0.28)
-        elif relation_type == "prerequisite":
-            bonus = {
-                ("agent_roles", "agent_roles"): 0.28,
-            }.get(pair, 0.0)
-            if anchor_stage == "agent_roles" and metrics["specific_role_score"] >= 0.5 and self._has_listing_context(anchor) >= 1.0:
-                bonus = max(bonus, 0.3)
-            if "scout" in set(tokenize(anchor.title)) and "judge" in set(tokenize(candidate.title)):
-                bonus = max(bonus, 0.24)
-        elif relation_type == "comparison":
-            if pair == ("argument_claim", "argument_claim"):
-                bonus = 0.24 if metrics.get("stance_contrast", 0.0) >= 1.0 else 0.12
-            elif pair == ("scientific_evidence", "scientific_evidence"):
-                bonus = 0.08
-        elif relation_type == "same_concept":
-            if pair == ("scientific_evidence", "scientific_evidence"):
-                bonus = 0.14
-            elif pair == ("clinical_passage", "clinical_passage"):
-                bonus = 0.12
-        return bonus
+    def _base_signal_report(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> dict[str, float]:
+        return self._signal_runtime.build_signal_report(anchor, candidate, local_signals=metrics)
 
     def _relation_fit_scores(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float]) -> dict[str, float]:
-        direction_score = self._implementation_direction_score(anchor, candidate, metrics)
-        listing_context = self._has_listing_context(anchor)
-        reference_balance = max(metrics["forward_reference_score"] - 0.75 * metrics["reverse_reference_score"], 0.0)
-        cue_terms = self._content_terms(anchor) | self._content_terms(candidate)
-        detail_cue_score = min(len(cue_terms & DETAIL_CUES) / 5.0, 1.0)
-        support_cue_score = min(len(cue_terms & SUPPORT_CUES) / 4.0, 1.0)
-        comparison_cue_score = min(len(cue_terms & ARGUMENT_COMPARISON_CUES) / 5.0, 1.0)
-        methodology_penalty = self._same_concept_methodology_penalty(anchor, candidate)
-        argument_bridge_strength = self._argument_bridge_strength(anchor, candidate, metrics)
-        argument_topic_consistency = self._argument_topic_consistency(anchor, candidate, metrics)
-        evidence_bridge_strength = self._evidence_bridge_strength(anchor, candidate, metrics)
-
-        implementation_detail = (
-            0.32 * metrics["dense_score"]
-            + 0.16 * metrics["family_bridge_score"]
-            + 0.12 * metrics["shared_dominant_family"]
-            + 0.16 * max(direction_score, 0.0)
-            + 0.1 * metrics["content_overlap_score"]
-            + 0.06 * metrics["mention_score"]
-            + 0.06 * metrics["topic_alignment"]
-            + 0.08 * reference_balance
-            + 0.06 * detail_cue_score
-            + self._relation_stage_bonus(anchor, candidate, "implementation_detail", metrics)
-            - 0.18 * metrics["service_surface_score"]
-            - 0.16 * max(-direction_score, 0.0)
-            - 0.06 * (listing_context * metrics["specific_role_score"])
-        )
-        supporting_evidence = (
-            0.18 * metrics["dense_score"]
-            + 0.22 * metrics["mention_score"]
-            + 0.16 * metrics["content_overlap_score"]
-            + 0.12 * metrics["family_bridge_score"]
-            + 0.08 * reference_balance
-            + 0.08 * metrics["topic_alignment"]
-            + 0.1 * support_cue_score
-            + self._relation_stage_bonus(anchor, candidate, "supporting_evidence", metrics)
-            - 0.24 * metrics["service_surface_score"]
-        )
-        if self._supports_same_concept_pair(anchor, candidate):
-            supporting_evidence += 0.1 * evidence_bridge_strength
-        prerequisite = (
-            0.34 * metrics["specific_role_score"]
-            + 0.24 * metrics["role_listing_score"]
-            + 0.12 * metrics["mention_score"]
-            + 0.08 * metrics["content_overlap_score"]
-            + 0.1 * listing_context
-            + 0.08 * metrics["topic_alignment"]
-            + self._relation_stage_bonus(anchor, candidate, "prerequisite", metrics)
-            - 0.08 * metrics["service_surface_score"]
-        )
-        comparison = (
-            0.2 * metrics["dense_score"]
-            + 0.18 * metrics["overlap_score"]
-            + 0.14 * metrics["content_overlap_score"]
-            + 0.16 * metrics["topic_alignment"]
-            + 0.14 * metrics["topic_family_match"]
-            + 0.14 * metrics["topic_cluster_match"]
-            + 0.18 * metrics["stance_contrast"]
-            + 0.08 * metrics["novelty_bridge_score"]
-            + 0.08 * comparison_cue_score
-            + self._relation_stage_bonus(anchor, candidate, "comparison", metrics)
-            - 0.12 * metrics["service_surface_score"]
-        )
-        comparison += 0.12 * argument_bridge_strength + 0.12 * argument_topic_consistency
-        if self._is_argumentative_pair(anchor, candidate) and argument_topic_consistency < 0.56:
-            comparison -= 0.2 * (0.56 - argument_topic_consistency) / 0.56
-        same_concept = (
-            0.26 * metrics["dense_score"]
-            + 0.22 * metrics["overlap_score"]
-            + 0.18 * metrics["content_overlap_score"]
-            + 0.16 * metrics["mention_score"]
-            + 0.16 * metrics["topic_alignment"]
-            + 0.12 * metrics["topic_cluster_match"]
-            + 0.08 * metrics["shared_dominant_family"]
-            + 0.14 * metrics["novelty_bridge_score"]
-            + max(self._relation_stage_bonus(anchor, candidate, "same_concept", metrics), 0.0)
-            - 0.16 * metrics["stance_contrast"]
-            - 0.22 * methodology_penalty
-            - 0.1 * max(0.0, 0.45 - metrics["family_bridge_score"])
-            - 0.12 * max(0.0, 0.14 - metrics["novel_term_ratio"])
-            - 0.1 * max(0.0, metrics["novel_term_ratio"] - 0.82)
-        )
-        if self._supports_same_concept_pair(anchor, candidate):
-            same_concept += 0.08 * evidence_bridge_strength
+        signal_report = self._base_signal_report(anchor, candidate, metrics)
+        payload = self._signal_runtime.score_relation_fit(anchor, candidate, metrics, signal_report)
+        fit_scores = payload.get("fit_scores", {})
         return {
-            "implementation_detail": max(0.0, min(implementation_detail, 1.4)),
-            "supporting_evidence": max(0.0, min(supporting_evidence, 1.2)),
-            "prerequisite": max(0.0, min(prerequisite, 1.2)),
-            "comparison": max(0.0, min(comparison, 1.2)),
-            "same_concept": max(0.0, min(same_concept, 1.1)),
+            relation_type: max(0.0, min(float(score or 0.0), 1.4))
+            for relation_type, score in fit_scores.items()
+            if relation_type in RELATION_TYPES
         }
 
-    def _utility_score(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> float:
-        bridge_gain = self._bridge_information_gain(anchor, candidate)
-        duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
-        specific_title_bridge = self._specific_title_bridge_score(anchor, candidate)
-        contrastive_bridge_score = self._contrastive_argument_reuse(anchor, candidate, metrics)
-        query_surface_match = float(
-            metrics.get(
-                "query_surface_match",
-                0.5 * metrics.get("topic_alignment", 0.0)
-                + 0.5 * max(metrics.get("overlap_score", 0.0), metrics.get("content_overlap_score", 0.0)),
-            )
-            or 0.0
+    def _utility_score(
+        self,
+        anchor: DocBrief,
+        candidate: DocBrief,
+        metrics: dict[str, float],
+        fit_scores: dict[str, float],
+        relation_type: str,
+        signal_report: dict[str, float] | None = None,
+    ) -> float:
+        payload = self._signal_runtime.score_candidate_utility(
+            relation_type=relation_type,
+            metrics=metrics,
+            fit_scores=fit_scores,
+            signal_report=signal_report or self._base_signal_report(anchor, candidate, metrics),
         )
-        score = (
-            0.26 * metrics["dense_score"]
-            + 0.2 * metrics["local_support"]
-            + 0.1 * metrics["mention_score"]
-            + 0.14 * fit_scores.get(relation_type, 0.0)
-            + 0.08 * metrics["forward_reference_score"]
-            + 0.06 * metrics["content_overlap_score"]
-            + 0.08 * metrics["topic_alignment"]
-            + 0.12 * bridge_gain
-            + 0.08 * specific_title_bridge
-            + 0.08 * metrics["novelty_bridge_score"]
-            + 0.08 * contrastive_bridge_score
-            + 0.06 * query_surface_match
-        )
-        score += 0.06 * metrics["topic_cluster_match"]
-        score += 0.06 * metrics["topic_family_match"]
-        score += 0.04 * metrics["stance_contrast"]
-        score -= 0.18 * metrics["service_surface_score"]
-        score -= 0.18 * min(metrics["topic_drift"], 1.0)
-        score -= 0.24 * duplicate_penalty
-        return max(0.0, min(score, 1.0))
+        return max(0.0, min(float(payload.get("utility_score", 0.0) or 0.0), 1.0))
 
     def _signal_bundle(self, anchor: DocBrief, candidate: DocBrief, metrics: dict[str, float], fit_scores: dict[str, float], relation_type: str) -> JudgeSignals:
         stage_pair = f"{self._doc_stage(anchor)}->{self._doc_stage(candidate)}".strip("->")
         duplicate_penalty = self._near_duplicate_penalty(anchor, candidate, metrics)
-        contrastive_bridge_score = self._contrastive_argument_reuse(anchor, candidate, metrics)
+        signal_report = self._base_signal_report(anchor, candidate, metrics)
+        utility_score = self._utility_score(anchor, candidate, metrics, fit_scores, relation_type, signal_report)
         signal_report = self._signal_runtime.build_signal_report(
             anchor,
             candidate,
             local_signals={
                 **metrics,
-                "utility_score": self._utility_score(anchor, candidate, metrics, fit_scores, relation_type),
-                "bridge_gain": self._bridge_information_gain(anchor, candidate),
+                "utility_score": utility_score,
+                "bridge_gain": float(signal_report.get("bridge_information_gain", 0.0) or 0.0),
                 "duplicate_penalty": duplicate_penalty,
-                "contrastive_bridge_score": contrastive_bridge_score,
+                "contrastive_bridge_score": float(signal_report.get("contrast_evidence", 0.0) or 0.0),
             },
         )
         risk_flags: list[str] = []
@@ -889,9 +555,9 @@ class LogicOrchestrator:
             role_listing_score=metrics["role_listing_score"],
             forward_reference_score=metrics["forward_reference_score"],
             reverse_reference_score=metrics["reverse_reference_score"],
-            direction_score=self._implementation_direction_score(anchor, candidate, metrics),
+            direction_score=max(min(metrics["forward_reference_score"] - metrics["reverse_reference_score"], 1.0), -1.0),
             local_support=metrics["local_support"],
-            utility_score=self._utility_score(anchor, candidate, metrics, fit_scores, relation_type),
+            utility_score=utility_score,
             best_relation=relation_type,
             stage_pair=stage_pair,
             risk_flags=risk_flags,
@@ -901,7 +567,7 @@ class LogicOrchestrator:
             stance_contrast=metrics["stance_contrast"],
             bridge_gain=float(signal_report.get("bridge_information_gain", self._bridge_information_gain(anchor, candidate)) or 0.0),
             duplicate_penalty=duplicate_penalty,
-            contrastive_bridge_score=max(float(signal_report.get("contrast_evidence", 0.0) or 0.0), contrastive_bridge_score),
+            contrastive_bridge_score=float(signal_report.get("contrast_evidence", 0.0) or 0.0),
             topic_consistency=float(signal_report.get("topic_consistency", 0.0) or 0.0),
             duplicate_risk=float(signal_report.get("duplicate_risk", duplicate_penalty) or 0.0),
             query_surface_match=float(signal_report.get("query_surface_match", 0.0) or 0.0),
@@ -1240,12 +906,8 @@ class LogicOrchestrator:
 
     def _review_consensus_result(
         self,
-        anchor: DocBrief,
-        candidate: DocBrief,
         result,
         review_result,
-        metrics: dict[str, float],
-        fit_scores: dict[str, float],
         signal_bundle: JudgeSignals,
     ):
         chosen = review_result or result
@@ -1562,7 +1224,7 @@ class LogicOrchestrator:
         metrics = self._candidate_metrics(anchor, candidate)
         rerank_score, rerank_relation, fit_scores = self._pair_rerank(anchor, candidate, metrics)
         signal_bundle = self._signal_bundle(anchor, candidate, metrics, fit_scores, rerank_relation)
-        final_result = self._review_consensus_result(anchor, candidate, result, review_result, metrics, fit_scores, signal_bundle)
+        final_result = self._review_consensus_result(result, review_result, signal_bundle)
 
         if not final_result.accepted:
             return CandidateAssessment(

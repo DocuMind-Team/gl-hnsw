@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Callable
 
 from hnsw_logic.docs.brief_store import BriefStore
@@ -69,33 +68,9 @@ def build_agent_tools(
                 return to_jsonable(doc)
         return None
 
-    def commit_logic_edge(edge_payload: dict) -> dict:
-        """Persist a logic edge into the sidecar graph store."""
-        from hnsw_logic.core.models import LogicEdge
-
-        edge = LogicEdge(**edge_payload)
-        graph_store.add_edges([edge])
-        return {"committed": True, "edge_id": f"{edge.src_doc_id}->{edge.dst_doc_id}"}
-
     def load_anchor_memory(doc_id: str) -> dict:
         """Load anchor memory state for a specific document id."""
         return to_jsonable(anchor_memory_store.read(doc_id))
-
-    def update_global_memory(payload: dict) -> dict:
-        """Merge aliases, relation patterns, and rejection patterns into global memory."""
-        memory = semantic_memory_store.read()
-        aliases = payload.get("aliases", {})
-        for entity, values in aliases.items():
-            memory.aliases[entity] = sorted(set(memory.aliases.get(entity, []) + values))
-            memory.canonical_entities.setdefault(entity, entity)
-        relation_patterns = payload.get("relation_patterns", {})
-        for relation_type, values in relation_patterns.items():
-            memory.relation_patterns[relation_type] = sorted(set(memory.relation_patterns.get(relation_type, []) + values))
-        rejection_patterns = payload.get("rejection_patterns", {})
-        for key, values in rejection_patterns.items():
-            memory.rejection_patterns[key] = sorted(set(memory.rejection_patterns.get(key, []) + values))
-        semantic_memory_store.write(memory)
-        return {"updated": True}
 
     return {
         "search_summaries": search_summaries,
@@ -103,7 +78,5 @@ def build_agent_tools(
         "get_hnsw_neighbors": get_hnsw_neighbors,
         "read_doc_brief": read_doc_brief,
         "read_doc_full": read_doc_full,
-        "commit_logic_edge": commit_logic_edge,
         "load_anchor_memory": load_anchor_memory,
-        "update_global_memory": update_global_memory,
     }

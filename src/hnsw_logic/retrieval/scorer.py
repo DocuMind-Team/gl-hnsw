@@ -206,12 +206,7 @@ class RetrievalScorer:
 
     def edge_use_cases(self, edge: LogicEdge) -> set[str]:
         profile = self._edge_activation_profile(edge)
-        use_cases = {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
-        if not use_cases and edge.relation_type == "same_concept":
-            use_cases.add("concept-bridge")
-        if not use_cases and edge.relation_type == "comparison":
-            use_cases.add("same-topic-contrast")
-        return use_cases
+        return {str(item).strip().lower() for item in profile.get("edge_use_cases", []) or [] if str(item).strip()}
 
     def is_concept_bridge(self, edge: LogicEdge) -> bool:
         return "concept-bridge" in self.edge_use_cases(edge)
