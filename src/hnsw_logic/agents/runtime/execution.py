@@ -247,6 +247,35 @@ def build_deepagent_toolsets(
     def stage_path(stage: str, doc_id: str, suffix: str = ".json") -> Path:
         return stage_artifact_path(workspace_root, stage, doc_id, suffix)
 
+    def normalize_reference_updates(payload: Any) -> dict[str, list[str]]:
+        """Coerce provider reference updates into a stable mapping shape."""
+        if isinstance(payload, dict):
+            return {
+                str(path): [str(item) for item in value][:12]
+                for path, value in payload.items()
+                if str(path)
+                and isinstance(value, list | tuple)
+            }
+        if not isinstance(payload, list):
+            return {}
+        normalized: dict[str, list[str]] = {}
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "") or "")
+            if not path:
+                continue
+            raw_lines = item.get("lines", item.get("updates", item.get("patterns", [])))
+            if isinstance(raw_lines, str):
+                lines = [raw_lines]
+            elif isinstance(raw_lines, list | tuple):
+                lines = [str(line) for line in raw_lines if str(line)]
+            else:
+                continue
+            if lines:
+                normalized[path] = lines[:12]
+        return normalized
+
     def mark_stage_started(anchor_doc_id: str, stage: str, note: str = "") -> None:
         record_manifest_stage_event(workspace_root, anchor_doc_id, stage=stage, status="started", note=note)
 
@@ -782,10 +811,7 @@ def build_deepagent_toolsets(
             failure_patterns=failure_patterns,
             reference_updates={
                 ".deepagents/skills/graph-hygiene/references/hygiene-rules.md": failure_patterns[:6],
-                **{
-                    str(key): [str(item) for item in value][:12]
-                    for key, value in dict(provider_payload.get("reference_updates", {})).items()
-                },
+                **normalize_reference_updates(provider_payload.get("reference_updates", {})),
             },
         )
         write_json(destination, bundle)

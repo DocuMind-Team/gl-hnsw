@@ -17,7 +17,7 @@ from hnsw_logic.agents.runtime.models import ExecutionAudit
 from hnsw_logic.agents.runtime.skill_runtime import SkillSignalRuntime
 from hnsw_logic.agents.runtime.toolsets import build_agent_tools
 from hnsw_logic.domain.models import LogicEdge
-from hnsw_logic.domain.serialization import write_json
+from hnsw_logic.domain.serialization import read_json, write_json
 from hnsw_logic.embedding.providers.types import JudgeResult
 from hnsw_logic.storage.memory.self_update import ControlledSelfUpdateManager
 
@@ -311,6 +311,44 @@ def test_offline_supervisor_test_harness_writes_bundles(app_container):
     assert (workspace / "judgments" / f"{anchor_doc_id}.json").exists()
     assert (workspace / "reviews" / f"{anchor_doc_id}.json").exists()
     assert (workspace / "memory" / f"{anchor_doc_id}.json").exists()
+
+
+def test_memory_stage_normalizes_reference_updates_payloads(app_container, monkeypatch):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor_doc_id = briefs[0].doc_id
+    app_container.offline_supervisor.run_anchor_workflow_test_harness(
+        anchor_doc_id,
+        stages=["dossiers", "candidates", "judgments", "checks", "reviews"],
+    )
+    tools = app_container.agent_factory.runtime_toolsets
+
+    def fake_summarize(payload: dict) -> dict:
+        return {
+            "learned_patterns": ["keep:comparison:doc-2"],
+            "failure_patterns": ["drop:doc-3:topic_drift"],
+            "reference_updates": [
+                {
+                    "path": ".deepagents/skills/graph-hygiene/references/hygiene-rules.md",
+                    "updates": ["prefer durable bridges"],
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        type(app_container.offline_supervisor.orchestrator.doc_profiler.provider),
+        "summarize_memory_learnings",
+        staticmethod(fake_summarize),
+    )
+
+    result = tools["memory_curator"]["execute_memory_summarization"](anchor_doc_id=anchor_doc_id)
+    bundle_path = Path(result["memory_bundle_path"])
+    payload = read_json(bundle_path, {})
+
+    assert bundle_path.exists()
+    assert ".deepagents/skills/graph-hygiene/references/hygiene-rules.md" in payload["reference_updates"]
+    assert "prefer durable bridges" in payload["reference_updates"][".deepagents/skills/graph-hygiene/references/hygiene-rules.md"]
 
 
 def test_runtime_tools_reuse_existing_stage_outputs(app_container):
