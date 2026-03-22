@@ -236,6 +236,28 @@ def test_runtime_tool_scopes_exclude_edge_commit(app_container):
     assert {"read_indexing_plan", "read_execution_manifest", "audit_anchor_execution"} <= supervisor_tool_names
 
 
+def test_subagent_skill_views_and_toolsets_match_agent_config(app_container):
+    settings = app_container.settings
+    runtime_views = app_container.agent_factory.runtime_skill_views
+    runtime_toolsets = app_container.agent_factory.runtime_toolsets
+    specs = {spec["name"]: spec for spec in app_container.agent_factory.create_deepagent_specs()}
+    configured_skills_root = settings.root_dir / settings.agents.skills_root
+
+    for agent_name, config in settings.agents.subagents.items():
+        if not config.enabled:
+            continue
+        expected_skills = {
+            skill_name for skill_name in config.skills if (configured_skills_root / skill_name).exists()
+        }
+        if expected_skills:
+            view_root = runtime_views[agent_name]
+            actual_skills = {path.name for path in view_root.iterdir() if path.is_dir()}
+            assert actual_skills == expected_skills
+            assert specs[agent_name]["skills"] == [f"/.deepagents/runtime_views/{agent_name}"]
+        tool_names = {tool.__name__ for tool in specs[agent_name]["tools"]}
+        assert tool_names == set(runtime_toolsets[agent_name])
+
+
 def test_supervisor_memory_prompt_requires_materialized_bundle(app_container):
     prompt = app_container.offline_supervisor._deepagent_stage_prompt(
         "doc-1",

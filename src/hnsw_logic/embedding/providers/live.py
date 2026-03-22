@@ -14,7 +14,7 @@ from hnsw_logic.config.schema import ProviderConfig
 from hnsw_logic.domain.facets import enrich_brief
 from hnsw_logic.domain.models import DocBrief, DocRecord, LogicEdge
 from hnsw_logic.domain.serialization import to_jsonable
-from hnsw_logic.domain.tokens import top_terms
+from hnsw_logic.domain.tokens import tokenize, top_terms
 from hnsw_logic.embedding.providers.base import ProviderBase
 from hnsw_logic.embedding.providers.client import OpenAIProviderTransportMixin
 from hnsw_logic.embedding.providers.stub import StubProvider
@@ -138,11 +138,16 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
         if not corpus:
             return []
         anchor_terms = set(anchor.keywords + anchor.entities + anchor.relation_hints)
+        anchor_terms.update(tokenize(anchor.title))
+        anchor_terms.update(tokenize(" ".join(anchor.claims[:2])))
         vectors = self._brief_vectors([anchor] + corpus)
         anchor_vec = vectors[0]
         ranked: list[tuple[float, DocBrief]] = []
         for idx, brief in enumerate(corpus, start=1):
-            overlap = len(anchor_terms & set(brief.keywords + brief.entities))
+            candidate_terms = set(brief.keywords + brief.entities + brief.relation_hints)
+            candidate_terms.update(tokenize(brief.title))
+            candidate_terms.update(tokenize(" ".join(brief.claims[:2])))
+            overlap = len(anchor_terms & candidate_terms)
             dense_score = float(np.dot(anchor_vec, vectors[idx]))
             topic_cluster_bonus = 0.0
             anchor_cluster = str(anchor.metadata.get("topic_cluster", ""))
@@ -159,7 +164,19 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
         return [brief for _, brief in ranked[:limit]]
 
     def _prefer_local_scout(self, anchor: DocBrief) -> bool:
-        return True
+        return False
+
+    def _local_candidate_proposals(self, anchor: DocBrief, corpus: list[DocBrief], limit: int = 6) -> list[CandidateProposal]:
+        shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=limit)
+        return [
+            CandidateProposal(
+                doc_id=brief.doc_id,
+                reason="local semantic shortlist for offline discovery",
+                query=" ".join((brief.keywords + brief.relation_hints + [brief.title])[:4]),
+                score_hint=0.72,
+            )
+            for brief in shortlist
+        ]
 
     def _judge_instruction(self) -> str:
         return (
@@ -214,11 +231,12 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
         )
 
     def _verdict_from_payload(self, payload: dict) -> JudgeResult:
-        canonical_relation = str(payload.get("canonical_relation", payload.get("relation_type", "comparison")))
+        raw_relation_type = str(payload.get("relation_type", payload.get("canonical_relation", "none")) or "none")
+        canonical_relation = str(payload.get("canonical_relation", raw_relation_type) or raw_relation_type)
         accepted = bool(payload.get("accepted", False))
         if canonical_relation == "none":
             accepted = False
-            relation_type = "comparison"
+            relation_type = "none"
         else:
             relation_type = canonical_relation
         return JudgeResult(
@@ -741,18 +759,9 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
 
     def propose_candidates(self, anchor: DocBrief, corpus: list[DocBrief]) -> list[CandidateProposal]:
         if self._prefer_local_scout(anchor):
-            shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=6)
-            return [
-                CandidateProposal(
-                    doc_id=brief.doc_id,
-                    reason="local semantic shortlist for offline discovery",
-                    query=" ".join((brief.keywords + brief.relation_hints + [brief.title])[:4]),
-                    score_hint=0.72,
-                )
-                for brief in shortlist
-            ]
+            return self._local_candidate_proposals(anchor, corpus)
         try:
-            shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=8)
+            shortlist = self._candidate_shortlist(anchor, [brief for brief in corpus if brief.doc_id != anchor.doc_id], limit=12)
             candidate_rows = [
                 {
                     "doc_id": brief.doc_id,
@@ -788,7 +797,7 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
             )
             items = payload if isinstance(payload, list) else payload.get("candidates", [])
             proposals: list[CandidateProposal] = []
-            for item in items[:4]:
+            for item in items[:6]:
                 doc_id = str(item.get("doc_id", ""))
                 if not doc_id:
                     continue
@@ -800,10 +809,10 @@ class OpenAICompatibleProvider(OpenAIProviderTransportMixin, StubProvider):
                         score_hint=float(item.get("score_hint", 0.5)),
                     )
                 )
-            return proposals or super().propose_candidates(anchor, corpus)
+            return proposals or self._local_candidate_proposals(anchor, corpus)
         except Exception as exc:
             self._handle_remote_failure("corpus_scout", exc)
-            return super().propose_candidates(anchor, corpus)
+            return self._local_candidate_proposals(anchor, corpus)
 
     def judge_relation(self, anchor: DocBrief, candidate: DocBrief) -> JudgeResult:
         return self.judge_relation_with_signals(

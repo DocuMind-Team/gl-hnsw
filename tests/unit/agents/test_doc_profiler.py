@@ -8,7 +8,7 @@ from hnsw_logic.domain.models import DocBrief, DocRecord
 from hnsw_logic.embedding.providers.base import ProviderBase
 from hnsw_logic.embedding.providers.live import OpenAICompatibleProvider
 from hnsw_logic.embedding.providers.stub import StubProvider
-from hnsw_logic.embedding.providers.types import JudgeResult, JudgeSignals
+from hnsw_logic.embedding.providers.types import CandidateProposal, JudgeResult, JudgeSignals
 
 
 def test_doc_profiler_returns_expected_fields(app_container):
@@ -661,6 +661,124 @@ def test_judge_relations_with_signals_returns_empty_for_empty_candidate_list():
     )
 
     assert provider.judge_relations_with_signals(anchor, []) == {}
+
+
+def test_verdict_from_payload_preserves_none_relation_for_rejected_edges():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+
+    verdict = provider._verdict_from_payload(
+        {
+            "accepted": False,
+            "canonical_relation": "none",
+            "semantic_relation_label": "unrelated_topic",
+            "confidence": 0.0,
+            "utility_score": 0.81,
+            "uncertainty": 0.2,
+            "evidence_spans": [],
+            "rationale": "Related topic, but not a durable retrieval edge.",
+            "support_score": 0.0,
+            "contradiction_flags": [],
+            "decision_reason": "Not useful as a durable edge.",
+        }
+    )
+
+    assert verdict.accepted is False
+    assert verdict.canonical_relation == "none"
+    assert verdict.relation_type == "none"
+
+
+def test_live_provider_prefers_remote_scout_results():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = False
+    provider.trace_path = None
+
+    anchor = DocBrief(
+        doc_id="anchor",
+        title="Transit investment improves mobility",
+        summary="Transit-first policy improves congestion and access.",
+        entities=["transit", "mobility"],
+        keywords=["transit", "mobility"],
+        claims=["Transit investment improves mobility outcomes."],
+        relation_hints=["comparison"],
+        metadata={},
+    )
+    candidate = DocBrief(
+        doc_id="candidate",
+        title="Highway expansion improves congestion",
+        summary="The text argues for expanding highways.",
+        entities=["highway", "congestion"],
+        keywords=["highway", "congestion"],
+        claims=["Highway expansion improves congestion."],
+        relation_hints=["comparison"],
+        metadata={},
+    )
+
+    provider._candidate_shortlist = lambda *_args, **_kwargs: [candidate]
+    provider._local_candidate_proposals = lambda *_args, **_kwargs: [
+        CandidateProposal(doc_id="local", reason="local", query="local", score_hint=0.3)
+    ]
+    provider._invoke_json = lambda *args, **kwargs: {
+        "candidates": [
+            {
+                "doc_id": "candidate",
+                "reason": "remote scout found a strong contrast pair",
+                "query": "transit versus highway congestion policy",
+                "score_hint": 0.84,
+            }
+        ]
+    }
+
+    proposals = provider.propose_candidates(anchor, [anchor, candidate])
+
+    assert provider._prefer_local_scout(anchor) is False
+    assert [proposal.doc_id for proposal in proposals] == ["candidate"]
+    assert proposals[0].reason.startswith("remote scout")
+
+
+def test_live_provider_falls_back_to_local_scout_when_remote_returns_empty():
+    provider = OpenAICompatibleProvider.__new__(OpenAICompatibleProvider)
+    ProviderBase.__init__(provider, ProviderConfig(kind="openai_compatible"))
+    provider.require_remote = False
+    provider.trace_path = None
+
+    anchor = DocBrief(
+        doc_id="anchor",
+        title="Vitamin intake affects cardiovascular risk",
+        summary="The anchor describes dietary risk relationships.",
+        entities=["vitamin", "cardiovascular risk"],
+        keywords=["vitamin", "risk"],
+        claims=["Vitamin intake affects cardiovascular risk."],
+        relation_hints=["supporting_evidence"],
+        metadata={},
+    )
+    candidate = DocBrief(
+        doc_id="candidate",
+        title="Dietary exposure shapes cardiovascular outcomes",
+        summary="The text discusses dietary exposure and outcomes.",
+        entities=["dietary exposure", "cardiovascular outcomes"],
+        keywords=["dietary", "outcomes"],
+        claims=["Dietary exposure shapes cardiovascular outcomes."],
+        relation_hints=["supporting_evidence"],
+        metadata={},
+    )
+
+    fallback = [
+        CandidateProposal(
+            doc_id="candidate",
+            reason="local semantic shortlist for offline discovery",
+            query="dietary exposure cardiovascular outcomes",
+            score_hint=0.72,
+        )
+    ]
+    provider._candidate_shortlist = lambda *_args, **_kwargs: [candidate]
+    provider._local_candidate_proposals = lambda *_args, **_kwargs: fallback
+    provider._invoke_json = lambda *args, **kwargs: {"candidates": []}
+
+    proposals = provider.propose_candidates(anchor, [anchor, candidate])
+
+    assert proposals == fallback
 
 
 def test_invoke_json_retries_after_empty_remote_response():
