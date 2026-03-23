@@ -1,5 +1,8 @@
 # gl-hnsw Architecture
 
+更完整、与当前代码完全对齐的论文级说明见：
+[DeepAgents Architecture Whitepaper](./deepagents-whitepaper.md)
+
 本文档给出 `gl-hnsw` 当前实现的一版完整架构说明。文档重点覆盖：
 
 - 系统目标与边界
