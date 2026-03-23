@@ -404,6 +404,39 @@ def test_workspace_output_path_resolution_maps_data_prefixes(tmp_path: Path):
         "indexing/reviews",
         default,
     ) == workspace_root / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "/indexing/reviews/doc-1.json",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "/indexing/reviews",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
+    assert resolve_workspace_output_path(
+        workspace_root,
+        "/indexing",
+        default,
+    ) == workspace_root / "indexing/reviews/doc-1.json"
+
+
+def test_execution_audit_clears_stale_failed_stage_when_artifact_exists(tmp_path: Path):
+    workspace_root = tmp_path / "data" / "workspace"
+    record_manifest_stage_event(
+        workspace_root,
+        "doc-1",
+        stage="candidates",
+        status="failed",
+        error="temporary failure",
+    )
+    write_json(stage_artifact_path(workspace_root, "candidates", "doc-1"), {"anchor_doc_id": "doc-1"})
+
+    audit = audit_execution_state(workspace_root, "doc-1", counterevidence_enabled=True, task_iteration_cap=2)
+    manifest = load_execution_manifest(workspace_root, "doc-1")
+
+    assert "candidates" in audit.completed_stages
+    assert "candidates" not in manifest.failed_stages
 
 
 def test_normalize_stage_container_path_moves_json_payload_into_default_file(tmp_path: Path):
@@ -688,6 +721,90 @@ def test_offline_supervisor_applies_reviewed_activation_profile(app_container, m
     assert assessments[0].edge is not None
     assert assessments[0].edge.utility_score == 0.74
     assert assessments[0].edge.activation_profile["activation_prior"] == 0.78
+
+
+def test_execute_edge_review_rescues_high_utility_supporting_bridge(app_container):
+    app_container.pipeline.build_embeddings()
+    app_container.pipeline.build_hnsw()
+    briefs = app_container.discovery_service.ensure_briefs(app_container.corpus_store.read_processed())
+    anchor = briefs[0]
+    candidate = briefs[1]
+    tools = app_container.agent_factory.runtime_toolsets
+
+    signal_payload = {
+        "dense_score": 0.82,
+        "sparse_score": 1.0,
+        "overlap_score": 0.94,
+        "content_overlap_score": 0.88,
+        "mention_score": 0.46,
+        "role_listing_score": 0.12,
+        "forward_reference_score": 0.24,
+        "reverse_reference_score": 0.16,
+        "direction_score": 0.18,
+        "local_support": 0.8,
+        "utility_score": 0.84,
+        "best_relation": "supporting_evidence",
+        "stage_pair": "scientific_evidence->scientific_evidence",
+        "risk_flags": [],
+        "relation_fit_scores": {"supporting_evidence": 0.84},
+        "topic_consistency": 0.9,
+        "bridge_information_gain": 0.82,
+        "query_surface_match": 0.9,
+        "drift_risk": 0.14,
+    }
+    verdict_payload = {
+        "accepted": True,
+        "relation_type": "supporting_evidence",
+        "canonical_relation": "supporting_evidence",
+        "semantic_relation_label": "supporting_evidence",
+        "confidence": 0.82,
+        "utility_score": 0.84,
+        "support_score": 0.8,
+        "uncertainty": 0.22,
+        "decision_reason": "Aligned evidence bridge.",
+        "rationale": "Candidate extends the anchor evidence surface.",
+        "evidence_spans": [anchor.summary, candidate.summary],
+        "contradiction_flags": [],
+    }
+
+    write_json(
+        stage_artifact_path(app_container.offline_supervisor.workspace_root, "judgments", anchor.doc_id),
+        {
+            "anchor_doc_id": anchor.doc_id,
+            "generated_at": "2026-03-23T00:00:00Z",
+            "judgments": [
+                {
+                    "candidate_doc_id": candidate.doc_id,
+                    "signals": signal_payload,
+                    "verdict": verdict_payload,
+                }
+            ],
+        },
+    )
+    write_json(
+        stage_artifact_path(app_container.offline_supervisor.workspace_root, "checks", anchor.doc_id),
+        {
+            "anchor_doc_id": anchor.doc_id,
+            "generated_at": "2026-03-23T00:00:00Z",
+            "checks": [
+                {
+                    "candidate_doc_id": candidate.doc_id,
+                    "keep": False,
+                    "risk_flags": ["duplicate_risk", "near_duplicate_bridge", "weak_direction"],
+                    "decision_reason": "duplicate-only risk",
+                    "risk_penalty": 0.63,
+                }
+            ],
+        },
+    )
+
+    result = tools["edge_reviewer"]["execute_edge_review"](anchor_doc_id=anchor.doc_id)
+    payload = read_json(Path(result["review_bundle_path"]), {})
+    row = payload["reviews"][0]
+
+    assert row["keep"] is True
+    assert "near_duplicate_bridge" not in row["risk_flags"]
+    assert row["reviewed_utility_score"] > 0.6
 
 
 def test_offline_supervisor_rejects_missing_review_artifact(app_container, monkeypatch):

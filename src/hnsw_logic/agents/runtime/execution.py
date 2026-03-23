@@ -106,8 +106,12 @@ def resolve_workspace_output_path(workspace_root: Path, output_path: str | None,
             resolved = workspace_root.parent / raw.removeprefix("/data/")
         elif raw.startswith("/workspace/"):
             resolved = workspace_root.parent.parent.parent / raw.removeprefix("/workspace/")
+        elif raw == "/indexing" or raw.startswith("/indexing/"):
+            resolved = workspace_root / raw.removeprefix("/")
         else:
             resolved = path
+    if resolved == workspace_root / "indexing":
+        return default_path
     if resolved == default_path.parent or (not resolved.suffix and resolved.name == default_path.parent.name):
         return resolved / default_path.name
     return resolved
@@ -180,7 +184,10 @@ def audit_execution_state(
         elif stage in manifest.completed_stages:
             completed.append(stage)
     completed = [stage for stage in required if stage in completed]
-    if completed != manifest.completed_stages:
+    stale_failures = [stage for stage in manifest.failed_stages if stage in completed]
+    for stage in stale_failures:
+        manifest.failed_stages.pop(stage, None)
+    if completed != manifest.completed_stages or stale_failures:
         manifest.completed_stages = completed
         save_execution_manifest(workspace_root, manifest)
     missing = [stage for stage in required if stage not in completed]
@@ -706,6 +713,12 @@ def build_deepagent_toolsets(
                 for flag in risk_flags
                 if str(flag)
             }
+            signal_report = signal_runtime.build_signal_report(
+                anchor,
+                candidate,
+                local_signals=signal_payload,
+                verdict=to_jsonable(reviewed_verdict),
+            )
             contradiction_like = {
                 flag
                 for flag in normalized_risk_flags
@@ -722,6 +735,17 @@ def build_deepagent_toolsets(
                 local_signals=signal_payload,
                 verdict=to_jsonable(reviewed_verdict),
             )
+            topic_consistency = max(
+                float(signal_payload.get("topic_consistency", 0.0) or 0.0),
+                float(signal_report.get("topic_consistency", 0.0) or 0.0),
+            )
+            bridge_gain = max(
+                float(signal_payload.get("bridge_gain", signal_payload.get("bridge_information_gain", 0.0)) or 0.0),
+                float(signal_report.get("bridge_information_gain", 0.0) or 0.0),
+            )
+            local_drift = float(signal_payload.get("drift_risk", 0.0) or 0.0)
+            computed_drift = float(signal_report.get("drift_risk", local_drift) or 0.0)
+            drift_risk = min(local_drift, computed_drift) if local_drift else computed_drift
             contrastive_comparison_bridge = bool(
                 getattr(reviewed_verdict, "relation_type", "") == "comparison"
                 and float(contrast_report.get("contrast_evidence", 0.0) or 0.0) >= 0.56
@@ -732,7 +756,7 @@ def build_deepagent_toolsets(
                 )
                 >= 0.32
             )
-            hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility", "weak_direction"}
+            hard_blockers = {"same_stance", "topic_drift", "weak_topic_match", "low_retrieval_utility"}
             effective_risk_flags = set(normalized_risk_flags)
             risk_penalty = float(check.get("risk_penalty", 0.0))
             if contrastive_comparison_bridge and "same_stance" not in effective_risk_flags:
@@ -740,10 +764,22 @@ def build_deepagent_toolsets(
                 effective_risk_flags -= contradiction_like
                 if not (effective_risk_flags & hard_blockers):
                     risk_penalty = min(risk_penalty, 0.22)
+            reviewed_bridge_rescue = bool(
+                getattr(reviewed_verdict, "accepted", False)
+                and str(getattr(reviewed_verdict, "relation_type", "")) in {"supporting_evidence", "same_concept", "implementation_detail"}
+                and float(getattr(reviewed_verdict, "utility_score", 0.0) or 0.0) >= 0.72
+                and topic_consistency >= 0.72
+                and bridge_gain >= 0.68
+                and drift_risk <= 0.22
+                and not (effective_risk_flags - {"duplicate_risk", "near_duplicate", "near_duplicate_bridge", "weak_direction"})
+            )
+            if reviewed_bridge_rescue:
+                effective_risk_flags -= {"near_duplicate", "near_duplicate_bridge", "weak_direction"}
+                risk_penalty = min(risk_penalty, 0.2)
             keep = bool(getattr(reviewed_verdict, "accepted", False)) and (
-                bool(check.get("keep", True)) or (
-                    contrastive_comparison_bridge and not (effective_risk_flags & hard_blockers)
-                )
+                bool(check.get("keep", True))
+                or (contrastive_comparison_bridge and not (effective_risk_flags & hard_blockers))
+                or reviewed_bridge_rescue
             )
             activation_profile = signal_runtime.compute_query_activation_profile(
                 anchor,
